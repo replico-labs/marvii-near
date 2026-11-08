@@ -1,0 +1,174 @@
+// Demo agent for Marvii on NEAR. It holds only a session key: every request
+// is checked by the extension (venue, cap, expiry) before the wallet asks
+// the MPC network to sign. The agent then broadcasts the signed transaction.
+//
+//   node agent.mjs keygen                       creates the agent key, prints its public key
+//   node agent.mjs approve <usdc>               approve the Aave pool for <usdc> USDC
+//   node agent.mjs supply <usdc>                supply <usdc> USDC to Aave
+//   node agent.mjs transfer <usdc> <0x address> try to send USDC away (must be refused)
+//
+// Env: MARVII_NEAR_KEYS (keeps demo-agent.json; never printed), RELAYER
+// (default http://localhost:8787), WALLET (the NEAR wallet account), EVM_RPC
+// (default https://sepolia.base.org).
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+import {
+  createPublicClient, http, keccak256, serializeTransaction, recoverTransactionAddress,
+  encodeFunctionData, parseAbi, getAddress,
+} from 'viem';
+import { baseSepolia } from 'viem/chains';
+
+const RELAYER = process.env.RELAYER ?? 'http://localhost:8787';
+const KEYS = process.env.MARVII_NEAR_KEYS;
+const WALLET = process.env.WALLET;
+const CHAIN_ID = 84532;
+// Aave V3 on Base Sepolia, from bgd-labs/aave-address-book (AaveV3BaseSepolia.sol),
+// checked on-chain: the pool's getReservesList() includes this USDC.
+const POOL = '0x8bab6d1b75f19e9ed9fce8b9bd338844ff79ae27';
+const USDC = '0xba50cd2a20f6da35d788639e581bca8d0b5d4d5f';
+// Refusals the delay queue can handle (extension v3, rules.rs).
+const NEW_TARGET = ['recipient not allowed', 'token recipient not allowed', 'not an allowed venue', 'spender is not a venue'];
+const N = 0xffffffffffffffffffffffffffffffffbaaedce6af48a03bbfd25e8cd0364141n; // secp256k1 order
+
+const evm = createPublicClient({ chain: baseSepolia, transport: http(process.env.EVM_RPC ?? 'https://sepolia.base.org') });
+const abi = parseAbi([
+  'function approve(address spender, uint256 amount) returns (bool)',
+  'function transfer(address to, uint256 amount) returns (bool)',
+  'function supply(address asset, uint256 amount, address onBehalfOf, uint16 referralCode)',
+]);
+
+const keyFile = () => path.join(KEYS, 'demo-agent.json');
+function agentKey() {
+  const { seed_hex } = JSON.parse(fs.readFileSync(keyFile(), 'utf8'));
+  // PKCS#8 wrapper for a raw ed25519 seed (RFC 8410).
+  return crypto.createPrivateKey({ key: Buffer.concat([Buffer.from('302e020100300506032b657004220420', 'hex'), Buffer.from(seed_hex, 'hex')]), format: 'der', type: 'pkcs8' });
+}
+const publicHex = (k) => crypto.createPublicKey(k).export({ format: 'der', type: 'spki' }).subarray(-32).toString('hex');
+
+async function relayer(p, body) {
+  const r = await fetch(RELAYER + p, body ? { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) } : {});
+  return r.json();
+}
+
+async function walletAddress(cfg) {
+  const args = Buffer.from(JSON.stringify({ path: 'evm', predecessor: WALLET, domain_id: 0 })).toString('base64');
+  const r = await fetch(cfg.rpc, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'query', params: { request_type: 'call_function', finality: 'final', account_id: cfg.signer, method_name: 'derived_public_key', args_base64: args } }) }).then((r) => r.json());
+  const k = JSON.parse(Buffer.from(r.result.result).toString());
+  // secp256k1:<base58 x||y> -> keccak -> last 20 bytes
+  const xy = base58(k.replace('secp256k1:', ''));
+  return getAddress('0x' + keccak256(xy).slice(-40));
+}
+
+function base58(s) {
+  const A = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+  let n = 0n;
+  for (const c of s) n = n * 58n + BigInt(A.indexOf(c));
+  let hex = n.toString(16);
+  if (hex.length % 2) hex = '0' + hex;
+  const lead = s.match(/^1*/)[0].length;
+  return Uint8Array.from(Buffer.from('00'.repeat(lead) + hex, 'hex'));
+}
+
+async function nextSessionNonce(cfg) {
+  const args = Buffer.from(JSON.stringify({ wallet: WALLET, key_id: 'aave-agent' })).toString('base64');
+  const r = await fetch(cfg.rpc, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'query', params: { request_type: 'call_function', finality: 'final', account_id: cfg.extension, method_name: 'get_session', args_base64: args } }) }).then((r) => r.json());
+  const s = JSON.parse(Buffer.from(r.result.result).toString());
+  if (!s) throw new Error('no session aave-agent for this wallet');
+  return s.nonce + 1;
+}
+
+async function send(to, data) {
+  const cfg = await relayer('/config');
+  const from = await walletAddress(cfg);
+  const [nonce, block, prio, gas] = await Promise.all([
+    evm.getTransactionCount({ address: from, blockTag: 'pending' }),
+    evm.getBlock(),
+    evm.estimateMaxPriorityFeePerGas(),
+    evm.estimateGas({ account: from, to, data }).catch(() => 200_000n),
+  ]);
+  const unsigned = {
+    type: 'eip1559', chainId: CHAIN_ID, nonce, to, value: 0n, data,
+    maxPriorityFeePerGas: prio, maxFeePerGas: block.baseFeePerGas * 2n + prio, gas: (gas * 12n) / 10n,
+  };
+  const tx = {
+    chain_id: CHAIN_ID, nonce, max_priority_fee_per_gas: unsigned.maxPriorityFeePerGas.toString(),
+    max_fee_per_gas: unsigned.maxFeePerGas.toString(), gas_limit: Number(unsigned.gas), to, value: '0', data,
+  };
+  // Each signed message carries the session's next nonce, so it can't replay.
+  const signMsg = async () => {
+    const msg = JSON.stringify({
+      domain: 'marvii-session-v1', extension: cfg.extension, wallet: WALLET, key_id: 'aave-agent',
+      nonce: await nextSessionNonce(cfg), deadline_ms: Date.now() + 300_000, action: { type: 'evm_tx', tx },
+    });
+    return { msg, signature: crypto.sign(null, crypto.createHash('sha256').update(msg).digest(), agentKey()).toString('hex') };
+  };
+  let out = await relayer('/agent/execute', await signMsg());
+  const reason = out.reason ?? out.error;
+  console.log(`  NEAR tx ${out.tx_hash ?? '-'}`);
+  let mpcSignature = out.mpc_signature;
+  if (!out.ok || !mpcSignature) {
+    console.log(`  REFUSED by the extension: ${reason ?? 'no signature'}`);
+    if (NEW_TARGET.includes(reason)) {
+      // A new recipient or venue: propose it. It waits out the extension's
+      // delay, during which the owner can cancel it with the passkey.
+      const p = await relayer('/agent/propose', await signMsg());
+      if (!p.queue_id) { console.log(`  proposal refused: ${p.reason ?? p.error}`); return false; }
+      console.log(`  queued as ${p.queue_id}, ready at ${new Date(p.ready_at_ms).toISOString()} (NEAR tx ${p.tx_hash}); the owner can cancel until then`);
+      await new Promise((r) => setTimeout(r, Math.max(0, p.ready_at_ms - Date.now()) + 5000));
+      out = await relayer(`/queued/${p.queue_id}/execute`, {});
+      console.log(`  executed after the delay (NEAR tx ${out.tx_hash})`);
+      if (!out.ok || !out.mpc_signature) { console.log(`  REFUSED at execution: ${out.reason ?? out.error}`); return false; }
+      mpcSignature = out.mpc_signature;
+    } else if (!out.pending_id) return false;
+  }
+  if (!mpcSignature) {
+    // Over the cap: the owner can approve this exact transaction with the
+    // passkey. Wait for that, then broadcast the same transaction.
+    console.log(`  waiting for the owner's approval (request ${out.pending_id})…`);
+    const deadline = Date.now() + 10 * 60_000;
+    for (;;) {
+      const p = await relayer(`/pending/${out.pending_id}`);
+      if (p.status === 'approved') { mpcSignature = p.mpc_signature; console.log(`  approved by the passkey (NEAR tx ${p.near_tx})`); break; }
+      if (p.status === 'rejected') { console.log('  rejected by the owner'); return false; }
+      if (Date.now() > deadline) { console.log('  no approval in 10 minutes'); return false; }
+      await new Promise((r) => setTimeout(r, 3000));
+    }
+  }
+  // The signature must be over this exact transaction: recovering the
+  // sender below proves it (and the extension's own hash must agree).
+  const hash = keccak256(serializeTransaction(unsigned));
+  if (out.ok && out.evm_signing_hash && hash.slice(2) !== out.evm_signing_hash) throw new Error(`hash mismatch: ${hash} vs ${out.evm_signing_hash}`);
+  const sig = mpcSignature;
+  const r = BigInt('0x' + sig.big_r.affine_point.slice(2));
+  let s = BigInt('0x' + sig.s.scalar);
+  let yParity = sig.recovery_id;
+  if (s > N / 2n) { s = N - s; yParity ^= 1; } // low S, as Ethereum requires
+  const signed = serializeTransaction(unsigned, { r: '0x' + r.toString(16).padStart(64, '0'), s: '0x' + s.toString(16).padStart(64, '0'), yParity });
+  const sender = await recoverTransactionAddress({ serializedTransaction: signed });
+  if (sender !== from) throw new Error(`signature recovers to ${sender}, not ${from}`);
+  const txHash = await evm.sendRawTransaction({ serializedTransaction: signed });
+  const rc = await evm.waitForTransactionReceipt({ hash: txHash });
+  console.log(`  Base Sepolia tx ${txHash}: ${rc.status} (block ${rc.blockNumber})`);
+  console.log(`  https://sepolia.basescan.org/tx/${txHash}`);
+  return rc.status === 'success';
+}
+
+const usdc = (x) => BigInt(Math.round(Number(x) * 1e6));
+const [cmd, a1, a2] = process.argv.slice(2);
+if (cmd === 'keygen') {
+  if (!fs.existsSync(keyFile())) fs.writeFileSync(keyFile(), JSON.stringify({ seed_hex: crypto.randomBytes(32).toString('hex') }));
+  console.log(publicHex(agentKey()));
+} else if (cmd === 'approve') {
+  console.log(`approve Aave pool for ${a1} USDC`);
+  await send(USDC, encodeFunctionData({ abi, functionName: 'approve', args: [POOL, usdc(a1)] }));
+} else if (cmd === 'supply') {
+  const from = await walletAddress(await relayer('/config'));
+  console.log(`supply ${a1} USDC to Aave for ${from}`);
+  await send(POOL, encodeFunctionData({ abi, functionName: 'supply', args: [USDC, usdc(a1), from, 0] }));
+} else if (cmd === 'transfer') {
+  console.log(`transfer ${a1} USDC to ${a2}`);
+  await send(USDC, encodeFunctionData({ abi, functionName: 'transfer', args: [a2, usdc(a1)] }));
+} else {
+  console.log('usage: agent.mjs keygen | approve <usdc> | supply <usdc> | transfer <usdc> <0x address>');
+}

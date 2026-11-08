@@ -1,0 +1,42 @@
+[package]
+name = "marvii-near-core"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "The wallet's own types compiled to WebAssembly for the page: the wallet's account ID from a passkey, the exact hash the passkey signs, and the proof the wallet checks"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wasm-bindgen = "=0.2.130"
+hex = "0.4"
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+bs58 = "0.5"
+sha3 = "0.10"
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "arithmetic"] }
+# Only for the shared EVM source file (near/extension/src/evm.rs); its
+# env::keccak256 path is never called here: the hash uses sha3 below.
+near-sdk = { version = "5.30.0", features = ["non-contract-usage"] }
+
+# Pinned to the near/intents commit we built and read (32cd1f9, 4 November 2026).
+defuse-wallet = { git = "https://github.com/near/intents", rev = "32cd1f9788a347908164fbcc56525dc6542f158f", features = ["borsh", "digest", "serde", "json"] }
+defuse-wallet-webauthn = { git = "https://github.com/near/intents", rev = "32cd1f9788a347908164fbcc56525dc6542f158f", features = ["p256", "borsh"] }
+defuse-crypto = { git = "https://github.com/near/intents", rev = "32cd1f9788a347908164fbcc56525dc6542f158f", features = ["p256", "serde", "borsh"] }
+defuse-near-promise = { git = "https://github.com/near/intents", rev = "32cd1f9788a347908164fbcc56525dc6542f158f", features = ["borsh"] }
+p256 = { version = "0.14.0", default-features = false, features = ["ecdsa"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[dev-dependencies]
+defuse-wallet-sdk = { git = "https://github.com/near/intents", rev = "32cd1f9788a347908164fbcc56525dc6542f158f" }
+defuse-wallet-webauthn = { git = "https://github.com/near/intents", rev = "32cd1f9788a347908164fbcc56525dc6542f158f", features = ["p256", "borsh", "mock"] }
+defuse-crypto = { git = "https://github.com/near/intents", rev = "32cd1f9788a347908164fbcc56525dc6542f158f", features = ["p256", "serde", "borsh", "signing"] }
+p256 = { version = "0.14.0", default-features = false, features = ["ecdsa", "getrandom"] }
+sha2 = "0.10"

@@ -1,0 +1,10 @@
+{
+  "name": "@marvii/near-demo-agent",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "A demo agent: holds a session key, asks the Marvii extension for EVM transactions, and broadcasts them once Chain Signatures has signed",
+  "dependencies": {
+    "viem": "2.57.8"
+  }
+}

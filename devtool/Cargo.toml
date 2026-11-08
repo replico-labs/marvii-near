@@ -1,0 +1,27 @@
+[package]
+name = "marvii-near-devtool"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "Testnet deploy and end-to-end check for the Marvii NEAR wallet: global wallet code, the session extension, a passkey wallet, an agent's Chain Signatures request"
+
+[dependencies]
+anyhow = "1"
+bs58 = "0.5"
+getrandom = "0.3"
+k256 = { version = "0.13", features = ["ecdsa"] }
+hex = "0.4"
+serde_json = "1"
+sha2 = "0.10"
+marvii-near-core = { path = "../core" }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+ed25519-dalek = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+
+# Pinned to the near/intents commit we built and read (32cd1f9, 4 November 2026).
+defuse-wallet-sdk = { git = "https://github.com/near/intents", rev = "32cd1f9788a347908164fbcc56525dc6542f158f" }
+defuse-wallet = { git = "https://github.com/near/intents", rev = "32cd1f9788a347908164fbcc56525dc6542f158f", features = ["serde", "json"] }
+defuse-wallet-webauthn = { git = "https://github.com/near/intents", rev = "32cd1f9788a347908164fbcc56525dc6542f158f", features = ["p256", "mock", "borsh"] }
+defuse-crypto = { git = "https://github.com/near/intents", rev = "32cd1f9788a347908164fbcc56525dc6542f158f", features = ["p256", "signing"] }
+near-kit = { version = "0.20.1" }

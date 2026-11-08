@@ -1,0 +1,24 @@
+[package]
+name = "marvii-near-relayer"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "Pays gas for Marvii wallets on NEAR testnet: relays passkey-signed requests to our wallets and agents' signed requests to the session extension"
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+bs58 = "0.5"
+ed25519-dalek = "2"
+near-kit = { version = "0.20.1" }
+marvii-near-core = { path = "../core" }
+
+# Pinned to the near/intents commit we built and read (32cd1f9, 4 November 2026).
+defuse-wallet-sdk = { git = "https://github.com/near/intents", rev = "32cd1f9788a347908164fbcc56525dc6542f158f" }
+defuse-wallet = { git = "https://github.com/near/intents", rev = "32cd1f9788a347908164fbcc56525dc6542f158f", features = ["serde", "json"] }
