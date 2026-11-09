@@ -1,3 +1,4 @@
+import qrcode from 'qrcode-generator';
 import '@fontsource-variable/geist';
 import '@fontsource-variable/geist-mono';
 import './style.css';
@@ -29,13 +30,39 @@ type OtherChain = { id: string; name: string; sym: string; decimals: number; exp
 const post = (url: string, body: unknown) =>
   fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(8000) }).then((r) => r.json());
 const get = (url: string) => fetch(url, { signal: AbortSignal.timeout(8000) }).then((r) => r.json());
-const utxoBalance = async (url: string) => {
-  const j = await get(url);
+/** Bitcoin and Litecoin explorers (mempool.space's API). Calls go through
+ *  the relayer first, because some browsers can't reach the explorers
+ *  directly (blockers, rate limits); then directly as a fallback. */
+const UTXO_DIRECT: Record<string, string> = { bitcoin: 'https://mempool.space/testnet4/api', litecoin: 'https://litecoinspace.org/testnet/api' };
+async function utxoGet(chain: string, path: string) {
+  try {
+    return await relayer<any>(`/utxo/${chain}${path}`);
+  } catch {
+    return get(UTXO_DIRECT[chain] + (path === '/fees' ? '/v1/fees/recommended' : path));
+  }
+}
+async function utxoBroadcast(chain: string, raw: string): Promise<string> {
+  let r: Response;
+  try {
+    r = await fetch(`${RELAYER}/utxo/${chain}/tx`, { method: 'POST', body: raw, signal: AbortSignal.timeout(20000) });
+  } catch {
+    // The relayer is unreachable: broadcast directly.
+    const d = await fetch(`${UTXO_DIRECT[chain]}/tx`, { method: 'POST', body: raw });
+    const t = (await d.text()).trim();
+    if (!d.ok) throw new Error(t);
+    return t;
+  }
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error ?? 'broadcast refused');
+  return j.txid;
+}
+const utxoBalance = async (chain: string, a: string) => {
+  const j = await utxoGet(chain, `/address/${a}`);
   const c = j.chain_stats, m = j.mempool_stats;
   return BigInt(c.funded_txo_sum - c.spent_txo_sum + m.funded_txo_sum - m.spent_txo_sum);
 };
 const OTHER_CHAINS: OtherChain[] = [
-  { id: 'bitcoin', name: 'Bitcoin', sym: 'BTC', decimals: 8, explorer: 'https://mempool.space/testnet4/address/', balance: (a) => utxoBalance(`https://mempool.space/testnet4/api/address/${a}`) },
+  { id: 'bitcoin', name: 'Bitcoin', sym: 'BTC', decimals: 8, explorer: 'https://mempool.space/testnet4/address/', balance: (a) => utxoBalance('bitcoin', a) },
   { id: 'solana', name: 'Solana', sym: 'SOL', decimals: 9, explorer: 'https://explorer.solana.com/address/{}?cluster=devnet',
     balance: async (a) => BigInt((await post('https://api.devnet.solana.com', { jsonrpc: '2.0', id: 1, method: 'getBalance', params: [a] })).result.value) },
   { id: 'tron', name: 'TRON', sym: 'TRX', decimals: 6, explorer: 'https://nile.tronscan.org/#/address/',
@@ -49,7 +76,7 @@ const OTHER_CHAINS: OtherChain[] = [
   { id: 'cardano', name: 'Cardano', sym: 'ADA', decimals: 6, explorer: 'https://preprod.cardanoscan.io/address/',
     // Through the relayer: Koios's POST responses carry no CORS header.
     balance: async (a) => BigInt((await get(`${RELAYER}/balance/cardano/${a}`)).lovelace) },
-  { id: 'litecoin', name: 'Litecoin', sym: 'LTC', decimals: 8, explorer: 'https://litecoinspace.org/testnet/address/', balance: (a) => utxoBalance(`https://litecoinspace.org/testnet/api/address/${a}`) },
+  { id: 'litecoin', name: 'Litecoin', sym: 'LTC', decimals: 8, explorer: 'https://litecoinspace.org/testnet/address/', balance: (a) => utxoBalance('litecoin', a) },
   { id: 'dogecoin', name: 'Dogecoin', sym: 'DOGE', decimals: 8 },
   { id: 'bitcoin-cash', name: 'Bitcoin Cash', sym: 'BCH', decimals: 8 },
   { id: 'zcash', name: 'Zcash', sym: 'ZEC', decimals: 8 },
@@ -79,6 +106,123 @@ function amount(chain: number, token: string, raw: string) {
 /** Addresses as 0x1234…abcd (brand guide); the full one is copied on tap. */
 const short = (a: string) => (a.length > 14 ? `${a.slice(0, 6)}…${a.slice(-4)}` : a);
 const copyable = (a: string) => `<button class="addr mono" data-copy="${esc(a)}" title="Copy">${esc(short(a))}</button>`;
+/** A name in full (not shortened), copyable. */
+const copyableName = (a: string) => `<button class="addr mono" data-copy="${esc(a)}" title="Copy">${esc(a)}</button>`;
+
+// ---- Names: alice.marvii.testnet, a deposit address that forwards here ----
+
+const RESERVED_NAMES = ['marvii', 'admin', 'support', 'help', 'official', 'team', 'wallet', 'near', 'security', 'relayer'];
+/** The registry's rules, checked here first so a bad name never costs a tap. */
+function nameProblem(n: string): string | null {
+  if (!/^[a-z0-9]+([-_][a-z0-9]+)*$/.test(n) || n.length < 2 || n.length > 32) return 'Use 2–32 lowercase letters and digits, with single - or _ between them.';
+  if (RESERVED_NAMES.includes(n) || n.startsWith('0x') || n.startsWith('0s')) return 'That name is reserved.';
+  return null;
+}
+async function nameAvailable(n: string): Promise<boolean> {
+  return (await view<string | null>(cfg.names!, 'wallet_of', { name: n })) === null;
+}
+const registerMessage = (n: string) => core.call_message(cfg.chain_id, wallet, nonce(), createdAt(), cfg.names!, 'register', JSON.stringify({ name: n }), '0', BigInt(60));
+
+/** Live feedback on a name field: format, then availability. */
+function watchName(input: HTMLInputElement, out: HTMLElement) {
+  let t: ReturnType<typeof setTimeout> | undefined;
+  input.oninput = () => {
+    const n = input.value.trim();
+    clearTimeout(t);
+    if (!n) return void (out.textContent = '');
+    const p = nameProblem(n);
+    if (p) return void (out.textContent = p);
+    out.textContent = 'Checking…';
+    t = setTimeout(() => nameAvailable(n).then((ok) => (out.textContent = ok ? `${n}.${cfg.names} is available` : 'That name is taken')).catch(() => (out.textContent = '')), 300);
+  };
+}
+
+/** For an account without a name: choose one, approved with the passkey. */
+function nameForm() {
+  const m = document.getElementById('modal')!;
+  m.innerHTML = `
+    <div class="backdrop"><form class="card sheet" id="send">
+      <h2>Choose a name</h2>
+      <p class="small muted">Anyone can send NEAR and tokens to your name, from any wallet or exchange. It forwards everything to this account. A name can't be changed later.</p>
+      <label>Name <span class="row"><input name="name" required class="mono" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="alice"><span class="muted mono">.${esc(cfg.names)}</span></span></label>
+      <p class="small muted" id="name-note"></p>
+      <div class="row end"><button type="button" class="secondary" id="cancel">Cancel</button><button class="primary">Review</button></div>
+      <div id="status" class="status"></div>
+    </form></div>`;
+  const input = m.querySelector<HTMLInputElement>('input[name=name]')!;
+  watchName(input, document.getElementById('name-note')!);
+  document.getElementById('cancel')!.onclick = () => (m.innerHTML = '');
+  (document.getElementById('send') as HTMLFormElement).onsubmit = async (ev) => {
+    ev.preventDefault();
+    try {
+      const n = input.value.trim();
+      const p = nameProblem(n);
+      if (p) throw new Error(p);
+      if (!(await nameAvailable(n))) throw new Error('That name is taken');
+      confirm(registerMessage(n), { after: async () => `Your name is ${copyableName(`${n}.${cfg.names}`)}` });
+    } catch (e) {
+      status(String((e as Error).message ?? e), 'error');
+    }
+  };
+}
+
+let nearBalance = '0';
+/** Sends NEAR to any account or name; the passkey approves the exact transfer. */
+function nearSendForm() {
+  const m = document.getElementById('modal')!;
+  m.innerHTML = `
+    <div class="backdrop"><form class="card sheet" id="send">
+      <h2>Send on NEAR</h2>
+      <p class="small muted">Balance ${esc(formatNear(nearBalance))} NEAR. Keep a little for your account's storage.</p>
+      <label>To <input name="to" required class="mono" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="alice.testnet"></label>
+      <label>Amount (NEAR) <input name="amount" required inputmode="decimal" placeholder="0.0"></label>
+      <div class="row end"><button type="button" class="secondary" id="cancel">Cancel</button><button class="primary">Review</button></div>
+      <div id="status" class="status"></div>
+    </form></div>`;
+  document.getElementById('cancel')!.onclick = () => (m.innerHTML = '');
+  (document.getElementById('send') as HTMLFormElement).onsubmit = async (ev) => {
+    ev.preventDefault();
+    try {
+      const f = new FormData(ev.target as HTMLFormElement);
+      const to = String(f.get('to')).trim().toLowerCase();
+      const yocto = toUnits(String(f.get('amount')), 24);
+      if (BigInt(yocto) > BigInt(nearBalance)) throw new Error('More than your balance');
+      if (!(await account(to))) throw new Error('No NEAR account by that name');
+      const msg = core.transfer_message(cfg.chain_id, wallet, nonce(), createdAt(), to, yocto);
+      confirm(msg, { after: async (out) => `Sent. <a target="_blank" rel="noopener" href="https://testnet.nearblocks.io/txns/${esc(out.tx_hash)}">View transaction</a>` });
+    } catch (e) {
+      status(String((e as Error).message ?? e), 'error');
+    }
+  };
+}
+
+/** The NEAR row: the name as the address people send to, and the account. */
+async function fillNear() {
+  const [a, name] = await Promise.all([
+    account(wallet),
+    cfg.names ? view<string | null>(cfg.names, 'name_of', { wallet }).catch(() => null) : Promise.resolve(null),
+  ]);
+  const bal = `${a ? formatNear(a.amount) : '0.0000'} NEAR`;
+  const d = document.getElementById('chain-near');
+  if (!d) return;
+  d.querySelector('.bal')!.textContent = bal;
+  const rows = name
+    ? `<div class="row between small"><span class="muted">Your NEAR address</span><span>${copyableName(name)}</span></div>
+       <div class="row between small"><span class="muted">Account</span><span>${copyable(wallet)}</span></div>`
+    : `<div class="row between small"><span class="muted">Address</span><span>${copyable(wallet)}</span></div>`;
+  const choose = !name && cfg.names ? `<div class="row end"><button class="secondary small-btn" data-name="1">Choose a name</button></div>` : '';
+  deposits['chain-near'] = { address: wallet, name: name ?? undefined };
+  nearBalance = a ? a.amount : '0';
+  d.querySelector('.assets')!.innerHTML = rows + `<div class="row between"><span>NEAR</span><span>${esc(bal.split(' ')[0])}</span></div>` + actions('chain-near', 'near') + choose;
+  if (name) {
+    // Deposits sent to the name wait there until forwarded; ask now rather
+    // than wait for the relayer's next round.
+    relayer<{ forwarded: boolean }>('/names/forward', { name })
+      .then((r) => (r.forwarded ? fillNear() : undefined))
+      .catch(() => {});
+  }
+}
+
 const named = (chain: number, addr: string) => (POOLS[`${chain}:${addr}`] ? `${esc(POOLS[`${chain}:${addr}`])} ` : '') + copyable(addr);
 
 const app = document.getElementById('app')!;
@@ -117,12 +261,57 @@ function status(msg: string, kind: 'info' | 'error' | 'ok' = 'info') {
   }
 }
 
+// ---- The loader: an animated Marvii mark over the page while we wait ----
+
+const MARK = `<svg class="mark" viewBox="0 0 64 64" aria-hidden="true"><path d="M11 52V30a10.5 10.5 0 0 1 21 0v22M32 52V30a10.5 10.5 0 0 1 21 0v22" pathLength="100" fill="none" stroke="currentColor" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+/** Shows the loader with `text`, or hides it with null. */
+function busy(text: string | null) {
+  let el = document.getElementById('busy');
+  if (text === null) return void el?.remove();
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'busy';
+    el.className = 'busy';
+    el.setAttribute('role', 'status');
+    el.setAttribute('aria-live', 'polite');
+    el.innerHTML = `<div class="busy-card">${MARK}<p></p></div>`;
+    document.body.appendChild(el);
+  }
+  el.querySelector('p')!.textContent = text;
+}
+/** Rejects after `ms`, so nothing waits forever. */
+function within<T>(p: Promise<T>, ms: number): Promise<T> {
+  return Promise.race([p, new Promise<T>((_, no) => setTimeout(() => no(new Error('timeout')), ms))]);
+}
+/** Calls `check` every 2 s until it returns something, for up to `ms`. */
+async function until<T>(check: () => Promise<T | null | undefined>, ms: number): Promise<T | null> {
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    const v = await check().catch(() => null);
+    if (v) return v;
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+  return null;
+}
+/** Back to the wallet after an action; if that fails, reload the page. */
+async function backToWallet() {
+  try {
+    await within(dashboard(), 30000);
+  } catch {
+    location.reload();
+  }
+}
+
 async function main() {
   await init();
   cfg = await relayer<Config>('/config');
   setRpc(cfg.rpc);
   // Read-only view of any wallet: ?wallet=0s… (no passkey, no buttons).
-  const viewOnly = new URLSearchParams(location.search).get('wallet');
+  let viewOnly = new URLSearchParams(location.search).get('wallet');
+  // A name works too: ?wallet=alice.marvii.testnet
+  if (viewOnly && cfg.names && viewOnly.endsWith(`.${cfg.names}`)) {
+    viewOnly = await view<string | null>(cfg.names, 'wallet_of', { name: viewOnly }).catch(() => null);
+  }
   if (viewOnly && /^0s[0-9a-f]{40}$/.test(viewOnly)) {
     wallet = viewOnly;
     document.body.classList.add('readonly');
@@ -134,7 +323,9 @@ async function main() {
     // The address comes from the extension the wallet was created with; it
     // keeps that address when the passkey moves it to a newer extension.
     wallet = (pk as Passkey & { wallet?: string }).wallet ?? core.wallet_account_id(cfg.wallet_code_hash, pk.publicKey, cfg.extension);
-    await dashboard();
+    busy('Opening your wallet…');
+    await backToWallet();
+    busy(null);
   } else {
     start();
   }
@@ -145,24 +336,43 @@ function start() {
     <section class="card hero">
       <h1>One passkey, every chain</h1>
       <p>No seed phrase, no password. Give agents and apps limited, revocable permission to act for you, and approve anything outside it with one tap.</p>
+      ${cfg.names ? `<label class="small">Choose your name <span class="row"><input id="name" class="mono" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="alice"><span class="muted mono">.${esc(cfg.names)}</span></span></label><p class="small muted" id="name-note">Anyone can send to it from any wallet or exchange. Optional; you can choose one later.</p>` : ''}
       <button id="create" class="primary">Create with a passkey</button>
       <p class="muted small">Testnet only. Unaudited.</p>
       <div id="status" class="status"></div>
     </section>`);
+  const nameInput = document.getElementById('name') as HTMLInputElement | null;
+  if (nameInput) watchName(nameInput, document.getElementById('name-note')!);
   document.getElementById('create')!.onclick = async () => {
     try {
-      status('Creating your passkey…');
+      const chosen = nameInput?.value.trim() ?? '';
+      if (chosen) {
+        const p = nameProblem(chosen);
+        if (p) throw new Error(p);
+        if (!(await nameAvailable(chosen))) throw new Error('That name is taken. Try another.');
+      }
+      busy('Creating your passkey…');
       const p = await createPasskey(`Marvii ${new Date().toISOString().slice(0, 10)}`);
       pk = p;
       wallet = core.wallet_account_id(cfg.wallet_code_hash, p.publicKey, cfg.extension);
       store.passkey = { ...p, wallet } as Passkey;
-      status('Activating your wallet: approve with your passkey once more…');
-      const msg = core.empty_message(cfg.chain_id, wallet, nonce(), createdAt());
-      const out = await signAndRelay(msg);
-      if (!out.ok) throw new Error('Activation failed: ' + JSON.stringify(out.failures));
-      await relayer('/wallet/fund', { public_key: p.publicKey, wallet }).catch(() => {});
-      await dashboard();
+      busy('Activating your wallet: approve with your passkey once more…');
+      // With a name, the same tap that activates the wallet registers it.
+      const msg = chosen ? registerMessage(chosen) : core.empty_message(cfg.chain_id, wallet, nonce(), createdAt());
+      // Phones can drop the connection while the passkey sheet is open, so
+      // whatever the relay call says, wait for the account itself.
+      const out = await within(signAndRelay(msg), 90000).catch(() => null);
+      busy('Setting up your wallet…');
+      const created = await until(() => account(wallet), 60000);
+      if (!created) throw new Error('Activation did not go through. Please try again.');
+      await within(relayer('/wallet/fund', { public_key: p.publicKey, wallet }), 30000).catch(() => {});
+      busy('Opening your wallet…');
+      await backToWallet();
+      busy(null);
+      const named = chosen && cfg.names ? await view<string | null>(cfg.names, 'name_of', { wallet }).catch(() => null) : null;
+      if (chosen && !named) status(`Your account is ready, but the name ${chosen} couldn't be registered. Choose a name from the NEAR row.`, 'error');
     } catch (e) {
+      busy(null);
       status(String((e as Error).message ?? e), 'error');
     }
   };
@@ -182,7 +392,18 @@ async function signAndRelay(msgJson: string, pendingId?: number): Promise<Outcom
   const a = await signChallenge(pk!, challenge);
   const proof = core.make_proof(a.authenticatorData, a.clientDataJSON, a.signature);
   if (!core.verify_proof(pk!.publicKey, msg, proof)) throw new Error('The passkey signature does not verify');
-  return relayer<Outcome>('/wallet/relay', { public_key: pk!.publicKey, msg: JSON.parse(msg), proof, pending_id: pendingId });
+  // The same signed message can be sent again without another tap: if an
+  // earlier attempt did land, the wallet refuses the repeat (same nonce).
+  // Errors that can never succeed aren't retried.
+  const permanent = /does not verify|not a Marvii wallet|wrong chain_id|nonce already used|expired/i;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await relayer<Outcome>('/wallet/relay', { public_key: pk!.publicKey, msg: JSON.parse(msg), proof, pending_id: pendingId });
+    } catch (e) {
+      if (attempt >= 3 || permanent.test(String((e as Error).message))) throw e;
+      await new Promise((r) => setTimeout(r, 3000 * attempt));
+    }
+  }
 }
 
 async function evmAddress(): Promise<string> {
@@ -224,6 +445,39 @@ type Session = {
   revoked: boolean;
 };
 
+/** What the Deposit sheet shows for each row. */
+const deposits: Record<string, { address: string; name?: string }> = {};
+/** Send (where this page can send on that chain) and Deposit, on every row. */
+function actions(id: string, sendChain?: number | string) {
+  const send = sendChain !== undefined ? `<button class="secondary small-btn" data-send="${sendChain}">Send</button>` : `<span class="muted small">Send coming soon</span>`;
+  return `<div class="row end">${send}<button class="secondary small-btn" data-deposit="${id}">Deposit</button></div>`;
+}
+
+/** Deposit: the address to send to, as text and a QR code. */
+function depositSheet(id: string) {
+  const d = deposits[id];
+  if (!d?.address) return;
+  const chain = document.querySelector(`#${id} summary b`)?.textContent ?? '';
+  const shown = d.name ?? d.address;
+  const qr = qrcode(0, 'M');
+  qr.addData(shown);
+  qr.make();
+  const evm = EVM_CHAINS.some((c) => `chain-${c.id}` === id);
+  const note = id === 'chain-near'
+    ? d.name ? 'Send NEAR or tokens to this name from any wallet or exchange. It forwards everything to your account.' : 'Some NEAR wallets don\'t accept this address yet. Choose a name in the NEAR row for one that works everywhere.'
+    : evm ? `The same address works on every EVM chain here. Send only on ${esc(chain)} test network.` : `Send only ${esc(chain)} test network coins to this address.`;
+  document.getElementById('modal')!.innerHTML = `
+    <div class="backdrop"><div class="card sheet deposit">
+      <h2>Deposit on ${esc(chain)}</h2>
+      <div class="qr">${qr.createSvgTag({ cellSize: 4, margin: 2, scalable: true })}</div>
+      <p class="mono addr-full">${esc(shown)}</p>
+      ${d.name ? `<p class="small muted">Account ${esc(d.address)}</p>` : ''}
+      <p class="small muted">${note}</p>
+      <div class="row end"><button class="secondary" id="cancel">Close</button><button class="primary" data-copy="${esc(shown)}">Copy address</button></div>
+    </div></div>`;
+  document.getElementById('cancel')!.onclick = () => (document.getElementById('modal')!.innerHTML = '');
+}
+
 function chainRow(id: string, name: string) {
   return `<li><details id="${id}"><summary class="row between"><b>${esc(name)}</b><span class="muted bal">…</span></summary><div class="assets"></div></details></li>`;
 }
@@ -234,7 +488,8 @@ function fillChain(id: string, address: string, native: string, assets: string[]
   const d = document.getElementById(id)!;
   d.querySelector('.bal')!.textContent = native;
   const link = explorer ? ` <a class="small" target="_blank" rel="noopener" href="${esc(explorer)}">Explorer</a>` : '';
-  const send = sendChain ? `<div class="row end"><button class="secondary small-btn" data-send="${sendChain}">Send</button></div>` : '';
+  deposits[id] = { address };
+  const send = actions(id, sendChain);
   d.querySelector('.assets')!.innerHTML =
     `<div class="row between small"><span class="muted">Address</span><span>${copyable(address)}${link}</span></div>` +
     [`<div class="row between"><span>${esc(native.split(' ').pop()!)}</span><span>${esc(native.split(' ')[0])}</span></div>`, ...assets].join('') +
@@ -387,7 +642,7 @@ function btcSendForm(chain = 'bitcoin') {
       const to = String(f.get('to')).trim();
       const sat = toUnits(String(f.get('amount')), 8);
       status('Preparing…');
-      const [utxos, fees] = await Promise.all([get(`${c.api}/address/${acct.address}/utxo`), get(`${c.api}/v1/fees/recommended`)]);
+      const [utxos, fees] = await Promise.all([utxoGet(chain, `/address/${acct.address}/utxo`), utxoGet(chain, '/fees')]);
       const btcPlan = core.bitcoin_plan(acct.address, to, sat, JSON.stringify(utxos.map((u: any) => ({ txid: u.txid, vout: u.vout, value: u.value }))), Math.max(1, fees.halfHourFee));
       const msg = core.owner_ecdsa_multi_sign_message(cfg.chain_id, wallet, nonce32(), createdAt(), cfg.signer, chain, JSON.stringify(JSON.parse(btcPlan).sighashes));
       confirm(msg, {
@@ -395,9 +650,7 @@ function btcSendForm(chain = 'bitcoin') {
         after: async (out) => {
           const sigs = (out as any).mpc_signatures ?? [];
           const signed = JSON.parse(core.bitcoin_signed_tx(btcPlan, JSON.stringify(sigs)));
-          const r = await fetch(`${c.api}/tx`, { method: 'POST', body: signed.raw });
-          const txid = (await r.text()).trim();
-          if (!r.ok) throw new Error(txid);
+          const txid = await utxoBroadcast(chain, signed.raw);
           return `Sent. <a target="_blank" rel="noopener" href="${c.tx}${esc(txid)}">View transaction</a>`;
         },
       });
@@ -454,6 +707,16 @@ function sendForm(chainId: number) {
   const c = EVM_CHAINS.find((x) => x.id === chainId)!;
   const assets = holdings[chainId] ?? [];
   const m = document.getElementById('modal')!;
+  if (!assets.length) {
+    m.innerHTML = `
+      <div class="backdrop"><div class="card sheet">
+        <h2>Send on ${esc(c.name)}</h2>
+        <p class="muted">Nothing to send on ${esc(c.name)} yet. Use Deposit to add funds first.</p>
+        <div class="row end"><button class="secondary" id="cancel">Close</button></div>
+      </div></div>`;
+    document.getElementById('cancel')!.onclick = () => (m.innerHTML = '');
+    return;
+  }
   m.innerHTML = `
     <div class="backdrop"><form class="card sheet" id="send">
       <h2>Send on ${esc(c.name)}</h2>
@@ -531,14 +794,17 @@ async function dashboard() {
       b.classList.add('copied');
       setTimeout(() => b.classList.remove('copied'), 1200);
     }
+    if ((e.target as HTMLElement).closest('[data-name]')) nameForm();
+    const dep = (e.target as HTMLElement).closest<HTMLElement>('[data-deposit]');
+    if (dep) depositSheet(dep.dataset.deposit!);
     const sb = (e.target as HTMLElement).closest<HTMLElement>('[data-send]');
     if (sb) {
       const k = sb.dataset.send!;
-      k === 'solana' ? solSendForm() : k === 'bitcoin' || k === 'litecoin' ? btcSendForm(k) : k === 'tron' ? tronSendForm() : k === 'xrp' ? xrpSendForm() : sendForm(Number(k));
+      k === 'near' ? nearSendForm() : k === 'solana' ? solSendForm() : k === 'bitcoin' || k === 'litecoin' ? btcSendForm(k) : k === 'tron' ? tronSendForm() : k === 'xrp' ? xrpSendForm() : sendForm(Number(k));
     }
   };
 
-  account(wallet).then((a) => fillChain('chain-near', wallet, `${a ? formatNear(a.amount) : '0.0000'} NEAR`, []));
+  fillNear().catch(() => fillChain('chain-near', wallet, '– NEAR', []));
   for (const c of OTHER_CHAINS) {
     const { path, domain_id } = JSON.parse(core.chain_path(c.id));
     view<string>(cfg.signer, 'derived_public_key', { path, predecessor: wallet, domain_id })
@@ -550,7 +816,7 @@ async function dashboard() {
         if (c.id in UTXO_SEND) utxoAccounts[c.id] = { address: addr, balance: bal };
         if (c.id === 'tron') tron = { address: addr, balance: bal };
         if (c.id === 'xrp') xrp = { address: addr, balance: bal, key: k };
-        const canSend = ['solana', 'bitcoin', 'litecoin', 'tron', 'xrp'].includes(c.id) && bal !== '–' && Number(bal) > 0;
+        const canSend = ['solana', 'bitcoin', 'litecoin', 'tron', 'xrp'].includes(c.id);
         fillChain(`chain-${c.id}`, addr, `${bal} ${c.sym}`, [], explorer, canSend ? c.id : undefined);
       })
       .catch(() => fillChain(`chain-${c.id}`, '', `– ${c.sym}`, []));
@@ -574,8 +840,7 @@ async function dashboard() {
               }),
             );
             holdings[c.id] = held;
-            const canSend = held.some((h) => Number(h.balance) > 0);
-            fillChain(`chain-${c.id}`, addr, native, rows.filter(Boolean), c.explorer ? c.explorer + addr : undefined, canSend ? c.id : undefined);
+            fillChain(`chain-${c.id}`, addr, native, rows.filter(Boolean), c.explorer ? c.explorer + addr : undefined, c.id);
           });
       }
     })
@@ -786,7 +1051,7 @@ type Described = {
 
 /** Plain words for a call, worked out from the decoded arguments. */
 function explain(receiver: string, a: Described['external'][0]['actions'][0], tx?: string, solMessage?: string, btcPlan?: string, tronRaw?: string, xrpTx?: string): string {
-  if (a.kind === 'transfer') return `Send ${formatNear(a.amount_yocto!)} NEAR to ${esc(receiver)}`;
+  if (a.kind === 'transfer') return `<b>Approve:</b> Send <b>${formatNear(a.amount_yocto!)} NEAR</b> to ${receiver.length > 32 ? copyable(receiver) : copyableName(receiver)} on NEAR`;
   if (a.kind !== 'function_call') return `<span class="error">Unrecognised action: ${esc(JSON.stringify(a))}</span>`;
   const ours = receiver === cfg.extension;
   if (ours && a.method === 'grant_session') {
@@ -851,6 +1116,9 @@ function explain(receiver: string, a: Described['external'][0]['actions'][0], tx
     }
     return `<b>Approve:</b> ${explainEvm(d)}<div class="small muted">Gas limit ${esc(JSON.parse(tx).gas_limit)} · EVM nonce ${esc(JSON.parse(tx).nonce)}</div>`;
   }
+  if (cfg.names && receiver === cfg.names && a.method === 'register' && a.deposit_yocto === '0') {
+    return `<b>Take the name ${copyableName(`${a.args?.name}.${cfg.names}`)}</b> for this account. NEAR and tokens sent to it are forwarded here. It can't be changed later.`;
+  }
   if (ours && a.method === 'cancel_queued') return `<b>Cancel queued request #${esc(a.args.id)}</b>. It will never run.`;
   if (ours && a.method === 'revoke_session') return `<b>Revoke the session key ${esc(a.args.key_id)}</b>. Its next request is refused.`;
   return `<span class="warn">Call ${esc(a.method)} on ${esc(receiver)}</span>${ours ? '' : ' <b class="error">(not the Marvii extension)</b>'}`;
@@ -872,7 +1140,7 @@ function confirm(msgJson: string, ctx: { pendingId?: number; tx?: string; solMes
     p.actions.map(
       (a) => `<li>${explainSafe(p.receiver_id, a, ctx.tx, ctx.solMessage, ctx.btcPlan, ctx.tronRaw, ctx.xrpTx)}
         <div class="small muted">${a.deposit_yocto && a.deposit_yocto !== '0' ? `Attaches ${formatNear(a.deposit_yocto)} NEAR · ` : ''}${a.gas_tgas ? `${a.gas_tgas} TGas` : ''}</div>
-        <details><summary class="small">Exact arguments</summary><pre class="mono small">${esc(JSON.stringify(a.args, null, 2))}</pre></details></li>`,
+        ${a.args === undefined ? '' : `<details><summary class="small">Exact arguments</summary><pre class="mono small">${esc(JSON.stringify(a.args, null, 2))}</pre></details>`}</li>`,
     ),
   );
   m.innerHTML = `
@@ -887,20 +1155,36 @@ function confirm(msgJson: string, ctx: { pendingId?: number; tx?: string; solMes
   if (blocked) (document.getElementById('yes') as HTMLButtonElement).disabled = true;
   document.getElementById('no')!.onclick = () => (m.innerHTML = '');
   document.getElementById('yes')!.onclick = async () => {
+    let sent = false;
     try {
-      status('Waiting for your passkey…');
-      const out = await signAndRelay(msg, ctx.pendingId);
+      busy('Waiting for your passkey…');
+      const relay = signAndRelay(msg, ctx.pendingId);
+      relay.then(() => busy('Confirming…')).catch(() => {});
+      const out = await within(relay, 120000);
+      sent = true;
       if (!out.ok) throw new Error('Refused on-chain: ' + JSON.stringify(out.failures));
-      const done = ctx.after ? await ctx.after(out) : `Done. Transaction ${esc(out.tx_hash)}`;
+      busy(ctx.after ? 'Sending…' : 'Confirming…');
+      const done = ctx.after ? await within(ctx.after(out), 90000) : `Done. Transaction ${esc(out.tx_hash)}`;
       m.innerHTML = '';
-      await dashboard();
+      busy('Updating your wallet…');
+      await backToWallet();
+      busy(null);
       const el = document.getElementById('status');
       if (el) {
         el.className = 'status ok';
         el.innerHTML = done;
       }
     } catch (e) {
-      status(String((e as Error).message ?? e), 'error');
+      busy(null);
+      const msg = String((e as Error).message ?? e);
+      if (msg === 'timeout') {
+        // It may still land: go back to the wallet, where balances update.
+        m.innerHTML = '';
+        await backToWallet();
+        status(sent ? 'Approved, still confirming. Your balances update when it lands.' : 'This is taking longer than usual. Check your balances in a minute.', 'info');
+      } else {
+        status(msg, 'error');
+      }
     }
   };
 }

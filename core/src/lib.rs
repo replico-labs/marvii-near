@@ -151,6 +151,31 @@ pub fn call_message(
     serde_json::to_string(&msg).map_err(err)
 }
 
+/// The owner sends NEAR: one transfer to `receiver` (any account, a name
+/// included). Confirm shows it from the decoded message.
+#[wasm_bindgen]
+pub fn transfer_message(chain_id: &str, wallet: &str, nonce: u32, created_at_secs: i64, receiver: &str, yocto: &str) -> Result<String, String> {
+    use defuse_wallet::{NearPromise, NearToken, Request, Timestamp};
+    let amount: u128 = yocto.parse().map_err(err)?;
+    if amount == 0 {
+        return Err("nothing to send".into());
+    }
+    if receiver == wallet {
+        return Err("sending to yourself".into());
+    }
+    let promise = NearPromise::new(receiver.parse::<defuse_wallet::AccountId>().map_err(|_| "not a NEAR account".to_string())?).transfer(NearToken::from_yoctonear(amount));
+    let msg = RequestMessage {
+        pay_for_gas: false,
+        chain_id: chain_id.to_string(),
+        signer_id: wallet.parse().map_err(err)?,
+        nonce,
+        created_at: Timestamp::from_secs(created_at_secs).ok_or("bad time")?,
+        timeout: core::time::Duration::from_secs(600),
+        request: Request { internal: vec![], external: vec![promise] },
+    };
+    serde_json::to_string(&msg).map_err(err)
+}
+
 /// An empty request: the first one deploys the wallet (the relayer
 /// attaches the state init) without doing anything else.
 #[wasm_bindgen]

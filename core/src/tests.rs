@@ -521,3 +521,17 @@ fn litecoin_and_bitcoin_addresses_dont_mix() {
     let b = bitcoin_plan(BTC_FROM, "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx", "50000", &utxos, 1).unwrap();
     assert_eq!(serde_json::from_str::<serde_json::Value>(&describe_bitcoin_plan(&b).unwrap()).unwrap()["chain"], "bitcoin");
 }
+
+#[test]
+fn near_transfer_message_decodes_to_one_transfer() {
+    let w = "0s3465557e026f471c0e84898f799c8032f356c77a";
+    let m = transfer_message("testnet", w, 7, 1_762_600_000, "alice.marvii.testnet", "1500000000000000000000000").unwrap();
+    let d: serde_json::Value = serde_json::from_str(&describe_message(&m).unwrap()).unwrap();
+    assert_eq!(d["external"][0]["receiver_id"], "alice.marvii.testnet");
+    assert_eq!(d["external"][0]["actions"][0]["kind"], "transfer");
+    assert_eq!(d["external"][0]["actions"][0]["amount_yocto"], "1500000000000000000000000");
+    assert_eq!(d["internal"].as_array().unwrap().len(), 0);
+    assert!(transfer_message("testnet", w, 7, 1_762_600_000, w, "1").is_err(), "to yourself");
+    assert!(transfer_message("testnet", w, 7, 1_762_600_000, "Not An Account", "1").is_err());
+    assert!(transfer_message("testnet", w, 7, 1_762_600_000, "bob.testnet", "0").is_err());
+}

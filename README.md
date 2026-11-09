@@ -56,8 +56,12 @@ All of the following ran on NEAR testnet and each chain's testnet (8–9 Novembe
   - the WebAuthn proof
   - the EVM transaction decoding and hash, sharing the extension's `evm.rs` source
 - **`relayer/`** pays gas and nothing else. It only relays for wallets built from our code, and checks the passkey's proof before spending gas. Everything it forwards is checked again on-chain.
-- **`web/`** is the page: create with a passkey, balances per chain with Send (EVM, Solana, Bitcoin, Litecoin, TRON, XRP), agents and apps, Confirm (it decodes exactly what the passkey signs), approvals, and the queue.
+- **`web/`** is the page: create with a passkey, balances per chain with Deposit (address and QR code) on every chain and Send on NEAR, EVM, Solana, Bitcoin, Litecoin, TRON and XRP, agents and apps, Confirm (it decodes exactly what the passkey signs), approvals, and the queue.
 - **`agent/`** is a demo agent. It holds only a session key. Before broadcasting, it checks the signature recovers to the account's address for its own transaction.
+- **`names/`** and **`forwarder/`** give each account a name, e.g. `alice.marvii.testnet`. NEAR wallet apps and exchanges don't yet accept `0s…` accounts (NEP-616) as recipients; a name works everywhere.
+  - `names/` is the registry, deployed at `marvii.testnet`. The account calls `register("alice")` itself, so only its passkey can claim a name for it, and the page puts this in the same tap that activates the account. One name per account; a name is never reassigned.
+  - The registry creates `alice.marvii.testnet` with no keys, running `forwarder/` (shared global code, published once by hash), with the account as its only target. NEAR sent to the name is forwarded by the relayer within about 20 seconds (anyone may call `forward`); tokens sent with `ft_transfer_call` are forwarded at once, and with a plain `ft_transfer` by `forward_ft`.
+  - The forwarder is written against near-sdk's low-level `env` without its macros, to keep the global code small (27 KB): publishing burns NEAR per byte.
 - **`devtool/`** handles deployment, a demo account and end-to-end runs.
 
 ## Deployed on NEAR testnet
@@ -67,16 +71,19 @@ All of the following ran on NEAR testnet and each chain's testnet (8–9 Novembe
 | Wallet code (`defuse-wallet-webauthn-p256`, near/intents `32cd1f9`), immutable global contract | `909f39dd861604db7f75eafad948b6cf288ffc81db1fb59177030f227721c98e` |
 | Marvii extension v3 | `2dc4e98d9de62211b1263a9a75d3c71caf45795719b790f12921198af309ba18` |
 | Chain Signatures | `v1.signer-prod.testnet` |
+| Names registry; forwarder code hash | `marvii.testnet`; `9428c9b6ea5401af2ecd8487170c5ceb409daa81133b8b62d70f59105d7f795e` |
 | Demo account | `0s3465557e026f471c0e84898f799c8032f356c77a`, EVM `0x48f0deef2c7e15ea9b4398a6875b43b5ab6ea81e` |
 
 ## Run it
 
 Requirements: Rust 1.97 with `wasm32-unknown-unknown`, Node 22, and a funded NEAR testnet account for the relayer.
 
-1. **Test the contracts.** Expect 38 extension tests and 30 core tests to pass:
+1. **Test the contracts.** Expect 38 extension tests, 31 core tests, 6 registry tests and 8 forwarder tests to pass:
    ```sh
    cd extension && cargo test
    cd ../core && cargo test
+   cd ../names && cargo test
+   cd ../forwarder && cargo test
    ```
 2. **Start the relayer** against the deployed contracts. Put the relayer account's key in the environment, never in a file in the repo:
    ```sh
@@ -99,6 +106,7 @@ Requirements: Rust 1.97 with `wasm32-unknown-unknown`, Node 22, and a funded NEA
    ```sh
    cd web && node e2e/testnet.mjs
    ```
+   Names, both at creation and chosen later: `node e2e/names.mjs`.
 
 To host the relayer, see `relayer/Dockerfile`. Build it from this directory: `docker build -f relayer/Dockerfile .`.
 
@@ -118,6 +126,8 @@ To host the relayer, see `relayer/Dockerfile`. Build it from this directory: `do
 - Known limits:
   - testnet only, unaudited
   - the relayer's list of requests awaiting approval lives in memory, and it has no rate limits
+  - NEAR sent to a name waits on the name until forwarded (a plain transfer runs no code); the relayer forwards every 20 seconds
+  - during the hackathon we keep a key to `marvii.testnet`. It can't touch existing names (they have no keys and their target is fixed), but it could redeploy the registry or create names directly; it's deleted before mainnet
   - caps count `approve` allowances; a venue that pulls funds another way would need its own amount rule
   - bare-message signing (EIP-712) isn't supported; if added, the chain must be bound inside the signed data
 

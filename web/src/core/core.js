@@ -910,6 +910,55 @@ export function solana_transfer_message(from, to, lamports, recent_blockhash) {
 }
 
 /**
+ * The owner sends NEAR: one transfer to `receiver` (any account, a name
+ * included). Confirm shows it from the decoded message.
+ * @param {string} chain_id
+ * @param {string} wallet
+ * @param {number} nonce
+ * @param {bigint} created_at_secs
+ * @param {string} receiver
+ * @param {string} yocto
+ * @returns {string}
+ */
+export function transfer_message(chain_id, wallet, nonce, created_at_secs, receiver, yocto) {
+    let deferred8_0;
+    let deferred8_1;
+    try {
+        const val5 = +nonce;
+        const val6 = BigInt.asIntN(64, created_at_secs);
+        let ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3;
+        try {
+            ptr0 = passStringToWasm0(chain_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            len0 = WASM_VECTOR_LEN;
+            ptr1 = passStringToWasm0(wallet, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            len1 = WASM_VECTOR_LEN;
+            ptr2 = passStringToWasm0(receiver, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            len2 = WASM_VECTOR_LEN;
+            ptr3 = passStringToWasm0(yocto, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            len3 = WASM_VECTOR_LEN;
+        } catch (e) {
+            if (ptr3) { wasm.__wbindgen_free(ptr3, len3 * 1, 1); }
+            if (ptr2) { wasm.__wbindgen_free(ptr2, len2 * 1, 1); }
+            if (ptr1) { wasm.__wbindgen_free(ptr1, len1 * 1, 1); }
+            if (ptr0) { wasm.__wbindgen_free(ptr0, len0 * 1, 1); }
+            throw e;
+        }
+        const ret = wasm.transfer_message(ptr0, len0, ptr1, len1, val5, val6, ptr2, len2, ptr3, len3);
+        var ptr7 = ret[0];
+        var len7 = ret[1];
+        if (ret[3]) {
+            ptr7 = 0; len7 = 0;
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        deferred8_0 = ptr7;
+        deferred8_1 = len7;
+        return getStringFromWasm0(ptr7, len7);
+    } finally {
+        wasm.__wbindgen_free(deferred8_0, deferred8_1, 1);
+    }
+}
+
+/**
  * The signed transaction as protobuf hex (for `broadcasthex`), after
  * checking the MPC signature over the txid recovers to `from`.
  * @param {string} raw_hex

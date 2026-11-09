@@ -25,6 +25,7 @@ export const owner_evm_sign_message: (a: number, b: number, c: number, d: number
 export const request_hash: (a: number, b: number) => [number, number, number, number];
 export const solana_signed_tx: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
 export const solana_transfer_message: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => [number, number, number, number];
+export const transfer_message: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number, h: number, i: number, j: number) => [number, number, number, number];
 export const tron_signed_tx: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
 export const tron_transfer_raw: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: bigint, l: bigint) => [number, number, number, number];
 export const verify_proof: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number];

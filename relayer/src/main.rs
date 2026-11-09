@@ -12,10 +12,14 @@
 //! - Local: `MARVII_NEAR_KEYS`, the directory the devtool writes
 //!   (`deployer.json`, `extension*.json`, `wallet_code_hash.txt`).
 //! - Keys are never printed.
-//! - `MARVII_NEAR_RPC` (default `https://rpc.testnet.near.org`),
+//! - `MARVII_NEAR_RPC` (default `https://rpc.testnet.fastnear.com`; NEAR's own
+//!   `rpc.testnet.near.org` is deprecated and refuses requests with HTTP 429),
 //!   `MARVII_NEAR_CHAIN` (default `testnet`), `MARVII_NEAR_SIGNER` (default
 //!   `v1.signer-prod.testnet`), `PORT` (default 8787),
 //!   `MARVII_PAGE_ORIGIN` (default `http://localhost:5173`).
+//! - `MARVII_NAMES_REGISTRY` (e.g. `marvii.testnet`; locally, `names.json`'s
+//!   account): the name registry. The relayer forwards NEAR that lands on a
+//!   name to its wallet, paying the gas. It holds no key for the registry.
 
 use anyhow::{Context, Result, anyhow};
 use axum::{Json, Router, extract::{Path, Query, State}, http::{HeaderValue, StatusCode}, routing::{get, post}};
@@ -54,13 +58,22 @@ struct App {
     /// Agent requests the extension refused for being over the cap, waiting
     /// for the owner's passkey. In memory: a demo, not a queue.
     pending: Mutex<Vec<Value>>,
+    /// The name registry, if names are enabled.
+    names: Option<String>,
 }
+
+/// Below this, NEAR waiting on a name isn't worth a forward's gas yet.
+const MIN_FORWARD: NearToken = NearToken::from_millinear(1);
 
 type Shared = Arc<App>;
 type Reply = Result<Json<Value>, (StatusCode, Json<Value>)>;
 
 fn bad(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
-    (StatusCode::BAD_REQUEST, Json(json!({ "error": e.to_string() })))
+    // Logged so failures can be diagnosed from the host's logs. These are
+    // validation and RPC messages; no key ever appears in them.
+    let e = e.to_string();
+    eprintln!("refused: {e}");
+    (StatusCode::BAD_REQUEST, Json(json!({ "error": e })))
 }
 
 fn load_key(dir: &PathBuf, name: &str) -> Result<(String, String)> {
@@ -76,8 +89,9 @@ fn load_key(dir: &PathBuf, name: &str) -> Result<(String, String)> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let rpc = env_or("MARVII_NEAR_RPC", "https://rpc.testnet.near.org");
+    let rpc = env_or("MARVII_NEAR_RPC", "https://rpc.testnet.fastnear.com");
     let chain = env_or("MARVII_NEAR_CHAIN", "testnet");
+    let mut names = std::env::var("MARVII_NAMES_REGISTRY").ok().filter(|s| !s.is_empty());
     let (payer, secret, extension, known_extensions, code_hash) = match std::env::var("MARVII_RELAYER_SECRET_KEY") {
         // Hosted: one secret (the paying account's key); the rest is public.
         Ok(secret) => {
@@ -109,6 +123,9 @@ async fn main() -> Result<()> {
                 }
             }
             let code_hash = fs::read_to_string(dir.join("wallet_code_hash.txt"))?.trim().to_string();
+            if names.is_none() {
+                names = load_key(&dir, "names").ok().map(|(account, _)| account);
+            }
             (payer, secret, extension, known, code_hash)
         }
     };
@@ -123,7 +140,11 @@ async fn main() -> Result<()> {
         known_extensions,
         funded: Mutex::new(HashSet::new()),
         pending: Mutex::new(Vec::new()),
+        names,
     });
+    if app.names.is_some() {
+        tokio::spawn(forward_loop(app.clone()));
+    }
     let origin = env_or("MARVII_PAGE_ORIGIN", "http://localhost:5173");
     let cors = CorsLayer::new()
         .allow_origin(origin.parse::<HeaderValue>()?)
@@ -137,6 +158,11 @@ async fn main() -> Result<()> {
         .route("/agent/propose", post(agent_propose))
         .route("/queued/{id}/execute", post(queued_execute))
         .route("/balance/cardano/{address}", get(cardano_balance))
+        .route("/utxo/{chain}/address/{address}", get(utxo_address))
+        .route("/utxo/{chain}/address/{address}/utxo", get(utxo_coins))
+        .route("/utxo/{chain}/fees", get(utxo_fees))
+        .route("/utxo/{chain}/tx", post(utxo_broadcast))
+        .route("/names/forward", post(names_forward))
         .route("/pending", get(pending_list))
         .route("/pending/{id}", get(pending_get))
         .route("/pending/{id}/reject", post(pending_reject))
@@ -154,8 +180,61 @@ async fn main() -> Result<()> {
 async fn config(State(a): State<Shared>) -> Json<Value> {
     Json(json!({
         "chain_id": a.chain, "rpc": a.rpc, "signer": a.signer,
-        "extension": a.extension, "wallet_code_hash": a.code_hash,
+        "extension": a.extension, "wallet_code_hash": a.code_hash, "names": a.names,
     }))
+}
+
+/// Forwards the NEAR waiting on a name to its wallet, if enough is there.
+/// Only names in our registry; the forwarder sends to its fixed wallet, so
+/// this can only ever move a deposit to where it was going.
+async fn forward_name(a: &App, name: &str) -> Result<Option<String>, String> {
+    let registry = a.names.as_deref().ok_or("names are not enabled")?;
+    if !name.strip_suffix(registry).is_some_and(|l| l.ends_with('.') && !l[..l.len() - 1].contains('.')) {
+        return Err("not one of our names".into());
+    }
+    let wallet: Option<String> = a.near.view(registry, "wallet_of").args(json!({ "name": name })).await.map_err(|e| e.to_string())?;
+    if wallet.is_none() {
+        return Err("not one of our names".into());
+    }
+    let waiting: String = a.near.view(name, "pending").await.map_err(|e| e.to_string())?;
+    if waiting.parse::<u128>().map_err(|e| e.to_string())? < MIN_FORWARD.as_yoctonear() {
+        return Ok(None);
+    }
+    let out = a.near.call(name, "forward").gas(Gas::from_tgas(10)).send().wait_until::<Final>().await.map_err(|e| e.to_string())?;
+    Ok(Some(out.transaction_hash().to_string()))
+}
+
+#[derive(Deserialize)]
+struct NameBody {
+    name: String,
+}
+
+/// The page asks for its own name's deposits to be forwarded now.
+async fn names_forward(State(a): State<Shared>, Json(b): Json<NameBody>) -> Reply {
+    let tx = forward_name(&a, &b.name).await.map_err(bad)?;
+    Ok(Json(json!({ "forwarded": tx.is_some(), "tx_hash": tx })))
+}
+
+/// Every 20 seconds, forwards deposits waiting on any name.
+async fn forward_loop(a: Shared) {
+    let registry = a.names.clone().unwrap();
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+        let mut from = 0u32;
+        loop {
+            let page: Result<Vec<String>, _> = a.near.view(registry.as_str(), "names").args(json!({ "from_index": from, "limit": 100 })).await;
+            let Ok(page) = page else { break };
+            for name in &page {
+                if let Ok(Some(tx)) = forward_name(&a, name).await {
+                    println!("forwarded deposits on {name}, tx {tx}");
+                }
+            }
+            if page.len() < 100 {
+                break;
+            }
+            from += 100;
+        }
+    }
 }
 
 /// Checks the public key gives this wallet with our code and extension.
@@ -409,6 +488,69 @@ async fn queued_execute(State(a): State<Shared>, Path(id): Path<u64>) -> Reply {
 /// Cardano preprod balance in lovelace. Koios answers browsers' preflight
 /// but leaves the CORS header off its POST responses, so the page asks here.
 /// Only testnet addresses, and only this one read.
+/// Bitcoin testnet4 and Litecoin testnet go through here first: some
+/// browsers can't reach the explorers directly (blockers, rate limits). The
+/// page falls back to calling them itself. Only these four read-and-send
+/// paths, for well-formed addresses.
+fn utxo_api(chain: &str) -> Result<&'static str, (StatusCode, Json<Value>)> {
+    match chain {
+        "bitcoin" => Ok("https://mempool.space/testnet4/api"),
+        "litecoin" => Ok("https://litecoinspace.org/testnet/api"),
+        _ => Err(bad("unknown chain")),
+    }
+}
+
+fn utxo_address_ok(a: &str) -> Result<(), (StatusCode, Json<Value>)> {
+    if a.is_empty() || a.len() > 100 || !a.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Err(bad("not an address"));
+    }
+    Ok(())
+}
+
+async fn utxo_get(url: String) -> Reply {
+    let r = reqwest::Client::new().get(url).timeout(std::time::Duration::from_secs(10)).send().await.map_err(bad)?;
+    if !r.status().is_success() {
+        return Err(bad(format!("explorer returned {}", r.status())));
+    }
+    Ok(Json(r.json().await.map_err(bad)?))
+}
+
+async fn utxo_address(Path((chain, address)): Path<(String, String)>) -> Reply {
+    utxo_address_ok(&address)?;
+    utxo_get(format!("{}/address/{address}", utxo_api(&chain)?)).await
+}
+
+async fn utxo_coins(Path((chain, address)): Path<(String, String)>) -> Reply {
+    utxo_address_ok(&address)?;
+    utxo_get(format!("{}/address/{address}/utxo", utxo_api(&chain)?)).await
+}
+
+async fn utxo_fees(Path(chain): Path<String>) -> Reply {
+    utxo_get(format!("{}/v1/fees/recommended", utxo_api(&chain)?)).await
+}
+
+/// Broadcasts a signed transaction (hex). The explorer checks it; the
+/// relayer only passes it on.
+async fn utxo_broadcast(Path(chain): Path<String>, body: String) -> Reply {
+    let raw = body.trim();
+    if raw.is_empty() || raw.len() > 200_000 || !raw.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(bad("not a raw transaction"));
+    }
+    let r = reqwest::Client::new()
+        .post(format!("{}/tx", utxo_api(&chain)?))
+        .body(raw.to_string())
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(bad)?;
+    let ok = r.status().is_success();
+    let text = r.text().await.map_err(bad)?.trim().to_string();
+    if !ok {
+        return Err(bad(text));
+    }
+    Ok(Json(json!({ "txid": text })))
+}
+
 async fn cardano_balance(Path(address): Path<String>) -> Reply {
     if !address.starts_with("addr_test1") || address.len() > 120 || !address.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         return Err(bad("not a Cardano testnet address"));

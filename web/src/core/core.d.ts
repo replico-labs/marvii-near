@@ -163,6 +163,12 @@ export function solana_signed_tx(message_hex: string, mpc_signature_json: string
 export function solana_transfer_message(from: string, to: string, lamports: string, recent_blockhash: string): string;
 
 /**
+ * The owner sends NEAR: one transfer to `receiver` (any account, a name
+ * included). Confirm shows it from the decoded message.
+ */
+export function transfer_message(chain_id: string, wallet: string, nonce: number, created_at_secs: bigint, receiver: string, yocto: string): string;
+
+/**
  * The signed transaction as protobuf hex (for `broadcasthex`), after
  * checking the MPC signature over the txid recovers to `from`.
  */
@@ -230,6 +236,7 @@ export interface InitOutput {
     readonly request_hash: (a: number, b: number) => [number, number, number, number];
     readonly solana_signed_tx: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
     readonly solana_transfer_message: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => [number, number, number, number];
+    readonly transfer_message: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number, h: number, i: number, j: number) => [number, number, number, number];
     readonly tron_signed_tx: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
     readonly tron_transfer_raw: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: bigint, l: bigint) => [number, number, number, number];
     readonly verify_proof: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number];

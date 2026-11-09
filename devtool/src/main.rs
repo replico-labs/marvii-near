@@ -21,7 +21,7 @@ use std::{fs, path::PathBuf};
 /// Defaults are NEAR testnet; set MARVII_NEAR_RPC, MARVII_NEAR_CHAIN and
 /// MARVII_NEAR_SIGNER to rehearse on a local sandbox first.
 fn env_or(k: &str, d: &str) -> String { std::env::var(k).unwrap_or_else(|_| d.to_string()) }
-fn rpc() -> String { env_or("MARVII_NEAR_RPC", "https://rpc.testnet.near.org") }
+fn rpc() -> String { env_or("MARVII_NEAR_RPC", "https://rpc.testnet.fastnear.com") }
 fn chain() -> String { env_or("MARVII_NEAR_CHAIN", "testnet") }
 fn signer() -> String { env_or("MARVII_NEAR_SIGNER", "v1.signer-prod.testnet") }
 /// On a local sandbox there is no MPC network: stop once the sign request
@@ -81,7 +81,13 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("publish-wallet") => publish_wallet(&args[2]).await,
+        Some("rotate-key") => rotate_key(&args[2]).await,
         Some("deploy-extension") => deploy_extension(&args[2]).await,
+        Some("deploy-names") => deploy_names(args.get(2).context("forwarder wasm")?, args.get(3).context("registry wasm")?, args.get(4).context("parent account")?, args.get(5).context("NEAR to fund it with")?).await,
+        Some("demo-name") => {
+            NAME.set(args.get(2).context("name")?.clone()).ok();
+            demo(None, None, false, None).await
+        }
         Some("e2e") => e2e().await,
         Some("fund") => fund(args.get(2).context("account")?, args.get(3).context("NEAR amount")?).await,
         Some("demo-wallet") => demo_wallet(None, None, false).await,
@@ -99,6 +105,94 @@ async fn main() -> Result<()> {
         Some("demo-approve") => demo_wallet(None, Some(args.get(2).context("pending request id")?.parse()?), false).await,
         _ => bail!("usage: devtool fund <account> <near> | publish-wallet <wasm> | deploy-extension <wasm> | e2e | demo-wallet | demo-upgrade | demo-cancel <queued id> | demo-grant <agent pubkey hex> | demo-approve <pending id>"),
     }
+}
+
+/// Replaces an account's full-access key with a fresh one in a single
+/// transaction (add the new key, delete the old), then rewrites its key
+/// file. The account ID stays the same. Never prints either key.
+async fn rotate_key(name: &str) -> Result<()> {
+    let old = Key::load(name)?;
+    let seed: [u8; 32] = rand_bytes();
+    let new_pk = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+    let old_pk = SigningKey::from_bytes(&old.seed).verifying_key().to_bytes();
+    let out = old
+        .near()?
+        .transaction(old.account_id.as_str())
+        .add_full_access_key(near_kit::signer::PublicKey::ed25519_from_bytes(new_pk)?)
+        .delete_key(near_kit::signer::PublicKey::ed25519_from_bytes(old_pk)?)
+        .wait_until::<Final>()
+        .await?;
+    if !out.is_success() {
+        bail!("rotation failed: {:?}", out.failure_message());
+    }
+    let path = keys_dir()?.join(format!("{name}.json"));
+    fs::write(&path, json!({ "account_id": old.account_id, "seed_hex": hex::encode(seed), "public_key_hex": hex::encode(new_pk) }).to_string())?;
+    println!("rotated the key of {}, tx {}", old.account_id, out.transaction_hash());
+    Ok(())
+}
+
+/// Names: publishes the forwarder as an immutable global contract (by code
+/// hash), creates the parent account (through the `testnet` registrar on
+/// testnet, or with MARVII_NAMES_CREATOR_KEY's account on a sandbox), funds
+/// it, and deploys the registry there. The parent's key goes to names.json.
+async fn deploy_names(forwarder: &str, registry: &str, parent: &str, fund_near: &str) -> Result<()> {
+    let deployer = Key::load("deployer")?;
+    let near = deployer.near()?;
+    let fwd = fs::read(forwarder)?;
+    let hash = code_hash(&fwd);
+    let hash_file = keys_dir()?.join("names_forwarder_hash.txt");
+    if fs::read_to_string(&hash_file).ok().as_deref().map(str::trim) != Some(hex::encode(hash).as_str()) {
+        let out = near.publish(fwd, PublishMode::Immutable).wait_until::<Final>().await?;
+        if !out.is_success() {
+            bail!("forwarder publish failed: {:?}", out.failure_message());
+        }
+        fs::write(&hash_file, hex::encode(hash))?;
+        println!("forwarder published, hash {} (base58 {}), tx {}", hex::encode(hash), bs58::encode(hash).into_string(), out.transaction_hash());
+    }
+    let seed: [u8; 32] = rand_bytes();
+    let pk = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+    let pk_str = format!("ed25519:{}", bs58::encode(pk).into_string());
+    let fund = NearToken::from_millinear((fund_near.parse::<f64>()? * 1000.0) as u128);
+    let names_file = keys_dir()?.join("names.json");
+    if names_file.exists() {
+        bail!("names.json already exists; refusing to replace the parent's key");
+    }
+    fs::write(&names_file, json!({ "account_id": parent, "seed_hex": hex::encode(seed), "public_key_hex": hex::encode(pk) }).to_string())?;
+    let out = if let Ok(creator_file) = std::env::var("MARVII_NAMES_CREATOR_KEY") {
+        // Sandbox: the parent is a sub-account of an account we hold a key for.
+        let c: Value = serde_json::from_slice(&fs::read(creator_file)?)?;
+        let cn = Near::custom(rpc(), chain()).credentials(c["secret_key"].as_str().context("secret_key")?, c["account_id"].as_str().context("account_id")?)?.build();
+        cn.transaction(parent).create_account().transfer(fund).add_full_access_key(pk_str.parse()?).send().wait_until::<Final>().await?
+    } else {
+        // Testnet: top-level `.testnet` names come from the `testnet` registrar.
+        near.call("testnet", "create_account")
+            .args(json!({ "new_account_id": parent, "new_public_key": pk_str }))
+            .deposit(fund)
+            .gas(Gas::from_tgas(100))
+            .send()
+            .wait_until::<Final>()
+            .await?
+    };
+    if !out.is_success() {
+        bail!("creating {parent} failed: {:?}", out.failure_message());
+    }
+    println!("{parent} created, tx {}", out.transaction_hash());
+    let names = Key::load("names")?;
+    let out = names
+        .near()?
+        .transaction(parent)
+        .deploy(fs::read(registry)?)
+        .call("new")
+        .args(json!({ "forwarder_code_hash": bs58::encode(hash).into_string() }))
+        .gas(Gas::from_tgas(30))
+        .send()
+        .wait_until::<Final>()
+        .await?;
+    if !out.is_success() {
+        bail!("registry deploy failed: {:?}", out.failure_message());
+    }
+    println!("registry deployed at {parent}, tx {}", out.transaction_hash());
+    Ok(())
 }
 
 /// Sends testnet NEAR from the deployer, e.g. to a hosted relayer's account.
@@ -163,6 +257,9 @@ static SOL_SEND: std::sync::OnceLock<(String, String, bool)> = std::sync::OnceLo
 /// `demo-sign-bitcoin`: a dry run with made-up coins (never broadcast), to
 /// check one passkey approval gets a valid signature for every input.
 static BTC_DRY: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+/// `demo-name <name>`: the passkey registers a name, then a deposit to the
+/// name is forwarded to the wallet.
+static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 async fn demo(grant_to: Option<String>, approve: Option<u64>, upgrade: bool, cancel: Option<u64>) -> Result<()> {
     let deployer = Key::load("deployer")?;
@@ -262,6 +359,23 @@ async fn demo(grant_to: Option<String>, approve: Option<u64>, upgrade: bool, can
         println!("  passkey approved: ok={} (NEAR tx {}), {} signatures", out["ok"], out["tx_hash"], out["mpc_signatures"].as_array().map_or(0, Vec::len));
         let signed = marvii_near_core::bitcoin_signed_tx(&plan, &out["mpc_signatures"].to_string()).map_err(|e| anyhow!(e))?;
         println!("  every input signed by {from}'s key; txid {} (dry run, not broadcast)", serde_json::from_str::<Value>(&signed)?["txid"]);
+    }
+    if let Some(name) = NAME.get() {
+        let registry = Key::load("names")?.account_id;
+        let req = NearPromise::new(registry.parse::<defuse_wallet::AccountId>()?)
+            .function_call(FunctionCall::name("register").args_json(json!({ "name": name })).gas(Gas::from_tgas(60)));
+        let out = wallet.sign_and_send(req).await?.status(&near).wait_until::<Final>().await?;
+        println!("  passkey registered {name}: tx {} ({:?})", out.transaction_hash(), out.failure_message());
+        let full: Option<String> = near.view(registry.as_str(), "name_of").args(json!({ "wallet": wallet_id })).await?;
+        let full = full.context("no name registered")?;
+        let target: String = near.view(full.as_str(), "target").await?;
+        println!("  {full} forwards to {target} (the wallet: {})", target == wallet_id);
+        let before = near.balance(wallet_id.as_str()).await?.total;
+        let out = near.transfer(full.as_str(), NearToken::from_millinear(50)).wait_until::<Final>().await?;
+        println!("  deposited 0.05 NEAR to {full}: {}", out.is_success());
+        let out = near.call(full.as_str(), "forward").gas(Gas::from_tgas(10)).send().wait_until::<Final>().await?;
+        let after = near.balance(wallet_id.as_str()).await?.total;
+        println!("  forward: {} (tx {}); wallet balance {} → {}", out.is_success(), out.transaction_hash(), before, after);
     }
     if let Some(id) = cancel {
         let req = NearPromise::new(ext.account_id.parse::<defuse_wallet::AccountId>()?)

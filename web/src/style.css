@@ -73,7 +73,7 @@ pre { white-space: pre-wrap; word-break: break-all; background: var(--mv-paper);
 .status.ok { color: var(--mv-success); word-break: break-all; }
 @media (max-width: 480px) { .grid2 { grid-template-columns: 1fr; } }
 /* Read-only view: nothing that needs the passkey. */
-.readonly #add, .readonly [data-revoke], .readonly [data-approve], .readonly [data-reject], .readonly [data-cancel], .readonly [data-send] { display: none; }
+.readonly #add, .readonly [data-revoke], .readonly [data-approve], .readonly [data-reject], .readonly [data-cancel], .readonly [data-send], .readonly [data-name] { display: none; }
 /* Chains: native balance on the row, everything held in the dropdown. */
 .chains details summary { list-style: none; cursor: pointer; }
 .chains details summary::-webkit-details-marker { display: none; }
@@ -83,3 +83,22 @@ pre { white-space: pre-wrap; word-break: break-all; background: var(--mv-paper);
 .assets { display: grid; gap: 6px; padding: 10px 0 2px; }
 .addr { background: none; border: 0; padding: 0; color: var(--mv-iris); cursor: pointer; }
 .addr.copied::after { content: ' copied'; color: var(--mv-success); font-family: 'Geist Variable', var(--mv-font-ui); }
+
+/* The loader: the Marvii mark draws itself in a loop over a frosted page. */
+.busy { position: fixed; inset: 0; z-index: 50; display: grid; place-items: center; padding: 16px; background: color-mix(in srgb, var(--mv-paper) 72%, transparent); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); }
+.busy-card { display: grid; justify-items: center; gap: 14px; text-align: center; max-width: 320px; }
+.busy-card p { margin: 0; color: var(--mv-ink2); font-size: 15px; }
+.busy .mark { width: 72px; height: 72px; color: var(--mv-iris); animation: mv-pulse 1.6s ease-in-out infinite; }
+.busy .mark path { stroke-dasharray: 100; animation: mv-draw 1.6s ease-in-out infinite; }
+@keyframes mv-draw { 0% { stroke-dashoffset: 100; } 55% { stroke-dashoffset: 0; } 100% { stroke-dashoffset: -100; } }
+@keyframes mv-pulse { 0%, 100% { transform: scale(0.94); } 50% { transform: scale(1.04); } }
+@media (prefers-reduced-motion: reduce) {
+  .busy .mark, .busy .mark path { animation: mv-fade 1.6s ease-in-out infinite; stroke-dasharray: none; }
+  @keyframes mv-fade { 0%, 100% { opacity: 0.45; } 50% { opacity: 1; } }
+}
+
+/* Deposit: QR code and the full address. */
+.deposit .qr { width: min(220px, 70vw); margin: 4px auto 0; padding: 10px; background: #fff; border-radius: 12px; }
+.deposit .qr svg { display: block; width: 100%; height: auto; }
+.deposit .addr-full { word-break: break-all; text-align: center; font-size: 14px; margin: 8px 0 0; }
+.row.end { gap: 8px; }
