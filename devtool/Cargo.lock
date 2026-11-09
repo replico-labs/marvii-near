@@ -131,6 +131,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
+name = "bech32"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32637268377fc7b10a8c6d51de3e7fba1ce5dd371a96e342b34e6078db558e7f"
+
+[[package]]
 name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -199,6 +205,7 @@ version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf88ba1141d185c399bee5288d850d63b8369520c1eafc32a0430b5b6c287bf4"
 dependencies = [
+ "sha2 0.10.9",
  "tinyvec",
 ]
 
@@ -1906,16 +1913,23 @@ checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 name = "marvii-near-core"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
+ "bech32",
+ "blake2",
  "bs58 0.5.1",
  "defuse-crypto",
  "defuse-near-promise",
  "defuse-wallet",
  "defuse-wallet-webauthn",
+ "ed25519-dalek 2.2.0",
  "hex",
+ "k256 0.13.4",
  "near-sdk",
  "p256",
+ "ripemd",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sha3 0.10.9",
  "wasm-bindgen",
 ]

@@ -2,7 +2,8 @@
 // Send → Confirm → passkey → broadcast. The account's passkey key is loaded
 // into Chromium's virtual authenticator from DEMO_PASSKEY (a testnet key
 // file kept outside the repo; never printed).
-//   DEMO_PASSKEY=…/demo-passkey.json WALLET=0s… node e2e/send.mjs <amount> <0x to>
+//   DEMO_PASSKEY=…/demo-passkey.json WALLET=0s… [CHAIN=84532|solana|bitcoin] node e2e/send.mjs <amount> <to>
+// On EVM chains it sends USDC; on Solana and Bitcoin the native coin.
 import { createRequire } from 'node:module';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -30,13 +31,14 @@ page.on('pageerror', (e) => console.log('page error:', e.message));
 await page.goto('http://localhost:5173');
 await page.evaluate(([id, pk, w]) => localStorage.setItem('marvii-near:passkey', JSON.stringify({ credentialId: id, publicKey: pk, wallet: w })), [b64u(credentialId), pub.toString('hex'), process.env.WALLET]);
 await page.reload();
-await page.waitForSelector('#chain-84532 [data-send]', { state: 'attached', timeout: 60_000 });
-await page.click('#chain-84532 summary');
-await page.click('#chain-84532 [data-send]');
-await page.selectOption('select[name=asset]', { label: /^USDC/ }).catch(async () => {
+const chain = process.env.CHAIN ?? '84532';
+await page.waitForSelector(`#chain-${chain} [data-send]`, { state: 'attached', timeout: 90_000 });
+await page.click(`#chain-${chain} summary`);
+await page.click(`#chain-${chain} [data-send]`);
+if (await page.$('select[name=asset]')) {
   const opts = await page.$$eval('select[name=asset] option', (o) => o.map((x) => [x.value, x.textContent]));
   await page.selectOption('select[name=asset]', opts.find(([, t]) => t.startsWith('USDC'))[0]);
-});
+}
 await page.fill('input[name=to]', to);
 await page.fill('input[name=amount]', amount);
 await page.click('#send button.primary');

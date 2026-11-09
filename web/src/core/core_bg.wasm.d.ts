@@ -1,20 +1,36 @@
 /* tslint:disable */
 /* eslint-disable */
 export const memory: WebAssembly.Memory;
+export const bitcoin_plan: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => [number, number, number, number];
+export const bitcoin_signed_tx: (a: number, b: number, c: number, d: number) => [number, number, number, number];
 export const call_message: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: bigint) => [number, number, number, number];
+export const chain_address: (a: number, b: number, c: number, d: number) => [number, number, number, number];
+export const chain_path: (a: number, b: number) => [number, number, number, number];
 export const compress_public_key: (a: number, b: number) => [number, number, number, number];
+export const describe_bitcoin_plan: (a: number, b: number) => [number, number, number, number];
 export const describe_evm_tx: (a: number, b: number) => [number, number, number, number];
 export const describe_message: (a: number, b: number) => [number, number, number, number];
+export const describe_solana_message: (a: number, b: number) => [number, number, number, number];
+export const describe_tron_raw: (a: number, b: number) => [number, number, number, number];
+export const describe_xrp_tx: (a: number, b: number) => [number, number, number, number];
 export const empty_message: (a: number, b: number, c: number, d: number, e: number, f: bigint) => [number, number, number, number];
 export const evm_address: (a: number, b: number) => [number, number, number, number];
 export const evm_send_tx: (a: bigint, b: bigint, c: number, d: number, e: number, f: number, g: bigint, h: number, i: number, j: number, k: number, l: number, m: number) => [number, number, number, number];
 export const evm_signed_tx: (a: number, b: number, c: number, d: number) => [number, number, number, number];
 export const make_proof: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
 export const normalize_request: (a: number, b: number) => [number, number, number, number];
+export const owner_ecdsa_multi_sign_message: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number, h: number, i: number, j: number, k: number, l: number) => [number, number, number, number];
+export const owner_eddsa_sign_message: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number, h: number, i: number, j: number, k: number, l: number) => [number, number, number, number];
 export const owner_evm_sign_message: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number, h: number, i: number, j: number) => [number, number, number, number];
 export const request_hash: (a: number, b: number) => [number, number, number, number];
+export const solana_signed_tx: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
+export const solana_transfer_message: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => [number, number, number, number];
+export const tron_signed_tx: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
+export const tron_transfer_raw: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: bigint, l: bigint) => [number, number, number, number];
 export const verify_proof: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number];
 export const wallet_account_id: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
+export const xrp_payment: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number) => [number, number, number, number];
+export const xrp_signed_tx: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
 export const __wbindgen_externrefs: WebAssembly.Table;
 export const __wbindgen_malloc: (a: number, b: number) => number;
 export const __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;

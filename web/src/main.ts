@@ -3,7 +3,7 @@ import '@fontsource-variable/geist-mono';
 import './style.css';
 import init, * as core from './core/core.js';
 import { createPasskey, signChallenge, type Passkey } from './passkey';
-import { account, formatNear, relayer, setRpc, view, type Config } from './near';
+import { RELAYER, account, formatNear, relayer, setRpc, view, type Config } from './near';
 
 // EVM test chains shown on the dashboard. One address on all of them: the
 // MPC signer's derived_public_key for the wallet and path `evm`.
@@ -22,6 +22,39 @@ const EVM_CHAINS = [
 ];
 // Token balances shown under their chain. Aave V3 Base Sepolia, from
 // bgd-labs/aave-address-book (AaveV3BaseSepolia.sol), checked on-chain.
+// Other chains, each with its own address from the account's key for that
+// chain. Balance sources were checked against live testnet data; chains
+// without a working public source show the address only.
+type OtherChain = { id: string; name: string; sym: string; decimals: number; explorer?: string; balance?: (addr: string) => Promise<bigint> };
+const post = (url: string, body: unknown) =>
+  fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(8000) }).then((r) => r.json());
+const get = (url: string) => fetch(url, { signal: AbortSignal.timeout(8000) }).then((r) => r.json());
+const utxoBalance = async (url: string) => {
+  const j = await get(url);
+  const c = j.chain_stats, m = j.mempool_stats;
+  return BigInt(c.funded_txo_sum - c.spent_txo_sum + m.funded_txo_sum - m.spent_txo_sum);
+};
+const OTHER_CHAINS: OtherChain[] = [
+  { id: 'bitcoin', name: 'Bitcoin', sym: 'BTC', decimals: 8, explorer: 'https://mempool.space/testnet4/address/', balance: (a) => utxoBalance(`https://mempool.space/testnet4/api/address/${a}`) },
+  { id: 'solana', name: 'Solana', sym: 'SOL', decimals: 9, explorer: 'https://explorer.solana.com/address/{}?cluster=devnet',
+    balance: async (a) => BigInt((await post('https://api.devnet.solana.com', { jsonrpc: '2.0', id: 1, method: 'getBalance', params: [a] })).result.value) },
+  { id: 'tron', name: 'TRON', sym: 'TRX', decimals: 6, explorer: 'https://nile.tronscan.org/#/address/',
+    balance: async (a) => BigInt((await post('https://nile.trongrid.io/wallet/getaccount', { address: a, visible: true })).balance ?? 0) },
+  { id: 'xrp', name: 'XRP', sym: 'XRP', decimals: 6, explorer: 'https://testnet.xrpl.org/accounts/',
+    balance: async (a) => {
+      const r = (await post(XRPL, { method: 'account_info', params: [{ account: a, ledger_index: 'validated' }] })).result;
+      if (r.error === 'actNotFound') return 0n;
+      return BigInt(r.account_data.Balance);
+    } },
+  { id: 'cardano', name: 'Cardano', sym: 'ADA', decimals: 6, explorer: 'https://preprod.cardanoscan.io/address/',
+    // Through the relayer: Koios's POST responses carry no CORS header.
+    balance: async (a) => BigInt((await get(`${RELAYER}/balance/cardano/${a}`)).lovelace) },
+  { id: 'litecoin', name: 'Litecoin', sym: 'LTC', decimals: 8, explorer: 'https://litecoinspace.org/testnet/address/', balance: (a) => utxoBalance(`https://litecoinspace.org/testnet/api/address/${a}`) },
+  { id: 'dogecoin', name: 'Dogecoin', sym: 'DOGE', decimals: 8 },
+  { id: 'bitcoin-cash', name: 'Bitcoin Cash', sym: 'BCH', decimals: 8 },
+  { id: 'zcash', name: 'Zcash', sym: 'ZEC', decimals: 8 },
+];
+
 const TOKEN_BALANCES = [
   { chain: 84532, token: '0xba50cd2a20f6da35d788639e581bca8d0b5d4d5f', symbol: 'USDC', decimals: 6 },
   { chain: 84532, token: '0x10f1a9d11cdf50041f3f8cb7191cbe2f31750acc', symbol: 'aUSDC', decimals: 6 },
@@ -169,7 +202,7 @@ async function evmRpc(rpcUrl: string, method: string, params: unknown[]) {
   return BigInt(r.result);
 }
 
-const fmtUnits = (n: bigint, decimals: number, shown = 4) => {
+const fmtUnits = (n: bigint, decimals: number, shown = 4): string => {
   const d = 10n ** BigInt(decimals);
   return `${n / d}.${((n % d) * 10n ** BigInt(shown) / d).toString().padStart(shown, '0')}`;
 };
@@ -197,7 +230,7 @@ function chainRow(id: string, name: string) {
 
 /** Fills a chain row: the native balance on the row, and in its dropdown the
  *  address and every asset held there. */
-function fillChain(id: string, address: string, native: string, assets: string[], explorer?: string, sendChain?: number) {
+function fillChain(id: string, address: string, native: string, assets: string[], explorer?: string, sendChain?: number | string) {
   const d = document.getElementById(id)!;
   d.querySelector('.bal')!.textContent = native;
   const link = explorer ? ` <a class="small" target="_blank" rel="noopener" href="${esc(explorer)}">Explorer</a>` : '';
@@ -218,6 +251,202 @@ const toUnits = (amount: string, decimals: number) => {
   if (!/^\d+$/.test(w || '0') || !/^\d*$/.test(f) || f.length > decimals) throw new Error('Enter an amount like 1.5');
   return (BigInt(w || '0') * 10n ** BigInt(decimals) + BigInt((f + '0'.repeat(decimals)).slice(0, decimals) || '0')).toString();
 };
+
+let solana = { address: '', balance: '0' };
+let tron = { address: '', balance: '0' };
+const TRON_API = 'https://nile.trongrid.io';
+let xrp = { address: '', balance: '0', key: '' };
+// XRPL Labs' public testnet node: HTTPS on 443, with CORS.
+const XRPL = 'https://testnet.xrpl-labs.com';
+
+/** Sends XRP. The Payment is built on this page; the node only supplies the
+ *  account's sequence, the current ledger and the fee (capped in core). */
+function xrpSendForm() {
+  const m = document.getElementById('modal')!;
+  m.innerHTML = `
+    <div class="backdrop"><form class="card sheet" id="send">
+      <h2>Send on XRP</h2>
+      <p class="small muted">Balance ${esc(xrp.balance)} XRP</p>
+      <label>To <input name="to" required class="mono" placeholder="r…"></label>
+      <label>Amount (XRP) <input name="amount" required inputmode="decimal" placeholder="0.0"></label>
+      <label>Destination tag (optional) <input name="tag" inputmode="numeric" placeholder="Exchanges often need one"></label>
+      <div class="row end"><button type="button" class="secondary" id="cancel">Cancel</button><button class="primary">Review</button></div>
+      <div id="status" class="status"></div>
+    </form></div>`;
+  document.getElementById('cancel')!.onclick = () => (m.innerHTML = '');
+  (document.getElementById('send') as HTMLFormElement).onsubmit = async (ev) => {
+    ev.preventDefault();
+    try {
+      const f = new FormData(ev.target as HTMLFormElement);
+      const to = String(f.get('to')).trim();
+      const drops = toUnits(String(f.get('amount')), 6);
+      const tagText = String(f.get('tag') ?? '').trim();
+      if (tagText && !/^\d+$/.test(tagText)) throw new Error('The destination tag is a whole number');
+      status('Preparing…');
+      const [info, fee] = await Promise.all([
+        post(XRPL, { method: 'account_info', params: [{ account: xrp.address, ledger_index: 'current' }] }),
+        post(XRPL, { method: 'fee', params: [{}] }),
+      ]);
+      const a = info.result;
+      if (a.error) throw new Error(a.error_message ?? a.error);
+      const drop = BigInt(fee.result.drops.open_ledger_fee ?? '12');
+      // About five minutes to approve and submit, then the payment expires.
+      const last = Number(fee.result.ledger_current_index) + 75;
+      const p = JSON.parse(core.xrp_payment(xrp.address, xrp.key, to, drops, String(drop < 12n ? 12n : drop), a.account_data.Sequence, last, tagText ? Number(tagText) : -1));
+      const msg = core.owner_ecdsa_multi_sign_message(cfg.chain_id, wallet, nonce32(), createdAt(), cfg.signer, 'xrp', JSON.stringify([p.signing_hash]));
+      confirm(msg, {
+        xrpTx: p.tx_hex,
+        after: async (out) => {
+          if (!out.mpc_signature) throw new Error('No signature came back');
+          const signed = JSON.parse(core.xrp_signed_tx(p.tx_hex, JSON.stringify(out.mpc_signature), xrp.address));
+          const r = (await post(XRPL, { method: 'submit', params: [{ tx_blob: signed.tx_blob }] })).result;
+          if (!['tesSUCCESS', 'terQUEUED'].includes(r.engine_result)) throw new Error(r.engine_result_message ?? r.error_message ?? r.engine_result ?? 'XRP refused the transaction');
+          return `Sent. <a target="_blank" rel="noopener" href="https://testnet.xrpl.org/transactions/${esc(signed.hash)}">View transaction</a>`;
+        },
+      });
+    } catch (e) {
+      status(String((e as Error).message ?? e), 'error');
+    }
+  };
+}
+
+/** Sends TRX. The transaction is built on this page from the latest block's
+ *  reference, never by a node, so the passkey approves bytes the page made. */
+function tronSendForm() {
+  const m = document.getElementById('modal')!;
+  m.innerHTML = `
+    <div class="backdrop"><form class="card sheet" id="send">
+      <h2>Send on TRON</h2>
+      <p class="small muted">Balance ${esc(tron.balance)} TRX</p>
+      <label>To <input name="to" required class="mono" placeholder="T…"></label>
+      <label>Amount (TRX) <input name="amount" required inputmode="decimal" placeholder="0.0"></label>
+      <div class="row end"><button type="button" class="secondary" id="cancel">Cancel</button><button class="primary">Review</button></div>
+      <div id="status" class="status"></div>
+    </form></div>`;
+  document.getElementById('cancel')!.onclick = () => (m.innerHTML = '');
+  (document.getElementById('send') as HTMLFormElement).onsubmit = async (ev) => {
+    ev.preventDefault();
+    try {
+      const f = new FormData(ev.target as HTMLFormElement);
+      const to = String(f.get('to')).trim();
+      const sun = toUnits(String(f.get('amount')), 6);
+      status('Preparing…');
+      const b = await post(`${TRON_API}/wallet/getnowblock`, {});
+      const h = b.block_header.raw_data;
+      const refBytes = (BigInt(h.number) & 0xffffn).toString(16).padStart(4, '0');
+      const refHash = b.blockID.slice(16, 32);
+      // Ten minutes to approve and broadcast.
+      const r = JSON.parse(core.tron_transfer_raw(tron.address, to, sun, refBytes, refHash, BigInt(h.timestamp + 600_000), BigInt(Date.now())));
+      const msg = core.owner_ecdsa_multi_sign_message(cfg.chain_id, wallet, nonce32(), createdAt(), cfg.signer, 'tron', JSON.stringify([r.txid]));
+      confirm(msg, {
+        tronRaw: r.raw_hex,
+        after: async (out) => {
+          if (!out.mpc_signature) throw new Error('No signature came back');
+          const signed = JSON.parse(core.tron_signed_tx(r.raw_hex, JSON.stringify(out.mpc_signature), tron.address));
+          const res = await post(`${TRON_API}/wallet/broadcasthex`, { transaction: signed.tx_hex });
+          if (!res.result) throw new Error(res.message ?? res.code ?? 'TRON refused the transaction');
+          return `Sent. <a target="_blank" rel="noopener" href="https://nile.tronscan.org/#/transaction/${esc(signed.txid)}">View transaction</a>`;
+        },
+      });
+    } catch (e) {
+      status(String((e as Error).message ?? e), 'error');
+    }
+  };
+}
+const MEMPOOL = 'https://mempool.space/testnet4/api';
+
+/** The Bitcoin-style chains with SegWit sends: the same plan and
+ *  transaction format, each with its own explorer API (mempool.space's). */
+const UTXO_SEND: Record<string, { name: string; sym: string; api: string; tx: string; placeholder: string }> = {
+  bitcoin: { name: 'Bitcoin', sym: 'BTC', api: MEMPOOL, tx: 'https://mempool.space/testnet4/tx/', placeholder: 'tb1…' },
+  litecoin: { name: 'Litecoin', sym: 'LTC', api: 'https://litecoinspace.org/testnet/api', tx: 'https://litecoinspace.org/testnet/tx/', placeholder: 'tltc1…' },
+};
+const utxoAccounts: Record<string, { address: string; balance: string }> = {};
+
+/** Sends BTC or LTC: the page picks coins and builds the transaction, the
+ *  passkey approves one signature per input, the page broadcasts once every
+ *  signature checks out. */
+function btcSendForm(chain = 'bitcoin') {
+  const c = UTXO_SEND[chain];
+  const acct = utxoAccounts[chain];
+  const m = document.getElementById('modal')!;
+  m.innerHTML = `
+    <div class="backdrop"><form class="card sheet" id="send">
+      <h2>Send on ${esc(c.name)}</h2>
+      <p class="small muted">Balance ${esc(acct.balance)} ${c.sym}</p>
+      <label>To <input name="to" required class="mono" placeholder="${c.placeholder}"></label>
+      <label>Amount (${c.sym}) <input name="amount" required inputmode="decimal" placeholder="0.0"></label>
+      <div class="row end"><button type="button" class="secondary" id="cancel">Cancel</button><button class="primary">Review</button></div>
+      <div id="status" class="status"></div>
+    </form></div>`;
+  document.getElementById('cancel')!.onclick = () => (m.innerHTML = '');
+  (document.getElementById('send') as HTMLFormElement).onsubmit = async (ev) => {
+    ev.preventDefault();
+    try {
+      const f = new FormData(ev.target as HTMLFormElement);
+      const to = String(f.get('to')).trim();
+      const sat = toUnits(String(f.get('amount')), 8);
+      status('Preparing…');
+      const [utxos, fees] = await Promise.all([get(`${c.api}/address/${acct.address}/utxo`), get(`${c.api}/v1/fees/recommended`)]);
+      const btcPlan = core.bitcoin_plan(acct.address, to, sat, JSON.stringify(utxos.map((u: any) => ({ txid: u.txid, vout: u.vout, value: u.value }))), Math.max(1, fees.halfHourFee));
+      const msg = core.owner_ecdsa_multi_sign_message(cfg.chain_id, wallet, nonce32(), createdAt(), cfg.signer, chain, JSON.stringify(JSON.parse(btcPlan).sighashes));
+      confirm(msg, {
+        btcPlan,
+        after: async (out) => {
+          const sigs = (out as any).mpc_signatures ?? [];
+          const signed = JSON.parse(core.bitcoin_signed_tx(btcPlan, JSON.stringify(sigs)));
+          const r = await fetch(`${c.api}/tx`, { method: 'POST', body: signed.raw });
+          const txid = (await r.text()).trim();
+          if (!r.ok) throw new Error(txid);
+          return `Sent. <a target="_blank" rel="noopener" href="${c.tx}${esc(txid)}">View transaction</a>`;
+        },
+      });
+    } catch (e) {
+      status(String((e as Error).message ?? e), 'error');
+    }
+  };
+}
+const SOLANA_RPC = 'https://api.devnet.solana.com';
+
+/** Sends SOL: the passkey approves the exact message, the account's ed25519
+ *  key signs it, and the page broadcasts it once the signature verifies. */
+function solSendForm() {
+  const m = document.getElementById('modal')!;
+  m.innerHTML = `
+    <div class="backdrop"><form class="card sheet" id="send">
+      <h2>Send on Solana</h2>
+      <p class="small muted">Balance ${esc(solana.balance)} SOL</p>
+      <label>To <input name="to" required class="mono" placeholder="Solana address"></label>
+      <label>Amount (SOL) <input name="amount" required inputmode="decimal" placeholder="0.0"></label>
+      <div class="row end"><button type="button" class="secondary" id="cancel">Cancel</button><button class="primary">Review</button></div>
+      <div id="status" class="status"></div>
+    </form></div>`;
+  document.getElementById('cancel')!.onclick = () => (m.innerHTML = '');
+  (document.getElementById('send') as HTMLFormElement).onsubmit = async (ev) => {
+    ev.preventDefault();
+    try {
+      const f = new FormData(ev.target as HTMLFormElement);
+      const to = String(f.get('to')).trim();
+      const lamports = toUnits(String(f.get('amount')), 9);
+      status('Preparing…');
+      const bh = (await post(SOLANA_RPC, { jsonrpc: '2.0', id: 1, method: 'getLatestBlockhash', params: [{ commitment: 'finalized' }] })).result.value.blockhash;
+      const solMessage = core.solana_transfer_message(solana.address, to, lamports, bh);
+      const msg = core.owner_eddsa_sign_message(cfg.chain_id, wallet, nonce32(), createdAt(), cfg.signer, 'solana', solMessage);
+      confirm(msg, {
+        solMessage,
+        after: async (out) => {
+          if (!out.mpc_signature) throw new Error('No signature came back');
+          const signed = core.solana_signed_tx(solMessage, JSON.stringify(out.mpc_signature), solana.address);
+          const r = await post(SOLANA_RPC, { jsonrpc: '2.0', id: 1, method: 'sendTransaction', params: [signed, { encoding: 'base64' }] });
+          if (r.error) throw new Error(r.error.message);
+          return `Sent. <a target="_blank" rel="noopener" href="https://explorer.solana.com/tx/${esc(r.result)}?cluster=devnet">View transaction</a>`;
+        },
+      });
+    } catch (e) {
+      status(String((e as Error).message ?? e), 'error');
+    }
+  };
+}
 
 /** Sends from the account's EVM address on one chain: the passkey approves
  *  the exact transaction, then the page broadcasts it. */
@@ -276,7 +505,7 @@ async function dashboard() {
   render(`
     <section class="card">
       <div class="row between"><h1>Balances</h1><span class="pill">${esc(cfg.chain_id === 'mainnet' ? 'Mainnet' : 'Testnet')}</span></div>
-      <ul class="list chains">${chainRow('chain-near', 'NEAR')}${EVM_CHAINS.map((c) => chainRow(`chain-${c.id}`, c.name)).join('')}</ul>
+      <ul class="list chains">${chainRow('chain-near', 'NEAR')}${EVM_CHAINS.map((c) => chainRow(`chain-${c.id}`, c.name)).join('')}${OTHER_CHAINS.map((c) => chainRow(`chain-${c.id}`, c.name)).join('')}</ul>
       <div id="status" class="status"></div>
     </section>
     <section class="card" id="pending-card" hidden>
@@ -303,10 +532,29 @@ async function dashboard() {
       setTimeout(() => b.classList.remove('copied'), 1200);
     }
     const sb = (e.target as HTMLElement).closest<HTMLElement>('[data-send]');
-    if (sb) sendForm(Number(sb.dataset.send));
+    if (sb) {
+      const k = sb.dataset.send!;
+      k === 'solana' ? solSendForm() : k === 'bitcoin' || k === 'litecoin' ? btcSendForm(k) : k === 'tron' ? tronSendForm() : k === 'xrp' ? xrpSendForm() : sendForm(Number(k));
+    }
   };
 
   account(wallet).then((a) => fillChain('chain-near', wallet, `${a ? formatNear(a.amount) : '0.0000'} NEAR`, []));
+  for (const c of OTHER_CHAINS) {
+    const { path, domain_id } = JSON.parse(core.chain_path(c.id));
+    view<string>(cfg.signer, 'derived_public_key', { path, predecessor: wallet, domain_id })
+      .then(async (k) => {
+        const addr = core.chain_address(c.id, k);
+        const bal = c.balance ? await c.balance(addr).then((b) => fmtUnits(b, c.decimals)).catch(() => '–') : '–';
+        const explorer = c.explorer ? (c.explorer.includes('{}') ? c.explorer.replace('{}', addr) : c.explorer + addr) : undefined;
+        if (c.id === 'solana') solana = { address: addr, balance: bal };
+        if (c.id in UTXO_SEND) utxoAccounts[c.id] = { address: addr, balance: bal };
+        if (c.id === 'tron') tron = { address: addr, balance: bal };
+        if (c.id === 'xrp') xrp = { address: addr, balance: bal, key: k };
+        const canSend = ['solana', 'bitcoin', 'litecoin', 'tron', 'xrp'].includes(c.id) && bal !== '–' && Number(bal) > 0;
+        fillChain(`chain-${c.id}`, addr, `${bal} ${c.sym}`, [], explorer, canSend ? c.id : undefined);
+      })
+      .catch(() => fillChain(`chain-${c.id}`, '', `– ${c.sym}`, []));
+  }
   evmAddress()
     .then((addr) => {
       evmAddr = addr;
@@ -519,9 +767,9 @@ function grantForm() {
 
 /** A decode failure blocks approval instead of showing something partial. */
 let blocked = false;
-function explainSafe(receiver: string, a: Described['external'][0]['actions'][0], tx?: string) {
+function explainSafe(receiver: string, a: Described['external'][0]['actions'][0], tx?: string, solMessage?: string, btcPlan?: string, tronRaw?: string, xrpTx?: string) {
   try {
-    return explain(receiver, a, tx);
+    return explain(receiver, a, tx, solMessage, btcPlan, tronRaw, xrpTx);
   } catch (e) {
     blocked = true;
     return `<span class="error"><b>Don't approve:</b> ${esc((e as Error).message ?? e)}</span>`;
@@ -537,7 +785,7 @@ type Described = {
 };
 
 /** Plain words for a call, worked out from the decoded arguments. */
-function explain(receiver: string, a: Described['external'][0]['actions'][0], tx?: string): string {
+function explain(receiver: string, a: Described['external'][0]['actions'][0], tx?: string, solMessage?: string, btcPlan?: string, tronRaw?: string, xrpTx?: string): string {
   if (a.kind === 'transfer') return `Send ${formatNear(a.amount_yocto!)} NEAR to ${esc(receiver)}`;
   if (a.kind !== 'function_call') return `<span class="error">Unrecognised action: ${esc(JSON.stringify(a))}</span>`;
   const ours = receiver === cfg.extension;
@@ -562,6 +810,40 @@ function explain(receiver: string, a: Described['external'][0]['actions'][0], tx
     // The wallet asks the MPC network to sign for its EVM address. Show the
     // transaction, and only if the hash being signed is that transaction's.
     const req = a.args?.request;
+    if (req?.path === 'tron') {
+      if (!tronRaw || req.domain_id !== 0) throw new Error('A TRON signature request with no transaction to show');
+      const d = JSON.parse(core.describe_tron_raw(tronRaw));
+      if (req.payload_v2?.Ecdsa !== d.txid) throw new Error('The signature request does not match the transaction shown');
+      return `<b>Approve:</b> Send <b>${esc(fmtUnits(BigInt(d.sun), 6))} TRX</b> to ${copyable(d.to)} on TRON`;
+    }
+    if (req?.path === 'xrp') {
+      if (!xrpTx || req.domain_id !== 0) throw new Error('An XRP signature request with no transaction to show');
+      const d = JSON.parse(core.describe_xrp_tx(xrpTx));
+      if (req.payload_v2?.Ecdsa !== d.signing_hash) throw new Error('The signature request does not match the transaction shown');
+      const tag = d.destination_tag != null ? ` · destination tag ${esc(d.destination_tag)}` : '';
+      return `<b>Approve:</b> Send <b>${esc(fmtUnits(BigInt(d.drops), 6))} XRP</b> to ${copyable(d.to)} on XRP<div class="small muted">Network fee ${esc(fmtUnits(BigInt(d.fee_drops), 6, 6))} XRP${tag}</div>`;
+    }
+    if (req?.path === 'bitcoin' || req?.path === 'litecoin') {
+      // Bitcoin and Litecoin: each input needs its own signature. Confirm
+      // checks the set of hashes; here each must be one of the plan's, on
+      // the plan's own chain.
+      if (!btcPlan || req.domain_id !== 0) throw new Error('A signature request with no transaction to show');
+      const d = JSON.parse(core.describe_bitcoin_plan(btcPlan));
+      if (d.chain !== req.path) throw new Error('The signature request is for another chain');
+      const c = UTXO_SEND[d.chain];
+      const k = d.sighashes.indexOf(req.payload_v2?.Ecdsa);
+      if (k < 0) throw new Error('The signature request does not match the transaction shown');
+      const pays = d.pays.map((x: any) => `<b>${esc(fmtUnits(BigInt(x.sat), 8, 8))} ${c.sym}</b> to ${copyable(x.to)}`).join(', ');
+      return `<b>Approve:</b> Send ${pays} on ${esc(c.name)}<div class="small muted">Network fee ${esc(fmtUnits(BigInt(d.fee_sat), 8, 8))} ${c.sym} · signature ${k + 1} of ${d.sighashes.length}</div>`;
+    }
+    if (req?.payload_v2?.Eddsa !== undefined) {
+      // Solana: show the transfer, and only if the bytes being signed are it.
+      if (!solMessage || req.path !== 'solana' || req.domain_id !== 1 || req.payload_v2.Eddsa !== solMessage) {
+        throw new Error('The signature request does not match the transfer shown');
+      }
+      const d = JSON.parse(core.describe_solana_message(solMessage));
+      return `<b>Approve:</b> Send <b>${esc(fmtUnits(BigInt(d.lamports), 9))} SOL</b> to ${copyable(d.to)} on Solana`;
+    }
     if (!tx) return `<span class="error">A signature request with no transaction to show. Don't approve.</span>`;
     const d: EvmDescribed = JSON.parse(core.describe_evm_tx(tx));
     if (req?.path !== 'evm' || req?.payload_v2?.Ecdsa !== d.hash || req?.domain_id !== 0) {
@@ -574,15 +856,21 @@ function explain(receiver: string, a: Described['external'][0]['actions'][0], tx
   return `<span class="warn">Call ${esc(a.method)} on ${esc(receiver)}</span>${ours ? '' : ' <b class="error">(not the Marvii extension)</b>'}`;
 }
 
-function confirm(msgJson: string, ctx: { pendingId?: number; tx?: string; after?: (out: Outcome & { mpc_signature?: unknown }) => Promise<string> } = {}) {
+function confirm(msgJson: string, ctx: { pendingId?: number; tx?: string; solMessage?: string; btcPlan?: string; tronRaw?: string; xrpTx?: string; after?: (out: Outcome & { mpc_signature?: unknown }) => Promise<string> } = {}) {
   const msg = core.normalize_request(msgJson);
   const d: Described = JSON.parse(core.describe_message(msg));
   blocked = false;
+  if (ctx.btcPlan) {
+    // Exactly one signature per input of the transaction shown, no more.
+    const asked = d.external.flatMap((p) => p.actions.map((a) => a.args?.request?.payload_v2?.Ecdsa)).sort();
+    const want = [...JSON.parse(core.describe_bitcoin_plan(ctx.btcPlan)).sighashes].sort();
+    if (JSON.stringify(asked) !== JSON.stringify(want)) blocked = true;
+  }
   const m = document.getElementById('modal')!;
   const ops = d.internal.map((o) => `<li class="error"><b>Changes the wallet itself:</b> ${esc(o.op)} ${esc(o.account_id ?? o.enable ?? '')}</li>`);
   const calls = d.external.flatMap((p) =>
     p.actions.map(
-      (a) => `<li>${explainSafe(p.receiver_id, a, ctx.tx)}
+      (a) => `<li>${explainSafe(p.receiver_id, a, ctx.tx, ctx.solMessage, ctx.btcPlan, ctx.tronRaw, ctx.xrpTx)}
         <div class="small muted">${a.deposit_yocto && a.deposit_yocto !== '0' ? `Attaches ${formatNear(a.deposit_yocto)} NEAR · ` : ''}${a.gas_tgas ? `${a.gas_tgas} TGas` : ''}</div>
         <details><summary class="small">Exact arguments</summary><pre class="mono small">${esc(JSON.stringify(a.args, null, 2))}</pre></details></li>`,
     ),

@@ -1,9 +1,9 @@
 # Marvii on NEAR
 
-One passkey, every chain. Marvii is a self-custody account owned by your phone's passkey: no seed phrase, no password. You give AI agents and apps limited, revocable permission to act for you. NEAR enforces the limits, and you approve anything outside them with one tap.
+Marvii is a passkey wallet: self-custody secured by your phone's Face ID or fingerprint, with no seed phrase. It has one account on every chain, and agents and apps act only within limits you set.
 
 - **Your passkey owns the account.** It's a [`defuse-wallet`](https://github.com/near/intents) contract that checks the passkey's P-256 signature on-chain (NEAR's `p256_verify`). No server holds a key that can move your funds.
-- **One account, many chains.** The same account holds NEAR and has one address on every EVM chain, signed through NEAR Chain Signatures.
+- **One account, many chains.** The same account holds NEAR, has one address on every EVM chain, and has its own address on Bitcoin, Solana, TRON, XRP, Cardano, Litecoin, Dogecoin, Bitcoin Cash and Zcash, all signed through NEAR Chain Signatures.
 - **Agents and apps get session keys** with rules NEAR checks on every request:
   - which contracts and functions they may call
   - who they may pay
@@ -18,7 +18,7 @@ Testnet only. The contracts are unaudited.
 
 ## What happened on testnet
 
-All of the following ran on NEAR testnet and Base Sepolia (8 November 2026). Transaction hashes, explorer links and build notes are in [TESTNET.md](TESTNET.md).
+All of the following ran on NEAR testnet and each chain's testnet (8–9 November 2026). Transaction hashes, explorer links and build notes are in [TESTNET.md](TESTNET.md).
 
 | Step | Result |
 |---|---|
@@ -29,7 +29,7 @@ All of the following ran on NEAR testnet and Base Sepolia (8 November 2026). Tra
 | It proposes the same payment instead | queued for 10 minutes, then run and broadcast |
 | A second proposal | cancelled by the passkey; it can never run |
 | The passkey revokes the agent | its next request is refused |
-| The owner sends 1 USDC from the dashboard | approved with the passkey, signed, broadcast on Base Sepolia |
+| The owner sends from the dashboard: 1 USDC on Base, 0.01 SOL on Solana, 10,000 sats on Bitcoin, 0.002 LTC on Litecoin, 5 TRX on TRON, 5 XRP on XRP | each approved with the passkey, signed, broadcast |
 
 ## How it works
 
@@ -56,7 +56,7 @@ All of the following ran on NEAR testnet and Base Sepolia (8 November 2026). Tra
   - the WebAuthn proof
   - the EVM transaction decoding and hash, sharing the extension's `evm.rs` source
 - **`relayer/`** pays gas and nothing else. It only relays for wallets built from our code, and checks the passkey's proof before spending gas. Everything it forwards is checked again on-chain.
-- **`web/`** is the page: create with a passkey, balances per chain with Send, agents and apps, Confirm (it decodes exactly what the passkey signs), approvals, and the queue.
+- **`web/`** is the page: create with a passkey, balances per chain with Send (EVM, Solana, Bitcoin, Litecoin, TRON, XRP), agents and apps, Confirm (it decodes exactly what the passkey signs), approvals, and the queue.
 - **`agent/`** is a demo agent. It holds only a session key. Before broadcasting, it checks the signature recovers to the account's address for its own transaction.
 - **`devtool/`** handles deployment, a demo account and end-to-end runs.
 
@@ -73,7 +73,7 @@ All of the following ran on NEAR testnet and Base Sepolia (8 November 2026). Tra
 
 Requirements: Rust 1.97 with `wasm32-unknown-unknown`, Node 22, and a funded NEAR testnet account for the relayer.
 
-1. **Test the contracts.** Expect 38 extension tests and 17 core tests to pass:
+1. **Test the contracts.** Expect 38 extension tests and 30 core tests to pass:
    ```sh
    cd extension && cargo test
    cd ../core && cargo test

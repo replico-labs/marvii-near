@@ -231,3 +231,293 @@ fn native_send_has_value_and_no_data() {
     assert_eq!(t["value"], "1000");
     assert_eq!(t["data"], "0x");
 }
+
+// Reference addresses from each chain's own library (bitcoinjs-lib 6.1.7,
+// bchaddrjs 0.5.2, tronweb 6.0.0, ripple-keypairs 2.0.0, @solana/web3.js
+// 1.98.0; Dogecoin, Zcash and Cardano by their version bytes / CIP-19 with
+// bs58check and bech32), for secp256k1 key 0x11…11 and ed25519 seed 0x22…22.
+#[test]
+fn chain_addresses_match_reference_libraries() {
+    let xy = hex::decode("4f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa385b6b1b8ead809ca67454d9683fcf2ba03456d6fe2c4abe2b07f0fbdbb2f1c1").unwrap();
+    let k = format!("secp256k1:{}", bs58::encode(xy).into_string());
+    let e = format!("ed25519:{}", bs58::encode(hex::decode("a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0").unwrap()).into_string());
+    for (chain, key, want) in [
+        ("bitcoin", &k, "tb1ql3e9pgs3mmwuwrh95fecme0s0qtn28804khrk8"),
+        ("litecoin", &k, "tltc1ql3e9pgs3mmwuwrh95fecme0s0qtn2880v74axw"),
+        ("dogecoin", &k, "nsCyVMbwVcbNFQNHBmEtyUsx9YCzMC8mub"),
+        ("bitcoin-cash", &k, "bchtest:qr78y59zz80dm3cwuk388r097pupwdguaugjl6473v"),
+        ("zcash", &k, "tmYjAZFpvdDXTaJrq2WikAntitBNJJo9VSo"),
+        ("tron", &k, "TCLBgkbfVkJroVBJVqBEsxtPNQEQMTQCLQ"),
+        ("xrp", &k, "rQrFNnvPGNNMqRcVRMbtBK3hpYaPzoa8K9"),
+        ("solana", &e, "Bow1CGKGDB9mNxeWdw85E2aCthQ1oZX4oFEe7fYT17ew"),
+        ("cardano", &e, "addr_test1vr523hvdkxflk0cv9swltju5vgxds6ly8e8q25ulceutrdgyneq9q"),
+    ] {
+        assert_eq!(chain_address(chain, key).unwrap(), want, "{chain}");
+    }
+    assert!(chain_address("solana", &k).is_err());
+    assert!(chain_address("bitcoin", &e).is_err());
+}
+
+// Reference from @solana/web3.js 1.98.0: SystemProgram.transfer of 1234567
+// lamports from Keypair.fromSeed(0x22…22) to Keypair.fromSeed(0x33…33),
+// blockhash EETubP5A…hq1k, signed by the 0x22 key.
+const SOL_FROM: &str = "Bow1CGKGDB9mNxeWdw85E2aCthQ1oZX4oFEe7fYT17ew";
+const SOL_TO: &str = "2btLJAAb1S3x6hZYdVyAePjqtQYi2ZBSRGy4569RZu8h";
+const SOL_MSG: &str = "01000103a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f017cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce0000000000000000000000000000000000000000000000000000000000000000c49ae77603782054f17a9decea43b444eba0edb12c6f1d31c6e0e4a84bf052eb01020200010c0200000087d6120000000000";
+const SOL_TX: &str = "AYbdviGp8Zhgydk7ewscUtxkyeRtnP+J/e0cuZE0eCCLcQiap28MDIvqPKFeBbLNgNP1x/AWR5R+kI/2GGx8LAoBAAEDoJql9HpnWYAv+VX43C0qFKXJnSO+l/hkEn/5ODRVpPAXy3n7K0Eg8rHsZeQZjW4Iso6BP+sB5KQAg5uF4YCAzgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAxJrndgN4IFTxep3s6kO0ROug7bEsbx0xxuDkqEvwUusBAgIAAQwCAAAAh9YSAAAAAAA=";
+
+#[test]
+fn solana_message_and_tx_match_web3js() {
+    let m = solana_transfer_message(SOL_FROM, SOL_TO, "1234567", "EETubP5AKHgjPAhzPAFcb8BAY1hMH639CWCFTqi3hq1k").unwrap();
+    assert_eq!(m, SOL_MSG);
+    let d: serde_json::Value = serde_json::from_str(&describe_solana_message(&m).unwrap()).unwrap();
+    assert_eq!((d["from"].as_str().unwrap(), d["to"].as_str().unwrap(), d["lamports"].as_str().unwrap()), (SOL_FROM, SOL_TO, "1234567"));
+    // Sign as the MPC signer would answer, with the 0x22 key.
+    use ed25519_dalek::{Signer, SigningKey};
+    let sig = SigningKey::from_bytes(&[0x22; 32]).sign(&hex::decode(&m).unwrap());
+    let resp = serde_json::json!({ "scheme": "Ed25519", "signature": sig.to_bytes().to_vec() }).to_string();
+    assert_eq!(solana_signed_tx(&m, &resp, SOL_FROM).unwrap(), SOL_TX);
+    // The same signature for another account, or another message, is refused.
+    assert!(solana_signed_tx(&m, &resp, SOL_TO).is_err());
+    let other = solana_transfer_message(SOL_FROM, SOL_TO, "1234568", "EETubP5AKHgjPAhzPAFcb8BAY1hMH639CWCFTqi3hq1k").unwrap();
+    assert!(solana_signed_tx(&other, &resp, SOL_FROM).is_err());
+}
+
+#[test]
+fn solana_describe_refuses_other_messages() {
+    let mut m = hex::decode(SOL_MSG).unwrap();
+    let n = m.len();
+    m[n - 12] = 3; // another System instruction
+    assert!(describe_solana_message(&hex::encode(m)).is_err());
+}
+
+#[test]
+fn owner_eddsa_message_uses_the_chain_path() {
+    let m = owner_eddsa_sign_message("testnet", "0s3465557e026f471c0e84898f799c8032f356c77a", 1, 1_762_560_000, "v1.signer-prod.testnet", "solana", SOL_MSG).unwrap();
+    let d: serde_json::Value = serde_json::from_str(&describe_message(&m).unwrap()).unwrap();
+    let r = &d["external"][0]["actions"][0]["args"]["request"];
+    assert_eq!((r["path"].as_str().unwrap(), r["domain_id"].as_u64().unwrap()), ("solana", 1));
+    assert_eq!(r["payload_v2"]["Eddsa"], SOL_MSG);
+    assert!(owner_eddsa_sign_message("testnet", "0s3465557e026f471c0e84898f799c8032f356c77a", 1, 1, "v1.signer-prod.testnet", "bitcoin", SOL_MSG).is_err());
+}
+
+// Reference from bitcoinjs-lib 6.1.7 (Psbt, P2WPKH, key 0x11…11, sequence
+// 0xfffffffd): 60000 + 25000 sat in; 70000 to tb1qw508…pjzsx, 14000 change.
+const BTC_FROM: &str = "tb1ql3e9pgs3mmwuwrh95fecme0s0qtn28804khrk8";
+const BTC_RAW: &str = "02000000000102aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0100000000fdffffffbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb0000000000fdffffff027011010000000000160014751e76e8199196d454941c45d1b3a323f1433bd6b036000000000000160014fc7250a211deddc70ee5a2738de5f07817351cef02483045022100f5ce32c5422a6b89f177ac054918e58f6700311f6d37f59fb255a1e037c3791b02203c67b7bf330bbcd7bf862dd5ebbd14b210022111485e063913f24bbf7a95c4240121034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa02483045022100c774a514e1d118bdc61dd000eb7a80c4d19aedfcf47cc68505c431662d1652fd0220255df0ef84d1fb2675d11aec7e43cbc105a30b21b1e5af5cc3079b2b9187dded0121034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa00000000";
+const BTC_TXID: &str = "e6d28e9d0d114c294fcc6eba8b105a36a340d75bd88749ff3fdfd3e611958925";
+
+fn btc_reference_plan() -> String {
+    let inputs = serde_json::json!([{ "txid": "aa".repeat(32), "vout": 1, "value": 60000 }, { "txid": "bb".repeat(32), "vout": 0, "value": 25000 }]);
+    let outputs = vec![BtcOutput { address: "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx".into(), value: 70000 }, BtcOutput { address: BTC_FROM.into(), value: 14000 }];
+    let inputs: Vec<BtcInput> = serde_json::from_value(inputs).unwrap();
+    let sighashes = btc_sighashes(BTC_FROM, &inputs, &outputs).unwrap();
+    serde_json::to_string(&BtcPlan { from: BTC_FROM.into(), inputs, outputs, fee: 1000, sighashes }).unwrap()
+}
+
+/// Signs each hash as the MPC signer would answer (k256 is RFC 6979, like
+/// bitcoinjs), in reverse order to check signatures are matched by content.
+fn btc_mpc_sigs(plan: &str) -> String {
+    use k256::ecdsa::SigningKey;
+    let key = SigningKey::from_slice(&[0x11; 32]).unwrap();
+    let p: BtcPlan = serde_json::from_str(plan).unwrap();
+    let sigs: Vec<_> = p.sighashes.iter().rev().map(|h| {
+        let (sig, recid) = key.sign_prehash_recoverable(&hex::decode(h).unwrap()).unwrap();
+        serde_json::json!({ "big_r": { "affine_point": format!("{:02x}{}", 2 + recid.is_y_odd() as u8, hex::encode(sig.r().to_bytes())) }, "s": { "scalar": hex::encode(sig.s().to_bytes()) }, "recovery_id": recid.to_byte() })
+    }).collect();
+    serde_json::to_string(&sigs).unwrap()
+}
+
+#[test]
+fn bitcoin_tx_matches_bitcoinjs() {
+    let plan = btc_reference_plan();
+    let out: serde_json::Value = serde_json::from_str(&bitcoin_signed_tx(&plan, &btc_mpc_sigs(&plan)).unwrap()).unwrap();
+    assert_eq!(out["raw"], BTC_RAW);
+    assert_eq!(out["txid"], BTC_TXID);
+}
+
+#[test]
+fn bitcoin_plan_selects_and_describes() {
+    let utxos = serde_json::json!([{ "txid": "aa".repeat(32), "vout": 1, "value": 60000 }, { "txid": "bb".repeat(32), "vout": 0, "value": 25000 }, { "txid": "cc".repeat(32), "vout": 2, "value": 1000 }]).to_string();
+    let plan = bitcoin_plan(BTC_FROM, "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx", "70000", &utxos, 2).unwrap();
+    let p: BtcPlan = serde_json::from_str(&plan).unwrap();
+    assert_eq!(p.inputs.len(), 2, "largest coins first");
+    assert_eq!(p.outputs[1].address, BTC_FROM, "change back to the account");
+    let d: serde_json::Value = serde_json::from_str(&describe_bitcoin_plan(&plan).unwrap()).unwrap();
+    assert_eq!(d["pays"][0]["sat"], "70000");
+    assert_eq!(d["pays"].as_array().unwrap().len(), 1, "change isn't shown as a payment");
+    // A tampered plan (different recipient, same hashes) is refused.
+    let tampered = plan.replace("tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx", "tb1ql3e9pgs3mmwuwrh95fecme0s0qtn28804khrk8");
+    assert!(describe_bitcoin_plan(&tampered).is_err());
+    assert!(bitcoin_plan(BTC_FROM, "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx", "90000", &utxos, 2).is_err(), "not enough");
+}
+
+#[test]
+fn bitcoin_signatures_from_another_key_are_refused() {
+    let plan = btc_reference_plan();
+    let p: BtcPlan = serde_json::from_str(&plan).unwrap();
+    let other = k256::ecdsa::SigningKey::from_slice(&[0x12; 32]).unwrap();
+    let sigs: Vec<_> = p.sighashes.iter().map(|h| {
+        let (sig, recid) = other.sign_prehash_recoverable(&hex::decode(h).unwrap()).unwrap();
+        serde_json::json!({ "big_r": { "affine_point": format!("{:02x}{}", 2 + recid.is_y_odd() as u8, hex::encode(sig.r().to_bytes())) }, "s": { "scalar": hex::encode(sig.s().to_bytes()) }, "recovery_id": recid.to_byte() })
+    }).collect();
+    assert!(bitcoin_signed_tx(&plan, &serde_json::to_string(&sigs).unwrap()).is_err());
+}
+
+// Reference from tronweb 6.0.0 (txJsonToPb / txPbToRawDataHex / txPbToTxID /
+// crypto.signTransaction) for 1234567 sun from key 0x11…11 to key 0x33…33's
+// address.
+const TRON_FROM: &str = "TCLBgkbfVkJroVBJVqBEsxtPNQEQMTQCLQ";
+const TRON_TO: &str = "TJRabPrwbZy45sbavfcjinPJC18kjpRTv8";
+const TRON_RAW: &str = "0a02a1b22208010203040506070840e0889a99a6335a67080112630a2d747970652e676f6f676c65617069732e636f6d2f70726f746f636f6c2e5472616e73666572436f6e747261637412320a154119e7e376e7c213b7e7e7e46cc70a5dd086daff2a1215415cbdd86a2fa8dc4bddd8a8f69dba48572eec07fb1887ad4b7080b49699a633";
+const TRON_TXID: &str = "15e0f5dd80e24a9f1ba17c47322437a76b4f51be2498baba756687565b83f0c3";
+const TRON_SIG: &str = "c5e2c7e2a5ab1738324d076bf57673b3c9b92bc7daceee0e9334cc5d3a675fb606400f5fcfaeba9c1ab8173d323dd74882b86dd77f09da512f5c9466bda73ddd1b";
+
+#[test]
+fn tron_raw_and_signature_match_tronweb() {
+    let r: serde_json::Value = serde_json::from_str(&tron_transfer_raw(TRON_FROM, TRON_TO, "1234567", "a1b2", "0102030405060708", 1762600060000, 1762600000000).unwrap()).unwrap();
+    assert_eq!(r["raw_hex"], TRON_RAW);
+    assert_eq!(r["txid"], TRON_TXID);
+    let d: serde_json::Value = serde_json::from_str(&describe_tron_raw(TRON_RAW).unwrap()).unwrap();
+    assert_eq!((d["from"].as_str().unwrap(), d["to"].as_str().unwrap(), d["sun"].as_str().unwrap()), (TRON_FROM, TRON_TO, "1234567"));
+    let key = k256::ecdsa::SigningKey::from_slice(&[0x11; 32]).unwrap();
+    let (sig, recid) = key.sign_prehash_recoverable(&hex::decode(TRON_TXID).unwrap()).unwrap();
+    let resp = serde_json::json!({ "big_r": { "affine_point": format!("{:02x}{}", 2 + recid.is_y_odd() as u8, hex::encode(sig.r().to_bytes())) }, "s": { "scalar": hex::encode(sig.s().to_bytes()) }, "recovery_id": recid.to_byte() }).to_string();
+    let out: serde_json::Value = serde_json::from_str(&tron_signed_tx(TRON_RAW, &resp, TRON_FROM).unwrap()).unwrap();
+    assert_eq!(out["signature"], TRON_SIG);
+    assert!(tron_signed_tx(TRON_RAW, &resp, TRON_TO).is_err());
+}
+
+#[test]
+fn tron_describe_refuses_tampering() {
+    // Change the amount byte inside the contract: re-encoding no longer matches the decode.
+    // The contract-type field (`08 01`, after the contract tag `5a 67`) set
+    // to another contract type: the strict re-encode no longer matches.
+    let mut raw = hex::decode(TRON_RAW).unwrap();
+    let pos = raw.windows(4).position(|w| w == [0x5a, 0x67, 0x08, 0x01]).unwrap();
+    raw[pos + 3] = 2;
+    assert!(describe_tron_raw(&hex::encode(&raw)).is_err());
+    // An extra field appended (e.g. a fee limit) is refused too.
+    let mut extra = hex::decode(TRON_RAW).unwrap();
+    extra.extend([0x90, 0x01, 0x01]);
+    assert!(describe_tron_raw(&hex::encode(extra)).is_err());
+}
+
+// Reference from xrpl.js 4.1.0 / ripple-binary-codec 2.1.0 (encode,
+// encodeForSigning, hashes.hashSignedTx) with ripple-keypairs 2.0.0 `sign`:
+// 1234567 drops, fee 12, sequence 7, last ledger 22176800, from key 0x11…11
+// to key 0x33…33's address; the second also has destination tag 4242.
+const XRP_FROM: &str = "rQrFNnvPGNNMqRcVRMbtBK3hpYaPzoa8K9";
+const XRP_TO: &str = "raSyAhSugW1h15KbK3cuxJXMpuk6pGKFR5";
+const XRP_KEY_XY: &str = "4f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa385b6b1b8ead809ca67454d9683fcf2ba03456d6fe2c4abe2b07f0fbdbb2f1c1";
+const XRP_VECTORS: [(f64, &str, &str, &str); 2] = [
+    (-1.0,
+     "1200002400000007201B0152642061400000000012D68768400000000000000C7321034F355BDCB7CC0AF728EF3CCEB9615D90684BB5B2CA5F859AB0F0B704075871AA74463044022075BD4AA86F098EF0BD05D513B843A0E4A30CC5E8A2BA6C9012392BA0AB2C7C1D02202FA45C8FD8E413B6F2A1DE9F6D1895B8D7B47C8DBF7A925198DE8EE8F32F803E8114FC7250A211DEDDC70EE5A2738DE5F07817351CEF83143BC28D6D92D9073FB5E3ADF481795EAF446BCEED",
+     "1200002400000007201B0152642061400000000012D68768400000000000000C7321034F355BDCB7CC0AF728EF3CCEB9615D90684BB5B2CA5F859AB0F0B704075871AA8114FC7250A211DEDDC70EE5A2738DE5F07817351CEF83143BC28D6D92D9073FB5E3ADF481795EAF446BCEED",
+     "13349C7DCEB9479C18DEF96F446675714866A53F1C36BE92EF99BD801DAA172A"),
+    (4242.0,
+     "12000024000000072E00001092201B0152642061400000000012D68768400000000000000C7321034F355BDCB7CC0AF728EF3CCEB9615D90684BB5B2CA5F859AB0F0B704075871AA7446304402201AA3E2DEDF9C7E4E2A70F1607623B21A9BFE3493B3F4EB4DB0FC982C29A3EEE7022051AB8EDA2A742B50B8F009C90AB857FDE3A23CF71EF26D173DFCA2CB221CCA9B8114FC7250A211DEDDC70EE5A2738DE5F07817351CEF83143BC28D6D92D9073FB5E3ADF481795EAF446BCEED",
+     "12000024000000072E00001092201B0152642061400000000012D68768400000000000000C7321034F355BDCB7CC0AF728EF3CCEB9615D90684BB5B2CA5F859AB0F0B704075871AA8114FC7250A211DEDDC70EE5A2738DE5F07817351CEF83143BC28D6D92D9073FB5E3ADF481795EAF446BCEED",
+     "7E53D6B41CFC5F031AC294CA2D0D5EC3737251DFA6097616E13CD24C11AFDE7D"),
+];
+
+fn xrp_mpc_sign(hash_hex: &str, key: [u8; 32], high_s: bool) -> String {
+    let key = k256::ecdsa::SigningKey::from_slice(&key).unwrap();
+    let (sig, recid) = key.sign_prehash_recoverable(&hex::decode(hash_hex).unwrap()).unwrap();
+    let mut y = recid.is_y_odd() as u8;
+    let mut s = sig.s().to_bytes();
+    if high_s {
+        s = (-*sig.s()).to_bytes();
+        y ^= 1;
+    }
+    serde_json::json!({ "big_r": { "affine_point": format!("{:02x}{}", 2 + recid.is_y_odd() as u8, hex::encode(sig.r().to_bytes())) }, "s": { "scalar": hex::encode(s) }, "recovery_id": y }).to_string()
+}
+
+#[test]
+fn xrp_payment_matches_xrpl_js() {
+    let key = format!("secp256k1:{}", bs58::encode(hex::decode(XRP_KEY_XY).unwrap()).into_string());
+    for (tag, signed, unsigned, hash) in XRP_VECTORS {
+        let p: serde_json::Value = serde_json::from_str(&xrp_payment(XRP_FROM, &key, XRP_TO, "1234567", "12", 7, 22176800, tag).unwrap()).unwrap();
+        assert_eq!(p["tx_hex"].as_str().unwrap().to_uppercase(), unsigned);
+        let d: serde_json::Value = serde_json::from_str(&describe_xrp_tx(p["tx_hex"].as_str().unwrap()).unwrap()).unwrap();
+        assert_eq!((d["from"].as_str().unwrap(), d["to"].as_str().unwrap(), d["drops"].as_str().unwrap(), d["fee_drops"].as_str().unwrap()), (XRP_FROM, XRP_TO, "1234567", "12"));
+        assert_eq!(d["destination_tag"].as_u64(), if tag < 0.0 { None } else { Some(tag as u64) });
+        // A high-S signature from the signer is normalised; both give xrpl.js's blob.
+        for high_s in [false, true] {
+            let sig = xrp_mpc_sign(p["signing_hash"].as_str().unwrap(), [0x11; 32], high_s);
+            let out: serde_json::Value = serde_json::from_str(&xrp_signed_tx(p["tx_hex"].as_str().unwrap(), &sig, XRP_FROM).unwrap()).unwrap();
+            assert_eq!(out["tx_blob"], signed);
+            assert_eq!(out["hash"], hash);
+        }
+        // Another key's signature, or the wrong account, is refused.
+        let other = xrp_mpc_sign(p["signing_hash"].as_str().unwrap(), [0x33; 32], false);
+        assert!(xrp_signed_tx(p["tx_hex"].as_str().unwrap(), &other, XRP_FROM).is_err());
+        let sig = xrp_mpc_sign(p["signing_hash"].as_str().unwrap(), [0x11; 32], false);
+        assert!(xrp_signed_tx(p["tx_hex"].as_str().unwrap(), &sig, XRP_TO).is_err());
+    }
+}
+
+#[test]
+fn xrp_refuses_bad_inputs_and_tampering() {
+    let key = format!("secp256k1:{}", bs58::encode(hex::decode(XRP_KEY_XY).unwrap()).into_string());
+    // Another account's key, a fee over the cap, and sending to yourself.
+    assert!(xrp_payment(XRP_TO, &key, XRP_FROM, "1", "12", 1, 1, -1.0).is_err());
+    assert!(xrp_payment(XRP_FROM, &key, XRP_TO, "1", "100001", 1, 1, -1.0).is_err());
+    assert!(xrp_payment(XRP_FROM, &key, XRP_FROM, "1", "12", 1, 1, -1.0).is_err());
+    let unsigned = hex::decode(XRP_VECTORS[0].2).unwrap();
+    // Flags inserted, a token (non-XRP) amount, a field appended: all refused.
+    let mut flags = unsigned.clone();
+    flags.splice(3..3, [0x22, 0, 0, 0, 0]);
+    assert!(describe_xrp_tx(&hex::encode(flags)).is_err());
+    let mut iou = unsigned.clone();
+    let a = iou.iter().position(|b| *b == 0x61).unwrap();
+    iou[a + 1] = 0xd4;
+    assert!(describe_xrp_tx(&hex::encode(iou)).is_err());
+    let mut extra = unsigned.clone();
+    extra.extend([0xf9]);
+    assert!(describe_xrp_tx(&hex::encode(extra)).is_err());
+}
+
+// Reference from bitcoinjs-lib 6.1.7 with Litecoin testnet's parameters
+// (bech32 "tltc", P2PKH 0x6f, P2SH 0x3a): key 0x11…11, 6,000,000 +
+// 2,500,000 litoshis in; 7,000,000 to a tltc1 address, 300,000 to a Q…
+// (P2SH) address, 1,190,000 change.
+const LTC_FROM: &str = "tltc1ql3e9pgs3mmwuwrh95fecme0s0qtn2880v74axw";
+const LTC_TO: &str = "tltc1qw508d6qejxtdg4y5r3zarvary0c5xw7klfsuq0";
+const LTC_Q: &str = "QSpwqbSBqWfenXFv2Wg6zJj794QtwmrUQg";
+const LTC_RAW: &str = "02000000000102aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0100000000fdffffffbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb0000000000fdffffff03c0cf6a0000000000160014751e76e8199196d454941c45d1b3a323f1433bd6e09304000000000017a9144444444444444444444444444444444444444444877028120000000000160014fc7250a211deddc70ee5a2738de5f07817351cef02473044022036163b75ab6dfc1fa92144a2210f46c3e40d8462a58bd289a09eea9ee5673e90022059be2e4fbb35173854d5d67c12261e04efd84a10fdd9b81613915f42d6a530110121034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa02483045022100f21d1b7cf3c92ec2ac0789fc8989685453d8807b8c207c6d8548ac4cb957334402200945ce7f3997e8b79ed0866bf2c0a98aba2eb01339734d3803ce66ce5cd487a00121034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa00000000";
+const LTC_TXID: &str = "22cdd9480b7895eb1789f706f5578d129ee7cefd151f8c43d8840de21bdbefe4";
+
+#[test]
+fn litecoin_tx_matches_bitcoinjs() {
+    let inputs: Vec<BtcInput> = serde_json::from_value(serde_json::json!([{ "txid": "aa".repeat(32), "vout": 1, "value": 6000000 }, { "txid": "bb".repeat(32), "vout": 0, "value": 2500000 }])).unwrap();
+    let outputs = vec![
+        BtcOutput { address: LTC_TO.into(), value: 7000000 },
+        BtcOutput { address: LTC_Q.into(), value: 300000 },
+        BtcOutput { address: LTC_FROM.into(), value: 1190000 },
+    ];
+    let sighashes = btc_sighashes(LTC_FROM, &inputs, &outputs).unwrap();
+    let plan = serde_json::to_string(&BtcPlan { from: LTC_FROM.into(), inputs, outputs, fee: 10000, sighashes }).unwrap();
+    let d: serde_json::Value = serde_json::from_str(&describe_bitcoin_plan(&plan).unwrap()).unwrap();
+    assert_eq!(d["chain"], "litecoin");
+    assert_eq!(d["pays"].as_array().unwrap().len(), 2);
+    let out: serde_json::Value = serde_json::from_str(&bitcoin_signed_tx(&plan, &btc_mpc_sigs(&plan)).unwrap()).unwrap();
+    assert_eq!(out["raw"], LTC_RAW);
+    assert_eq!(out["txid"], LTC_TXID);
+}
+
+#[test]
+fn litecoin_and_bitcoin_addresses_dont_mix() {
+    let utxos = serde_json::json!([{ "txid": "aa".repeat(32), "vout": 1, "value": 6000000 }]).to_string();
+    // A Bitcoin address from a Litecoin account, and the other way round.
+    assert!(bitcoin_plan(LTC_FROM, "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx", "1000000", &utxos, 1).is_err());
+    assert!(bitcoin_plan(BTC_FROM, LTC_TO, "1000000", &utxos, 1).is_err());
+    assert!(bitcoin_plan(BTC_FROM, LTC_Q, "1000000", &utxos, 1).is_err(), "Q… is Litecoin-only");
+    // Litecoin's higher dust limit: 0.0005 LTC is refused, a Bitcoin-sized amount isn't.
+    assert!(bitcoin_plan(LTC_FROM, LTC_TO, "50000", &utxos, 1).is_err());
+    let plan = bitcoin_plan(LTC_FROM, LTC_TO, "1000000", &utxos, 1).unwrap();
+    let d: serde_json::Value = serde_json::from_str(&describe_bitcoin_plan(&plan).unwrap()).unwrap();
+    assert_eq!((d["chain"].as_str().unwrap(), d["pays"][0]["to"].as_str().unwrap()), ("litecoin", LTC_TO));
+    let b = bitcoin_plan(BTC_FROM, "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx", "50000", &utxos, 1).unwrap();
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&describe_bitcoin_plan(&b).unwrap()).unwrap()["chain"], "bitcoin");
+}

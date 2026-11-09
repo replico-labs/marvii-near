@@ -83,13 +83,33 @@ async fn main() -> Result<()> {
         Some("publish-wallet") => publish_wallet(&args[2]).await,
         Some("deploy-extension") => deploy_extension(&args[2]).await,
         Some("e2e") => e2e().await,
+        Some("fund") => fund(args.get(2).context("account")?, args.get(3).context("NEAR amount")?).await,
         Some("demo-wallet") => demo_wallet(None, None, false).await,
+        Some("demo-sign-solana") => {
+            SOL_SEND.set((args.get(2).context("to")?.clone(), args.get(3).context("lamports")?.clone(), args.get(4).is_some_and(|a| a == "--broadcast"))).ok();
+            demo(None, None, false, None).await
+        }
+        Some("demo-sign-bitcoin") => {
+            BTC_DRY.set(()).ok();
+            demo(None, None, false, None).await
+        }
         Some("demo-cancel") => demo(None, None, false, Some(args.get(2).context("queued id")?.parse()?)).await,
         Some("demo-upgrade") => demo_wallet(None, None, true).await,
         Some("demo-grant") => demo_wallet(Some(args.get(2).context("agent public key hex")?.clone()), None, false).await,
         Some("demo-approve") => demo_wallet(None, Some(args.get(2).context("pending request id")?.parse()?), false).await,
-        _ => bail!("usage: devtool publish-wallet <wasm> | deploy-extension <wasm> | e2e | demo-wallet | demo-upgrade | demo-cancel <queued id> | demo-grant <agent pubkey hex> | demo-approve <pending id>"),
+        _ => bail!("usage: devtool fund <account> <near> | publish-wallet <wasm> | deploy-extension <wasm> | e2e | demo-wallet | demo-upgrade | demo-cancel <queued id> | demo-grant <agent pubkey hex> | demo-approve <pending id>"),
     }
+}
+
+/// Sends testnet NEAR from the deployer, e.g. to a hosted relayer's account.
+async fn fund(account: &str, near: &str) -> Result<()> {
+    let amount = NearToken::from_millinear((near.parse::<f64>()? * 1000.0) as u128);
+    let out = Key::load("deployer")?.near()?.transfer(account, amount).wait_until::<Final>().await?;
+    if !out.is_success() {
+        bail!("transfer failed: {:?}", out.failure_message());
+    }
+    println!("sent {near} NEAR to {account}, tx {}", out.transaction_hash());
+    Ok(())
 }
 
 async fn publish_wallet(path: &str) -> Result<()> {
@@ -137,6 +157,12 @@ async fn deploy_extension(path: &str) -> Result<()> {
 async fn demo_wallet(grant_to: Option<String>, approve: Option<u64>, upgrade: bool) -> Result<()> {
     demo(grant_to, approve, upgrade, None).await
 }
+
+/// `demo-sign-solana <to> <lamports> [--broadcast]`.
+static SOL_SEND: std::sync::OnceLock<(String, String, bool)> = std::sync::OnceLock::new();
+/// `demo-sign-bitcoin`: a dry run with made-up coins (never broadcast), to
+/// check one passkey approval gets a valid signature for every input.
+static BTC_DRY: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 
 async fn demo(grant_to: Option<String>, approve: Option<u64>, upgrade: bool, cancel: Option<u64>) -> Result<()> {
     let deployer = Key::load("deployer")?;
@@ -194,6 +220,48 @@ async fn demo(grant_to: Option<String>, approve: Option<u64>, upgrade: bool, can
         let k = Secp256k1UncompressedPublicKey::from(mpc.derive_public_key("evm")).to_string();
         let addr = marvii_near_core::evm_address(&k).map_err(|e| anyhow!(e))?;
         println!("  EVM address (every EVM chain): {addr}");
+    }
+    if let Some((to, lamports, broadcast)) = SOL_SEND.get() {
+        // The owner sends SOL as the page does: core builds the message, the
+        // passkey approves it through the relayer, the MPC signer signs it.
+        let http = reqwest::Client::new();
+        let rpc = "https://api.devnet.solana.com";
+        let derived: String = near.view(signer().as_str(), "derived_public_key").args(json!({ "path": "solana", "predecessor": wallet_id, "domain_id": 1 })).await?;
+        let from = marvii_near_core::chain_address("solana", &derived).map_err(|e| anyhow!(e))?;
+        let bh: Value = http.post(rpc).json(&json!({ "jsonrpc": "2.0", "id": 1, "method": "getLatestBlockhash", "params": [{ "commitment": "finalized" }] })).send().await?.json().await?;
+        let bh = bh["result"]["value"]["blockhash"].as_str().context("blockhash")?;
+        let message = marvii_near_core::solana_transfer_message(&from, to, lamports, bh).map_err(|e| anyhow!(e))?;
+        println!("  from {from}: {}", marvii_near_core::describe_solana_message(&message).map_err(|e| anyhow!(e))?);
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs() as i64 - 60;
+        let m = marvii_near_core::owner_eddsa_sign_message(&chain(), &wallet_id, rand_bytes::<4>().iter().fold(0u32, |a, b| a << 8 | *b as u32), now, &signer(), "solana", &message).map_err(|e| anyhow!(e))?;
+        let msg: defuse_wallet::RequestMessage = serde_json::from_str(&m)?;
+        let (msg, proof) = wallet.sign(msg.request).await?;
+        let relayer = env_or("RELAYER", "http://localhost:8787");
+        let out: Value = http.post(format!("{relayer}/wallet/relay")).json(&json!({ "public_key": passkey_sec1, "msg": msg, "proof": proof })).send().await?.json().await?;
+        println!("  passkey approved: ok={} (NEAR tx {})", out["ok"], out["tx_hash"]);
+        let tx = marvii_near_core::solana_signed_tx(&message, &out["mpc_signature"].to_string(), &from).map_err(|e| anyhow!(e))?;
+        println!("  ed25519 signature verifies for {from}: true");
+        if *broadcast {
+            let r: Value = http.post(rpc).json(&json!({ "jsonrpc": "2.0", "id": 1, "method": "sendTransaction", "params": [tx, { "encoding": "base64" }] })).send().await?.json().await?;
+            println!("  broadcast: {}", r);
+        }
+    }
+    if BTC_DRY.get().is_some() {
+        let derived: String = near.view(signer().as_str(), "derived_public_key").args(json!({ "path": "bitcoin", "predecessor": wallet_id, "domain_id": 0 })).await?;
+        let from = marvii_near_core::chain_address("bitcoin", &derived).map_err(|e| anyhow!(e))?;
+        let utxos = json!([{ "txid": "aa".repeat(32), "vout": 0, "value": 30000 }, { "txid": "bb".repeat(32), "vout": 1, "value": 20000 }]).to_string();
+        let plan = marvii_near_core::bitcoin_plan(&from, "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx", "40000", &utxos, 2).map_err(|e| anyhow!(e))?;
+        let hashes: Value = serde_json::from_str::<Value>(&plan)?["sighashes"].clone();
+        println!("  from {from}: {}", marvii_near_core::describe_bitcoin_plan(&plan).map_err(|e| anyhow!(e))?);
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs() as i64 - 60;
+        let m = marvii_near_core::owner_ecdsa_multi_sign_message(&chain(), &wallet_id, rand_bytes::<4>().iter().fold(0u32, |a, b| a << 8 | *b as u32), now, &signer(), "bitcoin", &hashes.to_string()).map_err(|e| anyhow!(e))?;
+        let msg: defuse_wallet::RequestMessage = serde_json::from_str(&m)?;
+        let (msg, proof) = wallet.sign(msg.request).await?;
+        let relayer = env_or("RELAYER", "http://localhost:8787");
+        let out: Value = reqwest::Client::new().post(format!("{relayer}/wallet/relay")).json(&json!({ "public_key": passkey_sec1, "msg": msg, "proof": proof })).send().await?.json().await?;
+        println!("  passkey approved: ok={} (NEAR tx {}), {} signatures", out["ok"], out["tx_hash"], out["mpc_signatures"].as_array().map_or(0, Vec::len));
+        let signed = marvii_near_core::bitcoin_signed_tx(&plan, &out["mpc_signatures"].to_string()).map_err(|e| anyhow!(e))?;
+        println!("  every input signed by {from}'s key; txid {} (dry run, not broadcast)", serde_json::from_str::<Value>(&signed)?["txid"]);
     }
     if let Some(id) = cancel {
         let req = NearPromise::new(ext.account_id.parse::<defuse_wallet::AccountId>()?)

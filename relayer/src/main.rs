@@ -136,6 +136,7 @@ async fn main() -> Result<()> {
         .route("/agent/execute", post(agent_execute))
         .route("/agent/propose", post(agent_propose))
         .route("/queued/{id}/execute", post(queued_execute))
+        .route("/balance/cardano/{address}", get(cardano_balance))
         .route("/pending", get(pending_list))
         .route("/pending/{id}", get(pending_get))
         .route("/pending/{id}/reject", post(pending_reject))
@@ -183,12 +184,15 @@ fn summarize(a: &App, out: &FinalExecutionOutcome) -> Value {
     let mut failures = vec![];
     let mut logs = vec![];
     let mut mpc_signature = Value::Null;
+    // A request can ask for several signatures (one per Bitcoin input).
+    let mut mpc_signatures = vec![];
     for o in &out.receipts_outcome {
         logs.extend(o.outcome.logs.iter().cloned());
         match &o.outcome.status {
             ExecutionStatus::Failure(e) => failures.push(json!({ "on": o.outcome.executor_id.to_string(), "error": format!("{e:?}") })),
             ExecutionStatus::SuccessValue(v) if o.outcome.executor_id.as_str() == a.signer && !v.is_empty() => {
                 mpc_signature = serde_json::from_slice(&v[..]).unwrap_or(Value::Null);
+                mpc_signatures.push(mpc_signature.clone());
             }
             _ => {}
         }
@@ -199,6 +203,7 @@ fn summarize(a: &App, out: &FinalExecutionOutcome) -> Value {
         "failures": failures,
         "logs": logs,
         "mpc_signature": mpc_signature,
+        "mpc_signatures": mpc_signatures,
     })
 }
 
@@ -399,4 +404,25 @@ async fn queued_execute(State(a): State<Shared>, Path(id): Path<u64>) -> Reply {
     let mut s = summarize(&a, &out);
     s["reason"] = refusal(&s).map(Value::String).unwrap_or(Value::Null);
     Ok(Json(s))
+}
+
+/// Cardano preprod balance in lovelace. Koios answers browsers' preflight
+/// but leaves the CORS header off its POST responses, so the page asks here.
+/// Only testnet addresses, and only this one read.
+async fn cardano_balance(Path(address): Path<String>) -> Reply {
+    if !address.starts_with("addr_test1") || address.len() > 120 || !address.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err(bad("not a Cardano testnet address"));
+    }
+    let r: Value = reqwest::Client::new()
+        .post("https://preprod.koios.rest/api/v1/address_info")
+        .json(&json!({ "_addresses": [address] }))
+        .timeout(std::time::Duration::from_secs(8))
+        .send()
+        .await
+        .map_err(bad)?
+        .json()
+        .await
+        .map_err(bad)?;
+    let lovelace = r.get(0).and_then(|a| a["balance"].as_str()).unwrap_or("0").to_string();
+    Ok(Json(json!({ "lovelace": lovelace })))
 }
