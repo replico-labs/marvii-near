@@ -193,6 +193,32 @@ pub fn empty_message(chain_id: &str, wallet: &str, nonce: u32, created_at_secs: 
     serde_json::to_string(&msg).map_err(err)
 }
 
+/// The passkey moves the wallet to another extension: adds `add`, removes
+/// each of `remove_json` (a JSON list). The address doesn't change. Sessions
+/// live in each extension, so the old one's sessions stop working.
+#[wasm_bindgen]
+pub fn extension_move_message(chain_id: &str, wallet: &str, nonce: u32, created_at_secs: i64, add: &str, remove_json: &str) -> Result<String, String> {
+    use defuse_wallet::{Request, Timestamp, WalletOp};
+    let remove: Vec<String> = serde_json::from_str(remove_json).map_err(err)?;
+    let mut internal = vec![WalletOp::AddExtension { account_id: add.parse().map_err(err)? }];
+    for r in remove {
+        if r == add {
+            return Err("can't remove the extension being added".into());
+        }
+        internal.push(WalletOp::RemoveExtension { account_id: r.parse().map_err(err)? });
+    }
+    let msg = RequestMessage {
+        pay_for_gas: false,
+        chain_id: chain_id.to_string(),
+        signer_id: wallet.parse().map_err(err)?,
+        nonce,
+        created_at: Timestamp::from_secs(created_at_secs).ok_or("bad time")?,
+        timeout: core::time::Duration::from_secs(600),
+        request: Request { internal, external: vec![] },
+    };
+    serde_json::to_string(&msg).map_err(err)
+}
+
 /// Decodes a message into what the Confirm screen shows: who signs, until
 /// when, every wallet op and every call with its decoded arguments. It
 /// works from the parsed message, which is exactly what gets hashed.
@@ -257,6 +283,10 @@ pub fn describe_message(msg_json: &str) -> Result<String, String> {
 #[path = "../../extension/src/evm.rs"]
 #[allow(dead_code)]
 mod evm;
+mod legacy;
+mod cardano;
+pub use legacy::*;
+pub use cardano::*;
 
 /// `supply(address,uint256,address,uint16)`, from `cast sig`: Aave V3.
 const SEL_AAVE_SUPPLY: [u8; 4] = [0x61, 0x7b, 0xa0, 0x37];
@@ -475,22 +505,23 @@ fn b58check(version: &[u8], payload: &[u8]) -> String {
     bs58::encode([version, payload].concat()).with_check().into_string()
 }
 
+pub(crate) fn cashaddr_polymod(v: &[u8]) -> u64 {
+    let mut c: u64 = 1;
+    for d in v {
+        let c0 = (c >> 35) as u8;
+        c = ((c & 0x07_ffff_ffff) << 5) ^ (*d as u64);
+        for (bit, g) in [0x98f2bc8e61u64, 0x79b76d99e2, 0xf33e5fb3c4, 0xae2eabe2a8, 0x1e4f43e470].iter().enumerate() {
+            if c0 & (1 << bit) != 0 {
+                c ^= g;
+            }
+        }
+    }
+    c ^ 1
+}
+
 /// CashAddr (Bitcoin Cash), P2PKH: polymod checksum over the prefix.
 fn cashaddr(prefix: &str, hash: &[u8; 20]) -> String {
     const CHARSET: &[u8] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
-    fn polymod(v: &[u8]) -> u64 {
-        let mut c: u64 = 1;
-        for d in v {
-            let c0 = (c >> 35) as u8;
-            c = ((c & 0x07_ffff_ffff) << 5) ^ (*d as u64);
-            for (bit, g) in [0x98f2bc8e61u64, 0x79b76d99e2, 0xf33e5fb3c4, 0xae2eabe2a8, 0x1e4f43e470].iter().enumerate() {
-                if c0 & (1 << bit) != 0 {
-                    c ^= g;
-                }
-            }
-        }
-        c ^ 1
-    }
     let mut payload = vec![0u8]; // version: P2PKH, 160-bit hash
     payload.extend(hash);
     // 8-bit to 5-bit groups, padded.
@@ -510,7 +541,7 @@ fn cashaddr(prefix: &str, hash: &[u8; 20]) -> String {
     data.push(0);
     data.extend(&five);
     data.extend([0u8; 8]);
-    let m = polymod(&data);
+    let m = cashaddr_polymod(&data);
     let check: Vec<u8> = (0..8).map(|i| ((m >> (5 * (7 - i))) & 31) as u8).collect();
     let body: String = five.iter().chain(check.iter()).map(|d| CHARSET[*d as usize] as char).collect();
     format!("{prefix}:{body}")

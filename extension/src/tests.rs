@@ -49,8 +49,11 @@ fn grant() -> Grant {
             Cap { asset: format!("evm:{BASE_SEPOLIA}:{USDC}"), daily: U128(50_000_000) },
             Cap { asset: "near".into(), daily: U128(NearToken::from_near(1).as_yoctonear()) },
             Cap { asset: format!("nep141:{}", token()), daily: U128(100) },
+            // 100 USD of Hyperliquid orders a day.
+            Cap { asset: rules::HL_CAP_ASSET.into(), daily: U128(100_000_000) },
         ],
         queue_new_targets: false,
+        hl_markets: vec![rules::HlMarket { asset: 4, max_leverage: 5 }],
     }
 }
 
@@ -495,4 +498,106 @@ fn pause_stops_queued() {
 fn delay_has_a_floor() {
     ctx(owner(), NearToken::ZERO, NOW);
     Extension::new(owner(), signer(), 59_999);
+}
+
+// ---- Hyperliquid ----
+
+/// Reference: hyperliquid-python-sdk 0.x (`action_hash`, `l1_payload`,
+/// eth_account's EIP-712 hashing), testnet, nonce 1794197767416: an ETH
+/// (asset 4) Gtc buy of 0.01 at 2000.5, a cancel of order 123456789, and
+/// leverage 5x cross. MessagePack bytes and digests match.
+#[test]
+fn hl_digests_match_the_python_sdk() {
+    ctx(owner(), NearToken::ZERO, NOW);
+    let n = 1_794_197_767_416;
+    let cases = [
+        (hl::order_action(4, true, "2000.5", "0.01", false, "Gtc"), "83a474797065a56f72646572a66f72646572739186a16104a162c3a170a6323030302e35a173a4302e3031a172c2a17481a56c696d697481a3746966a3477463a867726f7570696e67a26e61", "49803b85581337b975464264e545835445dba9853026ec8394ef8e923eeac65e"),
+        (hl::cancel_action(4, 123_456_789), "82a474797065a663616e63656ca763616e63656c739182a16104a16fce075bcd15", "0a19e326ac3e848246db125c624206e3645014e4e351f8f6baa0425da9887587"),
+        (hl::leverage_action(4, true, 5), "84a474797065ae7570646174654c65766572616765a5617373657404a7697343726f7373c3a86c6576657261676505", "8ab50ff619c3e10354b3dd5470febc188aabdeb924962ea1980121ed106acb34"),
+    ];
+    for (bytes, want_mp, want_digest) in cases {
+        assert_eq!(hex::encode(&bytes), want_mp);
+        assert_eq!(hex::encode(hl::signing_hash(&bytes, n)), want_digest);
+    }
+}
+
+fn hl_order(price: &str, size: &str, nonce: u64) -> serde_json::Value {
+    serde_json::json!({ "type": "hl_order", "asset": 4, "is_buy": true, "price": price, "size": size, "reduce_only": false, "tif": "Gtc", "nonce": nonce })
+}
+
+#[test]
+fn hl_order_within_the_grant_signs_its_digest() {
+    let c = setup();
+    let s = c.get_session(wallet(), "agent-1".into()).unwrap();
+    let a: Action = serde_json::from_value(hl_order("2000.5", "0.01", NOW)).unwrap();
+    let plan = rules::check(&s, &a, Mode::Direct, NOW, &wallet(), &ext(), &signer()).unwrap();
+    let rules::Kind::Evm { path, hash } = plan.kind else { panic!("not a signature") };
+    assert_eq!(path, "evm");
+    assert_eq!(hash, hl::signing_hash(&hl::order_action(4, true, "2000.5", "0.01", false, "Gtc"), NOW));
+    // 2000.5 × 0.01 = 20.005 USD.
+    assert_eq!(plan.spends, vec![(rules::HL_CAP_ASSET.to_string(), 20_005_000)]);
+}
+
+#[test]
+fn hl_attacks_are_refused() {
+    let c = setup();
+    // Another market.
+    let mut other = hl_order("2000", "0.01", NOW);
+    other["asset"] = 3.into();
+    assert_eq!(try_action(&c, other, NOW), Err("Hyperliquid market not allowed"));
+    // Over the daily cap: 2000 × 0.06 = 120 USD > 100.
+    assert_eq!(try_action(&c, hl_order("2000", "0.06", NOW), NOW), Err("over the daily cap"));
+    // A stale or far-future nonce: a signature for later use.
+    assert!(try_action(&c, hl_order("2000", "0.01", NOW - 6 * 60 * 1000), NOW).is_err());
+    assert!(try_action(&c, hl_order("2000", "0.01", NOW + 6 * 60 * 1000), NOW).is_err());
+    // Non-canonical numbers (would hash differently from what Hyperliquid sees).
+    for (p, s) in [("2000.50", "0.01"), ("02000", "0.01"), ("2000.", "0.01"), ("2e3", "0.01"), ("2000", "0"), ("-1", "0.01"), ("2000", "0.000000001")] {
+        assert!(try_action(&c, hl_order(p, s, NOW), NOW).is_err(), "{p} {s}");
+    }
+    // Another order type.
+    let mut trig = hl_order("2000", "0.01", NOW);
+    trig["tif"] = "FrontendMarket".into();
+    assert!(try_action(&c, trig, NOW).is_err());
+    // Leverage above the grant's 5x.
+    let lev = |l: u32| serde_json::json!({ "type": "hl_leverage", "asset": 4, "is_cross": true, "leverage": l, "nonce": NOW });
+    assert_eq!(try_action(&c, lev(5), NOW), Ok(()));
+    assert_eq!(try_action(&c, lev(6), NOW), Err("leverage above what the grant allows"));
+    assert!(try_action(&c, lev(0), NOW).is_err());
+    // Cancels are free but still market-bound.
+    assert_eq!(try_action(&c, serde_json::json!({ "type": "hl_cancel", "asset": 4, "oid": 1, "nonce": NOW }), NOW), Ok(()));
+    assert!(try_action(&c, serde_json::json!({ "type": "hl_cancel", "asset": 0, "oid": 1, "nonce": NOW }), NOW).is_err());
+    // Never through the queue.
+    let s = c.get_session(wallet(), "agent-1".into()).unwrap();
+    let mut s2 = s.clone();
+    s2.grant.queue_new_targets = true;
+    let a: Action = serde_json::from_value(hl_order("2000", "0.01", NOW)).unwrap();
+    assert!(rules::check(&s2, &a, Mode::Queued, NOW, &wallet(), &ext(), &signer()).is_err());
+}
+
+#[test]
+fn hl_spend_accumulates_across_orders() {
+    let mut c = setup();
+    exec(&mut c, 1, hl_order("2000", "0.03", NOW + 1000)); // 60 USD
+    assert_eq!(c.spent_today(wallet(), "agent-1".into(), rules::HL_CAP_ASSET.into()), U128(60_000_000));
+    // 60 + 60 > 100.
+    assert_eq!(try_action(&c, hl_order("2000", "0.03", NOW + 2000), NOW + 2000), Err("over the daily cap"));
+    assert_eq!(try_action(&c, hl_order("2000", "0.02", NOW + 2000), NOW + 2000), Ok(()));
+}
+
+#[test]
+fn hl_grant_limits() {
+    ctx(owner(), NearToken::ZERO, NOW);
+    let mut g = grant();
+    g.hl_markets.push(rules::HlMarket { asset: 4, max_leverage: 3 });
+    assert!(rules::validate_grant(&g, "k", NOW, &wallet(), &ext(), &signer()).is_err(), "listed twice");
+    let mut g = grant();
+    g.hl_markets[0].max_leverage = 51;
+    assert!(rules::validate_grant(&g, "k", NOW, &wallet(), &ext(), &signer()).is_err());
+}
+
+#[test]
+fn hl_notional_rounds_up() {
+    assert_eq!(hl::notional_micro_usd("3.62695", "0.1").unwrap(), 362_695);
+    assert_eq!(hl::notional_micro_usd("1.00000001", "1").unwrap(), 1_000_001);
+    assert_eq!(hl::notional_micro_usd("75378", "0.00013").unwrap(), 9_799_140);
 }

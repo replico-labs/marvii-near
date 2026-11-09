@@ -108,3 +108,8 @@ pre { white-space: pre-wrap; word-break: break-all; background: var(--mv-paper);
 .coin { display: inline-flex; width: 24px; height: 24px; flex: none; }
 .coin svg { width: 100%; height: 100%; display: block; }
 .coin.small { width: 18px; height: 18px; }
+
+/* Swap card */
+.stack { display: grid; gap: 10px; }
+.grow { flex: 1; min-width: 130px; }
+#swap-out .row { padding: 2px 0; }

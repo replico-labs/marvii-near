@@ -1,0 +1,11 @@
+{
+  "name": "@marvii/near-tee-agent",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "The demo agent in a TEE (Phala Cloud, dstack): its session key is derived inside the enclave and never leaves it",
+  "dependencies": {
+    "@phala/dstack-sdk": "0.5.8",
+    "viem": "2.57.8"
+  }
+}

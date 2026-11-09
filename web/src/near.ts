@@ -1,7 +1,7 @@
 // Read-only NEAR RPC calls. Anything that changes state goes through the
 // wallet (passkey) or the extension (session rules), via the relayer.
 
-export type Config = { chain_id: string; rpc: string; signer: string; extension: string; wallet_code_hash: string; names?: string | null };
+export type Config = { chain_id: string; rpc: string; signer: string; extension: string; wallet_code_hash: string; names?: string | null; known_extensions?: string[] };
 
 export const RELAYER = (import.meta.env.VITE_RELAYER as string | undefined) ?? 'http://localhost:8787';
 

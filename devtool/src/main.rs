@@ -290,14 +290,17 @@ async fn demo(grant_to: Option<String>, approve: Option<u64>, upgrade: bool, can
         .with_relayer(near.clone());
     let wallet_id = wallet.account_id().to_string();
     wallet.initialize().await.context("initialize wallet")?;
-    if upgrade && created_ext != ext.account_id {
+    // The extension to remove: the one it was created with, unless it has
+    // moved since (MARVII_REMOVE_EXTENSION names the one it has now).
+    let remove_ext = std::env::var("MARVII_REMOVE_EXTENSION").unwrap_or_else(|_| created_ext.clone());
+    if upgrade && remove_ext != ext.account_id {
         // The passkey moves the wallet to the current extension: add it, and
         // remove the one it was created with. The address doesn't change.
         use defuse_wallet::{Request, WalletOp};
         let req = Request {
             internal: vec![
                 WalletOp::AddExtension { account_id: ext.account_id.parse()? },
-                WalletOp::RemoveExtension { account_id: created_ext.parse()? },
+                WalletOp::RemoveExtension { account_id: remove_ext.parse()? },
             ],
             external: vec![],
         };
@@ -413,11 +416,14 @@ async fn demo(grant_to: Option<String>, approve: Option<u64>, upgrade: bool, can
         let pool = "0x8bab6d1b75f19e9ed9fce8b9bd338844ff79ae27";
         let usdc = "0xba50cd2a20f6da35d788639e581bca8d0b5d4d5f";
         let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis() as u64;
+        // MARVII_GRANT_KEY_ID names the session (default aave-agent; the
+        // TEE agent uses tee-agent).
+        let key_id = std::env::var("MARVII_GRANT_KEY_ID").unwrap_or_else(|_| "aave-agent".into());
         let grant = json!({
-            "key_id": "aave-agent",
+            "key_id": key_id,
             "grant": {
                 "public_key": agent_pk,
-                "label": "Aave agent",
+                "label": "Aave and Hyperliquid agent",
                 "expires_at_ms": now_ms + 7 * 86_400_000,
                 "inactivity_ms": 3 * 86_400_000u64,
                 "near_venues": [],
@@ -425,8 +431,11 @@ async fn demo(grant_to: Option<String>, approve: Option<u64>, upgrade: bool, can
                 "evm_venues": [{ "chain_id": CHAIN_ID, "to": pool, "selector": "0x617ba037" }],
                 "near_recipients": [],
                 "evm_recipients": [],
-                "caps": [{ "asset": format!("evm:{CHAIN_ID}:{usdc}"), "daily": "50000000" }],
-                "queue_new_targets": true
+                // Hyperliquid testnet: ETH perps (asset 4, from the testnet
+                // `meta`), at most 5x, up to 100 USD of orders a day.
+                "caps": [{ "asset": format!("evm:{CHAIN_ID}:{usdc}"), "daily": "50000000" }, { "asset": "hyperliquid:usd", "daily": "100000000" }],
+                "queue_new_targets": true,
+                "hl_markets": [{ "asset": 4, "max_leverage": 5 }]
             }
         });
         let req = NearPromise::new(ext.account_id.parse::<defuse_wallet::AccountId>()?).function_call(
@@ -434,7 +443,7 @@ async fn demo(grant_to: Option<String>, approve: Option<u64>, upgrade: bool, can
         );
         let out = wallet.sign_and_send(req).await?.status(&near).wait_until::<Final>().await?;
         let granted = out.receipts_outcome.iter().any(|o| o.outcome.logs.iter().any(|l| l.starts_with("session_granted")));
-        println!("  passkey granted aave-agent: {granted} (tx {})", out.transaction_hash());
+        println!("  passkey granted {key_id}: {granted} (tx {})", out.transaction_hash());
         if !granted {
             bail!("grant failed: {:?}", out.failure_message());
         }

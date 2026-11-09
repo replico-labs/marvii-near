@@ -25,6 +25,21 @@ export function bitcoin_signed_tx(plan_json: string, mpc_signatures_json: string
 export function call_message(chain_id: string, wallet: string, nonce: number, created_at_secs: bigint, receiver: string, method: string, args_json: string, deposit_yocto: string, gas_tgas: bigint): string;
 
 /**
+ * Plans an ADA send: coins largest first (only ADA-only UTxOs; Koios's
+ * `[{tx_hash, tx_index, value, asset_list}]`), change back to `from`
+ * unless below the minimum ADA, then it goes to the fee. `ttl` is the
+ * last slot the transaction is valid in.
+ */
+export function cardano_plan(from: string, to: string, lovelace: string, utxos_json: string, ttl: bigint): string;
+
+/**
+ * The signed transaction (CBOR hex, for submission) and its txid, after
+ * checking the MPC signature (`{ signature: [64] }`) verifies over the body
+ * hash for a key whose hash is `from`'s payment key hash.
+ */
+export function cardano_signed_tx(plan_json: string, mpc_signature_json: string, derived_public_key: string): string;
+
+/**
  * The account's address on a non-EVM chain, from the MPC signer's derived
  * key for that chain's path (`secp256k1:<base58 x||y>` or
  * `ed25519:<base58>`). Testnet encodings; each is checked against the
@@ -51,11 +66,21 @@ export function compress_public_key(sec1_hex: string): string;
 export function describe_bitcoin_plan(plan_json: string): string;
 
 /**
+ * For Confirm: what a plan pays, with the body hash recomputed.
+ */
+export function describe_cardano_plan(plan_json: string): string;
+
+/**
  * Decodes an EVM transaction for the Confirm screen and computes the hash
  * the passkey will approve. Unknown functions are shown as such, never
  * guessed.
  */
 export function describe_evm_tx(tx_json: string): string;
+
+/**
+ * For Confirm: what a plan pays, with the signing hashes recomputed.
+ */
+export function describe_legacy_plan(plan_json: string): string;
 
 /**
  * Decodes a message into what the Confirm screen shows: who signs, until
@@ -109,6 +134,34 @@ export function evm_send_tx(chain_id: bigint, nonce: bigint, max_priority_fee_pe
  * signed by the address it expects.
  */
 export function evm_signed_tx(tx_json: string, mpc_signature_json: string): string;
+
+/**
+ * The passkey moves the wallet to another extension: adds `add`, removes
+ * each of `remove_json` (a JSON list). The address doesn't change. Sessions
+ * live in each extension, so the old one's sessions stop working.
+ */
+export function extension_move_message(chain_id: string, wallet: string, nonce: number, created_at_secs: bigint, add: string, remove_json: string): string;
+
+/**
+ * Plans a send on Dogecoin, Bitcoin Cash or Zcash: coins largest first
+ * (at most 6), change back to `from` unless it's dust. `fee_rate` is per
+ * byte (Dogecoin, Bitcoin Cash); Zcash's fee is ZIP-317's, 5,000 zatoshis
+ * per logical action with a minimum of two. `branch_id` and
+ * `expiry_height` are for Zcash only (0 otherwise).
+ */
+export function legacy_plan(chain: string, from: string, to: string, amount: string, utxos_json: string, fee_rate: number, branch_id: number, expiry_height: number): string;
+
+/**
+ * The output script (hex) for a testnet address on Dogecoin, Bitcoin Cash
+ * or Zcash; the relayer derives Electrum script hashes from it.
+ */
+export function legacy_script_pubkey(chain: string, address: string): string;
+
+/**
+ * The signed transaction (hex) and its txid, after every signature is
+ * checked against the account's key.
+ */
+export function legacy_signed_tx(plan_json: string, mpc_signatures_json: string): string;
 
 /**
  * Builds the proof `w_execute_signed` expects from a WebAuthn assertion.
@@ -215,11 +268,15 @@ export interface InitOutput {
     readonly bitcoin_plan: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => [number, number, number, number];
     readonly bitcoin_signed_tx: (a: number, b: number, c: number, d: number) => [number, number, number, number];
     readonly call_message: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: bigint) => [number, number, number, number];
+    readonly cardano_plan: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: bigint) => [number, number, number, number];
+    readonly cardano_signed_tx: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
     readonly chain_address: (a: number, b: number, c: number, d: number) => [number, number, number, number];
     readonly chain_path: (a: number, b: number) => [number, number, number, number];
     readonly compress_public_key: (a: number, b: number) => [number, number, number, number];
     readonly describe_bitcoin_plan: (a: number, b: number) => [number, number, number, number];
+    readonly describe_cardano_plan: (a: number, b: number) => [number, number, number, number];
     readonly describe_evm_tx: (a: number, b: number) => [number, number, number, number];
+    readonly describe_legacy_plan: (a: number, b: number) => [number, number, number, number];
     readonly describe_message: (a: number, b: number) => [number, number, number, number];
     readonly describe_solana_message: (a: number, b: number) => [number, number, number, number];
     readonly describe_tron_raw: (a: number, b: number) => [number, number, number, number];
@@ -228,6 +285,10 @@ export interface InitOutput {
     readonly evm_address: (a: number, b: number) => [number, number, number, number];
     readonly evm_send_tx: (a: bigint, b: bigint, c: number, d: number, e: number, f: number, g: bigint, h: number, i: number, j: number, k: number, l: number, m: number) => [number, number, number, number];
     readonly evm_signed_tx: (a: number, b: number, c: number, d: number) => [number, number, number, number];
+    readonly extension_move_message: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number, h: number, i: number, j: number) => [number, number, number, number];
+    readonly legacy_plan: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number) => [number, number, number, number];
+    readonly legacy_script_pubkey: (a: number, b: number, c: number, d: number) => [number, number, number, number];
+    readonly legacy_signed_tx: (a: number, b: number, c: number, d: number) => [number, number, number, number];
     readonly make_proof: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
     readonly normalize_request: (a: number, b: number) => [number, number, number, number];
     readonly owner_ecdsa_multi_sign_message: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number, h: number, i: number, j: number, k: number, l: number) => [number, number, number, number];

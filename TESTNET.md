@@ -33,3 +33,59 @@ Confirm recomputes the hashes from the plan, and refuses a request with any hash
 - Browser tests on testnet pass: `e2e/names.mjs` (a name at creation, a taken name refused, a name chosen later through Confirm) and `e2e/testnet.mjs`.
 
 **RPC.** NEAR's own testnet RPC (`rpc.testnet.near.org`) is deprecated and now refuses requests with HTTP 429; that made account creation fail intermittently. The relayer and devtool default to FASTNEAR's (`rpc.testnet.fastnear.com`), and the page uses whatever the relayer's `/config` says.
+
+## More chains: Cardano, Bitcoin Cash, Zcash, Dogecoin (9 November 2026)
+
+Each is built in `near/core` and checked against the chain's own reference library on the same inputs:
+- **Zcash (testnet, transparent).** v5 transactions with ZIP-244 signing hashes (BLAKE2b-256), committing to the consensus branch ID and an expiry height that lightwalletd reports (testnet is on NU7, `0x77190ad9`). zcash_primitives 0.31 parses the raw transaction, re-serializes it byte for byte, and computes the same txid and the same signing hash for each input. Fee: ZIP-317 (5,000 zatoshis per logical action, at least two).
+- **Bitcoin Cash (chipnet).** BIP-143 with SIGHASH_ALL | FORKID. The raw transaction is identical to bitcore-lib-cash's, signed with the same key.
+- **Dogecoin (testnet).** The original Bitcoin signing hash, version 1. Both inputs' hashes match bitcoinjs-lib's `hashForSignature`.
+- **Cardano (preprod).** A Shelley-era body in CBOR (inputs, outputs, fee, TTL), signed over BLAKE2b-256 of the body by the account's ed25519 key. cardano-serialization-lib decodes it and computes the same transaction hash, and the signature verifies. Fee: 44 × size + 155,381 (preprod parameters), plus a 16-byte margin because encoders that tag sets count 6 more bytes. UTxOs carrying tokens are left alone.
+
+Reads and broadcasts go through the relayer, under `/chain/{chain}/…`:
+- Cardano: Koios.
+- Zcash: lightwalletd over gRPC (`testnet.zec.rocks`).
+- Bitcoin Cash: Electrum over TLS (`chipnet.bch.ninja:50002`).
+- Dogecoin: an Esplora API.
+
+Confirm decodes each plan and refuses a request whose hashes aren't exactly the plan's, as for Bitcoin.
+
+On testnet, the demo account received 0.02 BCH on chipnet from the BCH Ninja faucet (`bd0970e5…81ab`).
+
+## Hyperliquid (extension v4, 9 November 2026)
+
+**Extension v4** is deployed at `cd1cd8fe1383641c975a832c077b612ef8c95935377636241d84803223f20deb` (tx [`6yHX2Nii…`](https://testnet.nearblocks.io/txns/6yHX2NiiYy9MtYnEZYVsenSHnuAdruBYjEBMUCFBxtmT)).
+- The demo account's passkey moved it from v3 ([`DeqtX5qG…`](https://testnet.nearblocks.io/txns/DeqtX5qGw9hkJWsPHhFgaFSWvGBAeSkFhyNiUUT84ABE)).
+- It then granted the agent ETH perps (asset 4): at most 5x, up to 100 USD of orders a day ([`9dcgc3gM…`](https://testnet.nearblocks.io/txns/9dcgc3gM8iZSYT4uimqvMHacetRw71Mx7EfDZdSjvRv1)).
+
+The digests match hyperliquid-python-sdk for an order, a cancel and a leverage change: the MessagePack bytes and the EIP-712 digest. That vector is in the extension's tests.
+
+On testnet, through the relayer:
+- Leverage 3x: signed ([`GroCMrYt…`](https://testnet.nearblocks.io/txns/GroCMrYtCycWmMQgxSBBRZShmFEUS9vXQfroqCvMYVpf)). Hyperliquid recovered the signer as the account's own address, `0x48f0…a81e`, then answered that the account has no deposit yet.
+- Leverage 10x: refused by the extension, "leverage above what the grant allows" ([`8Z57xSVY…`](https://testnet.nearblocks.io/txns/8Z57xSVY9VdoCySADQfjSWBkVyWUGAVEaymN2LAQ4bNR)).
+- A 120 USD order: refused, "over the daily cap" ([`4fFx7BVe…`](https://testnet.nearblocks.io/txns/4fFx7BVeoAQaUSCfjqJZhr9YmXTaxKTb7t9ot2hyf4Ls)).
+- A 20 USD order (0.01 ETH at 2000): signed ([`5PZ1T2A5…`](https://testnet.nearblocks.io/txns/5PZ1T2A57RJx7tSDAc2Fwj4Eknwvf2B3cpAMvnDZ1Lmg)). Hyperliquid again recovered the account's address.
+
+Orders rest once the account holds testnet USDC on Hyperliquid.
+
+Browser tests on v4 pass:
+- `e2e/testnet.mjs` now also grants Hyperliquid through the form. Confirm shows the market and leverage, the agent's order is signed, and 9x is refused.
+- `e2e/move.mjs`: an account created on v3 is offered the update and moved with one tap; its address is unchanged.
+
+## TEE agent (9 November 2026)
+
+`agent/tee/agent.mjs` derives its session key from dstack's key service and publishes a TDX quote. The quote's report data is SHA-256 of `marvii-agent-key:<public key>`.
+
+Run locally against a stand-in for dstack (not a TEE):
+- the passkey granted its key a `tee-agent` session ([`GrmrqcGc…`](https://testnet.nearblocks.io/txns/GrmrqcGcZVQuWL32gFH2nwjSQ7cJzLkWeQbYrzc71oQa))
+- its ETH order was signed ([`Cz6suK7x…`](https://testnet.nearblocks.io/txns/Cz6suK7xFjcToQ8d9G9wr1rpQBzE4JNXMxUbNU8uf5Xc))
+- 20x leverage was refused ([`xBRXGsY4…`](https://testnet.nearblocks.io/txns/xBRXGsY4hRk2123iSt7AvL3hZ1itQtADhWZ2cC5CH2B))
+- a request without its token was refused (401)
+
+`docker-compose.yml`'s bootstrap was also run locally: it fetches the three files, checks their SHA-256 and runs the agent. Deploying it on Phala Cloud gives the real enclave and quote.
+
+## NEAR Intents (quotes)
+
+The Swap card asks NEAR Intents' 1Click API for a quote through the relayer, which always sends `dry: true`, so no deposit address is ever created. The quote is between balances the account would hold inside Intents.
+
+On 9 November 2026, 10 wNEAR quoted 36.14 USDC, at least 35.78 after 1% slippage, in about 10 seconds. No solver quoted wNEAR to BTC inside Intents at that moment; the page says so.

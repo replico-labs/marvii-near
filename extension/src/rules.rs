@@ -2,6 +2,7 @@
 //! be tested on its own.
 
 use crate::evm::{self, Decoded, Eip1559};
+use crate::hl;
 use near_sdk::{AccountId, NearToken, json_types::U128, near};
 
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
@@ -22,6 +23,19 @@ pub struct EvmVenue {
     /// 0x-prefixed 4-byte function selector.
     pub selector: String,
 }
+
+/// A Hyperliquid perpetual the agent may trade, by Hyperliquid's asset
+/// index (testnet: 4 is ETH), and the most leverage it may set.
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HlMarket {
+    pub asset: u32,
+    pub max_leverage: u32,
+}
+
+/// The cap asset for Hyperliquid orders: their value, price × size, in
+/// micro-USD (6 decimals), counted whether they open or reduce.
+pub const HL_CAP_ASSET: &str = "hyperliquid:usd";
 
 #[near(serializers = [borsh, json])]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,6 +71,10 @@ pub struct Grant {
     /// passkey can cancel them; caps and expiry still apply.
     #[serde(default)]
     pub queue_new_targets: bool,
+    /// Hyperliquid (testnet) markets the agent may trade. Orders count
+    /// against the `hyperliquid:usd` cap.
+    #[serde(default)]
+    pub hl_markets: Vec<HlMarket>,
 }
 
 #[near(serializers = [borsh, json])]
@@ -112,7 +130,18 @@ pub enum Action {
     NearCall { receiver_id: AccountId, method: String, args: String, deposit: U128 },
     /// An EVM transaction, signed through Chain Signatures.
     EvmTx { tx: EvmTx },
+    /// A Hyperliquid limit order. `price` and `size` as Hyperliquid writes
+    /// them; `nonce` is the order's timestamp in milliseconds.
+    HlOrder { asset: u32, is_buy: bool, price: String, size: String, reduce_only: bool, tif: String, nonce: u64 },
+    /// Cancels a Hyperliquid order by its ID.
+    HlCancel { asset: u32, oid: u64, nonce: u64 },
+    /// Sets the leverage on a Hyperliquid market.
+    HlLeverage { asset: u32, is_cross: bool, leverage: u32, nonce: u64 },
 }
+
+/// How far a Hyperliquid nonce (a timestamp) may be from the block time:
+/// a signature is only good for an action meant to be sent now.
+pub const HL_NONCE_WINDOW_MS: u64 = 5 * 60 * 1000;
 
 #[near(serializers = [json])]
 #[derive(Clone, Debug)]
@@ -209,12 +238,20 @@ pub fn validate_grant(
         chain.parse::<u64>().map_err(|_| "bad chain id in evm recipient")?;
         evm::parse_address(addr)?;
     }
+    for (i, m) in g.hl_markets.iter().enumerate() {
+        if m.max_leverage == 0 || m.max_leverage > 50 {
+            return Err("max leverage must be 1 to 50");
+        }
+        if g.hl_markets[..i].iter().any(|x| x.asset == m.asset) {
+            return Err("a Hyperliquid market is listed twice");
+        }
+    }
     for c in &g.caps {
         if c.asset != c.asset.to_lowercase() {
             return Err("cap assets must be lowercase");
         }
     }
-    if g.near_venues.len() + g.evm_venues.len() + g.near_recipients.len() + g.evm_recipients.len() + g.caps.len() > 64 {
+    if g.near_venues.len() + g.evm_venues.len() + g.near_recipients.len() + g.evm_recipients.len() + g.caps.len() + g.hl_markets.len() > 64 {
         return Err("grant too large");
     }
     Ok(())
@@ -337,6 +374,17 @@ pub fn check(
             }
             Plan { kind: Kind::Evm { path: EVM_PATH.to_string(), hash: t.signing_hash() }, spends }
         }
+        Action::HlOrder { .. } | Action::HlCancel { .. } | Action::HlLeverage { .. } => {
+            if queued {
+                return Err("Hyperliquid actions can't be queued");
+            }
+            let (action_bytes, spends) = hl_check(g, action, now)?;
+            let nonce = match action {
+                Action::HlOrder { nonce, .. } | Action::HlCancel { nonce, .. } | Action::HlLeverage { nonce, .. } => *nonce,
+                _ => unreachable!(),
+            };
+            Plan { kind: Kind::Evm { path: EVM_PATH.to_string(), hash: hl::signing_hash(&action_bytes, nonce) }, spends }
+        }
     };
     for (asset, amount) in &plan.spends {
         let cap = cap_for(g, asset).ok_or("no cap for this asset")?;
@@ -346,6 +394,35 @@ pub fn check(
         }
     }
     Ok(plan)
+}
+
+/// A Hyperliquid action's encoding and spend, if the grant allows it.
+pub fn hl_check(g: &Grant, action: &Action, now: u64) -> Result<(Vec<u8>, Vec<(String, u128)>), &'static str> {
+    let (asset, nonce) = match action {
+        Action::HlOrder { asset, nonce, .. } | Action::HlCancel { asset, nonce, .. } | Action::HlLeverage { asset, nonce, .. } => (*asset, *nonce),
+        _ => return Err("not a Hyperliquid action"),
+    };
+    if nonce + HL_NONCE_WINDOW_MS < now || nonce > now + HL_NONCE_WINDOW_MS {
+        return Err("Hyperliquid nonce must be within 5 minutes of now");
+    }
+    let market = g.hl_markets.iter().find(|m| m.asset == asset).ok_or("Hyperliquid market not allowed")?;
+    Ok(match action {
+        Action::HlOrder { is_buy, price, size, reduce_only, tif, .. } => {
+            if !hl::TIFS.contains(&tif.as_str()) {
+                return Err("order type must be Gtc, Ioc or Alo");
+            }
+            let value = hl::notional_micro_usd(price, size)?;
+            (hl::order_action(asset, *is_buy, price, size, *reduce_only, tif), vec![(HL_CAP_ASSET.to_string(), value)])
+        }
+        Action::HlCancel { oid, .. } => (hl::cancel_action(asset, *oid), vec![]),
+        Action::HlLeverage { is_cross, leverage, .. } => {
+            if *leverage == 0 || *leverage > market.max_leverage {
+                return Err("leverage above what the grant allows");
+            }
+            (hl::leverage_action(asset, *is_cross, *leverage), vec![])
+        }
+        _ => unreachable!(),
+    })
 }
 
 #[derive(near_sdk::serde::Deserialize)]

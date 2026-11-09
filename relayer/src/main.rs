@@ -36,6 +36,8 @@ use serde_json::{Value, json};
 use std::{collections::HashSet, fs, path::PathBuf, sync::{Arc, Mutex}};
 use tower_http::cors::CorsLayer;
 
+mod chains;
+
 fn env_or(k: &str, d: &str) -> String {
     std::env::var(k).unwrap_or_else(|_| d.to_string())
 }
@@ -162,6 +164,12 @@ async fn main() -> Result<()> {
         .route("/utxo/{chain}/address/{address}/utxo", get(utxo_coins))
         .route("/utxo/{chain}/fees", get(utxo_fees))
         .route("/utxo/{chain}/tx", post(utxo_broadcast))
+        .route("/chain/{chain}/utxos/{address}", get(chains::utxos))
+        .route("/chain/{chain}/balance/{address}", get(chains::balance))
+        .route("/chain/{chain}/info", get(chains::info))
+        .route("/chain/{chain}/tx", post(chains::broadcast))
+        .route("/intents/tokens", get(chains::intents_tokens))
+        .route("/intents/quote", post(chains::intents_quote))
         .route("/names/forward", post(names_forward))
         .route("/pending", get(pending_list))
         .route("/pending/{id}", get(pending_get))
@@ -181,6 +189,9 @@ async fn config(State(a): State<Shared>) -> Json<Value> {
     Json(json!({
         "chain_id": a.chain, "rpc": a.rpc, "signer": a.signer,
         "extension": a.extension, "wallet_code_hash": a.code_hash, "names": a.names,
+        // Earlier Marvii extensions, which a wallet may still have: the page
+        // offers to move it to the current one.
+        "known_extensions": a.known_extensions,
     }))
 }
 

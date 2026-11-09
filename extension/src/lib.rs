@@ -20,6 +20,7 @@
 //! extension, or the MPC signer directly. Testnet only: unaudited.
 
 pub mod evm;
+mod hl;
 pub mod rules;
 
 use defuse_wallet::{
@@ -269,6 +270,25 @@ impl Extension {
     pub fn evm_signing_hash(&self, tx: EvmTx) -> String {
         let t = tx.parse().unwrap_or_else(|e| env::panic_str(e));
         hex::encode(t.signing_hash())
+    }
+
+    /// The EIP-712 digest a Hyperliquid action is signed over (for the
+    /// agent, which checks the signature recovers to the account's address).
+    pub fn hl_signing_hash(&self, action: Action) -> String {
+        let nonce = match &action {
+            Action::HlOrder { nonce, .. } | Action::HlCancel { nonce, .. } | Action::HlLeverage { nonce, .. } => *nonce,
+            _ => env::panic_str("not a Hyperliquid action"),
+        };
+        let bytes = match &action {
+            Action::HlOrder { asset, is_buy, price, size, reduce_only, tif, .. } => {
+                hl::parse_decimal(price).and_then(|_| hl::parse_decimal(size)).unwrap_or_else(|e| env::panic_str(e));
+                hl::order_action(*asset, *is_buy, price, size, *reduce_only, tif)
+            }
+            Action::HlCancel { asset, oid, .. } => hl::cancel_action(*asset, *oid),
+            Action::HlLeverage { asset, is_cross, leverage, .. } => hl::leverage_action(*asset, *is_cross, *leverage),
+            _ => unreachable!(),
+        };
+        hex::encode(hl::signing_hash(&bytes, nonce))
     }
 
     pub fn spent_today(&self, wallet: AccountId, key_id: String, asset: String) -> U128 {

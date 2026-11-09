@@ -1,0 +1,45 @@
+# The demo agent on Phala Cloud (Intel TDX, dstack). Deploy this file as the
+# app's compose: its hash is measured into the TDX quote, and it pins the
+# agent's code by SHA-256, so the quote says exactly which code holds the key.
+#
+# Before deploying, set COMMIT below to the marvii-near commit that carries
+# these files (the hashes are of the files in this directory). Set WALLET
+# and AGENT_TOKEN as encrypted environment variables in Phala Cloud.
+services:
+  agent:
+    image: node:22.22.0-slim
+    restart: always
+    ports:
+      - "8080:8080"
+    volumes:
+      # dstack's guest agent: key derivation and quotes, inside the TEE.
+      - /var/run/dstack.sock:/var/run/dstack.sock
+    environment:
+      - WALLET=${WALLET}
+      - AGENT_TOKEN=${AGENT_TOKEN}
+      - KEY_ID=tee-agent
+      - RELAYER=https://relayer.marvii.xyz
+    command:
+      - node
+      - --input-type=module
+      - -e
+      - |
+        import fs from 'node:fs';
+        import crypto from 'node:crypto';
+        import { execSync } from 'node:child_process';
+        const COMMIT = 'SET-ME';
+        const base = 'https://raw.githubusercontent.com/replico-labs/marvii-near/' + COMMIT + '/agent/tee/';
+        const files = {
+          'agent.mjs': '494fadf5aef85a1cf3a8040e92bea8584168d60cbd4978a73e8c4385fc4e8b43',
+          'package.json': 'dba6afdd3efe0d2cca71b3210dcf6e03cbc9f4613f92bf0db3dce5c90c6a3dab',
+          'package-lock.json': '334cae8ec6ba950f0665e8ee7d2dd4308f2e294497502e529343e879bbb90180',
+        };
+        fs.mkdirSync('/app', { recursive: true });
+        process.chdir('/app');
+        for (const [f, h] of Object.entries(files)) {
+          const b = Buffer.from(await (await fetch(base + f)).arrayBuffer());
+          if (crypto.createHash('sha256').update(b).digest('hex') !== h) throw new Error('hash mismatch: ' + f);
+          fs.writeFileSync(f, b);
+        }
+        execSync('npm ci --omit=dev', { stdio: 'inherit' });
+        await import('/app/agent.mjs');

@@ -49,6 +49,8 @@ await page.fill('input[name=to]', POOL);
 await page.fill('input[name=selector]', '0x617ba037');
 await page.fill('input[name=token]', USDC);
 await page.check('input[name=queue]');
+// And Hyperliquid testnet: ETH perps, at most 5x, 100 USD of orders a day.
+await page.check('input[name=hl]');
 await page.click('#grant button.primary');
 await page.waitForSelector('text=Confirm');
 console.log('confirm shows:', (await page.textContent('.sheet .list')).replace(/\s+/g, ' ').trim().slice(0, 300));
@@ -108,16 +110,30 @@ const left = await (await fetch(cfg.rpc, { method: 'POST', headers: { 'content-t
 const queuedLeft = JSON.parse(Buffer.from(left.result.result).toString()).length;
 console.log('after the passkey cancels, queued requests left:', queuedLeft);
 
+// Hyperliquid: the extension builds the EIP-712 digest from the order's
+// fields and has it signed; leverage above the grant's is refused.
+async function hlAgent(n, action) {
+  const msg = JSON.stringify({ domain: 'marvii-session-v1', extension: cfg.extension, wallet, key_id: 'agent-1', nonce: n, deadline_ms: Date.now() + 300_000, action });
+  const signature = crypto.sign(null, crypto.createHash('sha256').update(msg).digest(), privateKey).toString('hex');
+  const j = await (await fetch(RELAYER + '/agent/execute', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ msg, signature }) })).json();
+  j.reason = j.reason ?? j.error ?? '';
+  return j;
+}
+const hlOk = await hlAgent(3, { type: 'hl_order', asset: 4, is_buy: true, price: '2000', size: '0.01', reduce_only: false, tif: 'Gtc', nonce: Date.now() });
+console.log('agent Hyperliquid ETH order (20 USD):', hlOk.ok && hlOk.mpc_signature ? 'signed' : 'refused: ' + hlOk.reason);
+const hlLev = await hlAgent(4, { type: 'hl_leverage', asset: 4, is_cross: true, leverage: 9, nonce: Date.now() });
+console.log('agent Hyperliquid leverage 9x (grant allows 5x):', hlLev.ok ? 'ACCEPTED (bad)' : 'refused:', hlLev.reason);
+
 await page.click('[data-revoke]');
 await page.waitForSelector('text=Revoke the session key');
 await page.click('#yes');
 await page.waitForSelector('.pill.bad', { timeout: 120_000 });
 console.log('revoked on the dashboard');
-const after = await agent(3, 1_000_000);
+const after = await agent(4, 1_000_000);
 console.log('agent after revoke:', after.ok ? 'ACCEPTED (bad)' : 'refused:', after.reason);
 
 await page.screenshot({ path: process.env.SHOT ?? 'dashboard.png', fullPage: true });
 await browser.close();
-const pass = ok.ok && ok.mpc_signature && !over.ok && over.reason.includes('daily cap') && approved?.status === 'approved' && approved.mpc_signature && !direct.ok && direct.reason === 'recipient not allowed' && prop.queue_id && queuedLeft === 0 && !after.ok && after.reason.includes('revoked');
+const pass = ok.ok && ok.mpc_signature && !over.ok && over.reason.includes('daily cap') && approved?.status === 'approved' && approved.mpc_signature && !direct.ok && direct.reason === 'recipient not allowed' && prop.queue_id && queuedLeft === 0 && !after.ok && after.reason.includes('revoked') && hlOk.ok && hlOk.mpc_signature && !hlLev.ok && hlLev.reason.includes('leverage');
 console.log(pass ? 'PASS' : 'FAIL');
 process.exit(pass ? 0 : 1);

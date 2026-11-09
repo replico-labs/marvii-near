@@ -62,6 +62,7 @@ const utxoBalance = async (chain: string, a: string) => {
   const c = j.chain_stats, m = j.mempool_stats;
   return BigInt(c.funded_txo_sum - c.spent_txo_sum + m.funded_txo_sum - m.spent_txo_sum);
 };
+const relayerBalance = async (chain: string, a: string) => BigInt((await get(`${RELAYER}/chain/${chain}/balance/${encodeURIComponent(a)}`)).balance);
 const OTHER_CHAINS: OtherChain[] = [
   { id: 'bitcoin', name: 'Bitcoin', sym: 'BTC', decimals: 8, explorer: 'https://mempool.space/testnet4/address/', balance: (a) => utxoBalance('bitcoin', a) },
   { id: 'solana', name: 'Solana', sym: 'SOL', decimals: 9, explorer: 'https://explorer.solana.com/address/{}?cluster=devnet',
@@ -76,11 +77,13 @@ const OTHER_CHAINS: OtherChain[] = [
     } },
   { id: 'cardano', name: 'Cardano', sym: 'ADA', decimals: 6, explorer: 'https://preprod.cardanoscan.io/address/',
     // Through the relayer: Koios's POST responses carry no CORS header.
-    balance: async (a) => BigInt((await get(`${RELAYER}/balance/cardano/${a}`)).lovelace) },
+    balance: (a) => relayerBalance('cardano', a) },
   { id: 'litecoin', name: 'Litecoin', sym: 'LTC', decimals: 8, explorer: 'https://litecoinspace.org/testnet/address/', balance: (a) => utxoBalance('litecoin', a) },
-  { id: 'dogecoin', name: 'Dogecoin', sym: 'DOGE', decimals: 8 },
-  { id: 'bitcoin-cash', name: 'Bitcoin Cash', sym: 'BCH', decimals: 8 },
-  { id: 'zcash', name: 'Zcash', sym: 'ZEC', decimals: 8 },
+  // Through the relayer: Electrum (Bitcoin Cash) and gRPC (Zcash) aren't
+  // reachable from a page, and Dogecoin's explorer is relayed the same way.
+  { id: 'dogecoin', name: 'Dogecoin', sym: 'DOGE', decimals: 8, explorer: 'https://doge-testnet-explorer.qed.me/address/', balance: (a) => relayerBalance('dogecoin', a) },
+  { id: 'bitcoin-cash', name: 'Bitcoin Cash', sym: 'BCH', decimals: 8, explorer: 'https://explorer.selene.cash/address/{}?network=chipnet', balance: (a) => relayerBalance('bitcoin-cash', a) },
+  { id: 'zcash', name: 'Zcash', sym: 'ZEC', decimals: 8, explorer: 'https://testnet.zcashexplorer.app/address/', balance: (a) => relayerBalance('zcash', a) },
 ];
 
 const TOKEN_BALANCES = [
@@ -94,6 +97,15 @@ const TOKEN_BALANCES = [
 const TOKENS: Record<string, { symbol: string; decimals: number }> = {
   '84532:0xba50cd2a20f6da35d788639e581bca8d0b5d4d5f': { symbol: 'USDC', decimals: 6 },
 };
+/** Hyperliquid testnet perps by asset index (`meta` universe, checked
+ *  9 November 2026). */
+const HL_MARKETS: Record<number, string> = { 0: 'SOL', 3: 'BTC', 4: 'ETH', 54: 'NEAR' };
+const hlName = (a: number) => (HL_MARKETS[a] ? `${HL_MARKETS[a]} perps` : `market #${a}`);
+/** Cap amounts in plain words where the page knows the asset. */
+function capWords(asset: string, daily: string): string {
+  if (asset === 'hyperliquid:usd') return `$${esc(fmtUnits(BigInt(daily), 6, 2))} of Hyperliquid orders`;
+  return `${esc(daily)} of ${esc(asset)}`;
+}
 const POOLS: Record<string, string> = { '84532:0x8bab6d1b75f19e9ed9fce8b9bd338844ff79ae27': 'Aave V3 pool' };
 const chainName = (id: number) => EVM_CHAINS.find((c) => c.id === id)?.name ?? `chain ${id}`;
 function amount(chain: number, token: string, raw: string) {
@@ -440,7 +452,7 @@ async function tokenBalance(rpcUrl: string, token: string, addr: string, decimal
 }
 
 type Session = {
-  grant: { label: string; public_key: string; expires_at_ms: number; inactivity_ms: number; caps: { asset: string; daily: string }[]; evm_venues: { chain_id: number; to: string; selector: string }[]; near_venues: { receiver_id: string; method: string }[] };
+  grant: { label: string; public_key: string; expires_at_ms: number; inactivity_ms: number; caps: { asset: string; daily: string }[]; evm_venues: { chain_id: number; to: string; selector: string }[]; near_venues: { receiver_id: string; method: string }[]; hl_markets?: { asset: number; max_leverage: number }[] };
   nonce: number;
   last_used_ms: number;
   revoked: boolean;
@@ -661,6 +673,94 @@ function btcSendForm(chain = 'bitcoin') {
     }
   };
 }
+/** Dogecoin, Bitcoin Cash and Zcash (transparent): P2PKH sends, read and
+ *  broadcast through the relayer. `rate` is the fee per byte (Zcash's fee
+ *  is ZIP-317's, set in core). */
+const LEGACY_SEND: Record<string, { name: string; sym: string; tx: string; placeholder: string; rate: number }> = {
+  dogecoin: { name: 'Dogecoin', sym: 'DOGE', tx: 'https://doge-testnet-explorer.qed.me/tx/{}', placeholder: 'n…', rate: 1000 },
+  'bitcoin-cash': { name: 'Bitcoin Cash', sym: 'BCH', tx: 'https://explorer.selene.cash/tx/{}?network=chipnet', placeholder: 'bchtest:q…', rate: 2 },
+  zcash: { name: 'Zcash', sym: 'ZEC', tx: 'https://testnet.zcashexplorer.app/transactions/{}', placeholder: 'tm…', rate: 1 },
+};
+const legacyAccounts: Record<string, { address: string; balance: string }> = {};
+let ada = { address: '', balance: '0', key: '' };
+
+async function relayerBroadcast(chain: string, raw: string): Promise<string> {
+  const r = await fetch(`${RELAYER}/chain/${chain}/tx`, { method: 'POST', body: raw, signal: AbortSignal.timeout(30000) });
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error ?? 'broadcast refused');
+  return j.txid;
+}
+
+/** A send sheet: To and Amount, then `review` builds what Confirm shows. */
+function simpleSendForm(title: string, balance: string, sym: string, placeholder: string, review: (to: string, amount: string) => Promise<void>) {
+  const m = document.getElementById('modal')!;
+  m.innerHTML = `
+    <div class="backdrop"><form class="card sheet" id="send">
+      <h2>Send on ${esc(title)}</h2>
+      <p class="small muted">Balance ${esc(balance)} ${esc(sym)}</p>
+      <label>To <input name="to" required class="mono" placeholder="${esc(placeholder)}"></label>
+      <label>Amount (${esc(sym)}) <input name="amount" required inputmode="decimal" placeholder="0.0"></label>
+      <div class="row end"><button type="button" class="secondary" id="cancel">Cancel</button><button class="primary">Review</button></div>
+      <div id="status" class="status"></div>
+    </form></div>`;
+  document.getElementById('cancel')!.onclick = () => (m.innerHTML = '');
+  (document.getElementById('send') as HTMLFormElement).onsubmit = async (ev) => {
+    ev.preventDefault();
+    try {
+      const f = new FormData(ev.target as HTMLFormElement);
+      status('Preparing…');
+      await review(String(f.get('to')).trim(), String(f.get('amount')));
+    } catch (e) {
+      status(String((e as Error).message ?? e), 'error');
+    }
+  };
+}
+
+function legacySendForm(chain: string) {
+  const c = LEGACY_SEND[chain];
+  const acct = legacyAccounts[chain];
+  simpleSendForm(c.name, acct.balance, c.sym, c.placeholder, async (to, amount) => {
+    const sat = toUnits(amount, 8);
+    const enc = encodeURIComponent(acct.address);
+    const [utxos, info] = await Promise.all([get(`${RELAYER}/chain/${chain}/utxos/${enc}`), chain === 'zcash' ? get(`${RELAYER}/chain/zcash/info`) : null]);
+    if (!Array.isArray(utxos)) throw new Error(utxos?.error ?? `Couldn't read your ${c.sym} coins`);
+    // Zcash: the signatures commit to the current branch and expire 40
+    // blocks (about 50 minutes) from now.
+    const legacyPlan = core.legacy_plan(chain, acct.address, to, sat, JSON.stringify(utxos), c.rate, info?.branch_id ?? 0, info ? info.height + 40 : 0);
+    const msg = core.owner_ecdsa_multi_sign_message(cfg.chain_id, wallet, nonce32(), createdAt(), cfg.signer, chain, JSON.stringify(JSON.parse(legacyPlan).sighashes));
+    confirm(msg, {
+      legacyPlan,
+      after: async (out) => {
+        const signed = JSON.parse(core.legacy_signed_tx(legacyPlan, JSON.stringify((out as any).mpc_signatures ?? [])));
+        await relayerBroadcast(chain, signed.raw);
+        return `Sent. <a target="_blank" rel="noopener" href="${esc(c.tx.replace('{}', signed.txid))}">View transaction</a>`;
+      },
+    });
+  });
+}
+
+/** Sends ADA: the page builds the transaction body, the passkey approves a
+ *  signature over its hash, the page submits once the signature verifies. */
+function adaSendForm() {
+  simpleSendForm('Cardano', ada.balance, 'ADA', 'addr_test1…', async (to, amount) => {
+    const lovelace = toUnits(amount, 6);
+    const enc = encodeURIComponent(ada.address);
+    const [utxos, tip] = await Promise.all([get(`${RELAYER}/chain/cardano/utxos/${enc}`), get(`${RELAYER}/chain/cardano/info`)]);
+    if (!Array.isArray(utxos)) throw new Error(utxos?.error ?? "Couldn't read your ADA");
+    // Valid for two hours of slots (one a second).
+    const adaPlan = core.cardano_plan(ada.address, to, lovelace, JSON.stringify(utxos), BigInt(tip.slot + 7200));
+    const msg = core.owner_eddsa_sign_message(cfg.chain_id, wallet, nonce32(), createdAt(), cfg.signer, 'cardano', JSON.parse(adaPlan).hash);
+    confirm(msg, {
+      adaPlan,
+      after: async (out) => {
+        if (!out.mpc_signature) throw new Error('No signature came back');
+        const signed = JSON.parse(core.cardano_signed_tx(adaPlan, JSON.stringify(out.mpc_signature), ada.key));
+        await relayerBroadcast('cardano', signed.cbor);
+        return `Sent. <a target="_blank" rel="noopener" href="https://preprod.cardanoscan.io/transaction/${esc(signed.txid)}">View transaction</a>`;
+      },
+    });
+  });
+}
 const SOLANA_RPC = 'https://api.devnet.solana.com';
 
 /** Sends SOL: the passkey approves the exact message, the account's ed25519
@@ -766,12 +866,85 @@ function sendForm(chainId: number) {
   };
 }
 
+/** Offers to move a wallet still on an older Marvii extension to the
+ *  current one (adds it, removes the old: one passkey tap). */
+async function moveCard() {
+  const have = await view<string[]>(wallet, 'w_extensions', {});
+  if (have.includes(cfg.extension)) return;
+  const old = have.filter((e) => (cfg.known_extensions ?? []).includes(e));
+  if (!old.length) return;
+  document.getElementById('move-card')!.hidden = false;
+  document.getElementById('move')!.onclick = () => confirm(core.extension_move_message(cfg.chain_id, wallet, nonce(), createdAt(), cfg.extension, JSON.stringify(old)));
+}
+
+type IntentsToken = { asset: string; symbol: string; chain: string; decimals: number; price: number };
+
+/** The Swap card: a dry NEAR Intents quote (1Click, through the relayer,
+ *  which always asks with `dry: true`). Nothing is deposited or signed. */
+function swapCard() {
+  const form = document.getElementById('swap') as HTMLFormElement | null;
+  if (!form) return;
+  const out = document.getElementById('swap-out')!;
+  const names: Record<string, string> = { near: 'NEAR', eth: 'Ethereum', btc: 'Bitcoin', sol: 'Solana', zec: 'Zcash', doge: 'Dogecoin', xrp: 'XRP', tron: 'TRON', cardano: 'Cardano', ltc: 'Litecoin', bch: 'Bitcoin Cash' };
+  let tokens: IntentsToken[] = [];
+  get(`${RELAYER}/intents/tokens`)
+    .then((t: IntentsToken[]) => {
+      tokens = t;
+      const opts = t.map((x) => `<option value="${esc(x.asset)}">${esc(x.symbol)} · ${esc(names[x.chain] ?? x.chain)}</option>`).join('');
+      for (const n of ['from', 'to']) (form.elements.namedItem(n) as HTMLSelectElement).innerHTML = opts;
+      (form.elements.namedItem('to') as HTMLSelectElement).selectedIndex = Math.min(1, t.length - 1);
+    })
+    .catch(() => (out.innerHTML = '<span class="muted">Quotes are unavailable right now.</span>'));
+  form.onsubmit = async (ev) => {
+    ev.preventDefault();
+    const f = new FormData(form);
+    const from = tokens.find((x) => x.asset === f.get('from'));
+    const to = tokens.find((x) => x.asset === f.get('to'));
+    if (!from || !to) return;
+    try {
+      if (from.asset === to.asset) throw new Error('Pick two different assets');
+      out.innerHTML = '<span class="muted">Asking NEAR Intents…</span>';
+      const r = await fetch(`${RELAYER}/intents/quote`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ from: from.asset, to: to.asset, amount: toUnits(String(f.get('amount')), from.decimals), account: wallet }),
+        signal: AbortSignal.timeout(25000),
+      });
+      const j = await r.json();
+      if (!r.ok) throw new Error(/liquidity/i.test(j.error ?? '') ? 'No solver is quoting this pair right now. Try another.' : j.error ?? 'No quote');
+      const q = j.quote;
+      const usd = (v: string) => (v ? ` ($${Number(v).toFixed(2)})` : '');
+      out.innerHTML = `<div class="row between"><span>You'd get</span><b>${esc(q.amountOutFormatted)} ${esc(to.symbol)}${esc(usd(q.amountOutUsd))}</b></div>
+        <div class="row between muted"><span>At least</span><span>${esc(fmtUnits(BigInt(q.minAmountOut), to.decimals, Math.min(8, to.decimals)))} ${esc(to.symbol)} (1% slippage)</span></div>
+        <div class="row between muted"><span>For</span><span>${esc(q.amountInFormatted)} ${esc(from.symbol)}${esc(usd(q.amountInUsd))}</span></div>
+        <div class="row between muted"><span>Time</span><span>about ${esc(q.timeEstimate)} s</span></div>`;
+    } catch (e) {
+      out.innerHTML = `<span class="error">${esc((e as Error).message ?? e)}</span>`;
+    }
+  };
+}
+
 async function dashboard() {
   render(`
     <section class="card">
       <div class="row between"><h1>Balances</h1><span class="pill">${esc(cfg.chain_id === 'mainnet' ? 'Mainnet' : 'Testnet')}</span></div>
       <ul class="list chains">${chainRow('chain-near', 'NEAR')}${EVM_CHAINS.map((c) => chainRow(`chain-${c.id}`, c.name)).join('')}${OTHER_CHAINS.map((c) => chainRow(`chain-${c.id}`, c.name)).join('')}</ul>
       <div id="status" class="status"></div>
+    </section>
+    <section class="card" id="move-card" hidden>
+      <h2>Update available</h2>
+      <p class="small">A newer Marvii extension lets agents trade on Hyperliquid within limits you set. One tap moves your account to it; the address and funds stay the same. Agents added before need adding again.</p>
+      <div class="row end"><button class="primary" id="move">Update with passkey</button></div>
+    </section>
+    <section class="card" id="swap-card">
+      <div class="row between"><h2>Swap</h2><span class="pill">NEAR Intents · mainnet quote</span></div>
+      <form id="swap" class="stack">
+        <div class="row"><label class="grow">From <select name="from"></select></label><label class="grow">To <select name="to"></select></label></div>
+        <label>Amount <input name="amount" required inputmode="decimal" placeholder="0.0"></label>
+        <div class="row end"><button class="secondary">Get quote</button></div>
+        <div id="swap-out" class="small"></div>
+      </form>
+      <p class="muted small">Live prices from NEAR Intents' solvers, between balances held in NEAR Intents by this account. Quote only: Intents runs on mainnet, and this testnet wallet never deposits.</p>
     </section>
     <section class="card" id="pending-card" hidden>
       <h2>Waiting for you</h2>
@@ -789,6 +962,8 @@ async function dashboard() {
     </section>
     <div id="modal"></div>`);
   document.getElementById('add')!.onclick = grantForm;
+  swapCard();
+  if (!document.body.classList.contains('readonly')) moveCard().catch(() => {});
   app.onclick = (e) => {
     const b = (e.target as HTMLElement).closest<HTMLElement>('[data-copy]');
     if (b) {
@@ -802,7 +977,7 @@ async function dashboard() {
     const sb = (e.target as HTMLElement).closest<HTMLElement>('[data-send]');
     if (sb) {
       const k = sb.dataset.send!;
-      k === 'near' ? nearSendForm() : k === 'solana' ? solSendForm() : k === 'bitcoin' || k === 'litecoin' ? btcSendForm(k) : k === 'tron' ? tronSendForm() : k === 'xrp' ? xrpSendForm() : sendForm(Number(k));
+      k === 'near' ? nearSendForm() : k === 'solana' ? solSendForm() : k === 'bitcoin' || k === 'litecoin' ? btcSendForm(k) : k === 'tron' ? tronSendForm() : k === 'xrp' ? xrpSendForm() : k === 'cardano' ? adaSendForm() : k in LEGACY_SEND ? legacySendForm(k) : sendForm(Number(k));
     }
   };
 
@@ -818,7 +993,9 @@ async function dashboard() {
         if (c.id in UTXO_SEND) utxoAccounts[c.id] = { address: addr, balance: bal };
         if (c.id === 'tron') tron = { address: addr, balance: bal };
         if (c.id === 'xrp') xrp = { address: addr, balance: bal, key: k };
-        const canSend = ['solana', 'bitcoin', 'litecoin', 'tron', 'xrp'].includes(c.id);
+        if (c.id in LEGACY_SEND) legacyAccounts[c.id] = { address: addr, balance: bal };
+        if (c.id === 'cardano') ada = { address: addr, balance: bal, key: k };
+        const canSend = ['solana', 'bitcoin', 'litecoin', 'tron', 'xrp', 'cardano', ...Object.keys(LEGACY_SEND)].includes(c.id);
         fillChain(`chain-${c.id}`, addr, `${bal} ${c.sym}`, [], explorer, canSend ? c.id : undefined);
       })
       .catch(() => fillChain(`chain-${c.id}`, '', `– ${c.sym}`, []));
@@ -953,11 +1130,12 @@ async function loadSessions() {
       const caps = s.grant.caps.map((c) => {
         const [kind, chain, token] = c.asset.split(':');
         if (kind === 'evm' && token) return `${amount(Number(chain), token, c.daily)} a day on ${esc(chainName(Number(chain)))}`;
-        return `${esc(c.daily)} of ${esc(c.asset)} a day`;
+        return `${capWords(c.asset, c.daily)} a day`;
       }).join(', ') || 'no spending';
       const venues = [
         ...s.grant.evm_venues.map((v) => `${v.selector === '0x617ba037' ? 'supply on ' : `function ${esc(v.selector)} on `}${named(v.chain_id, v.to)}, ${esc(chainName(v.chain_id))}`),
         ...s.grant.near_venues.map((v) => `${esc(v.receiver_id)}.${esc(v.method)}`),
+        ...(s.grant.hl_markets ?? []).map((m) => `Hyperliquid ${esc(hlName(m.asset))} up to ${esc(m.max_leverage)}x`),
       ].join('; ') || 'none';
       return `<li class="session">
         <div class="row between"><b>${esc(s.grant.label)}</b> ${state}</div>
@@ -1000,6 +1178,14 @@ function grantForm() {
         <label>Token contract on that chain (empty for the native coin) <input name="token" placeholder="0x…" pattern="0x[0-9a-fA-F]{40}" class="mono"></label>
         <label>Most per day, in the token's smallest unit <input name="daily" required pattern="[0-9]+" value="50000000"></label>
       </fieldset>
+      <fieldset><legend>Hyperliquid (testnet perps)</legend>
+        <label class="row"><input type="checkbox" name="hl" style="width:auto"> Let it trade on Hyperliquid, signed by your account</label>
+        <div class="grid2">
+          <label>Market <select name="hl_asset">${Object.entries(HL_MARKETS).map(([a, n]) => `<option value="${a}"${n === 'ETH' ? ' selected' : ''}>${n} perps</option>`).join('')}</select></label>
+          <label>Most leverage <input name="hl_lev" type="number" min="1" max="50" value="5"></label>
+        </div>
+        <label>Most order value per day (USD) <input name="hl_daily" inputmode="decimal" value="100"></label>
+      </fieldset>
       <label class="row"><input type="checkbox" name="queue" style="width:auto"> Let it propose new recipients and contracts; they wait <span id="delay">the delay</span> and you can cancel</label>
       <p class="muted small">Otherwise the extension refuses anything else: other contracts, other functions, other recipients, or more than the cap.</p>
       <div class="row end"><button type="button" class="secondary" id="cancel">Cancel</button><button class="primary">Review</button></div>
@@ -1025,7 +1211,12 @@ function grantForm() {
       evm_recipients: [],
       caps: [{ asset: g('token') ? `evm:${chain}:${g('token').toLowerCase()}` : `evm:${chain}`, daily: g('daily') }],
       queue_new_targets: f.get('queue') === 'on',
+      hl_markets: [] as { asset: number; max_leverage: number }[],
     };
+    if (f.get('hl') === 'on') {
+      grant.hl_markets.push({ asset: Number(g('hl_asset')), max_leverage: Number(g('hl_lev')) });
+      grant.caps.push({ asset: 'hyperliquid:usd', daily: toUnits(g('hl_daily'), 6) });
+    }
     const key_id = g('key_id');
     // 0.01 NEAR: the extension's storage deposit for a session.
     const msg = core.call_message(cfg.chain_id, wallet, nonce(), createdAt(), cfg.extension, 'grant_session', JSON.stringify({ key_id, grant }), '10000000000000000000000', 20n);
@@ -1035,9 +1226,9 @@ function grantForm() {
 
 /** A decode failure blocks approval instead of showing something partial. */
 let blocked = false;
-function explainSafe(receiver: string, a: Described['external'][0]['actions'][0], tx?: string, solMessage?: string, btcPlan?: string, tronRaw?: string, xrpTx?: string) {
+function explainSafe(receiver: string, a: Described['external'][0]['actions'][0], ctx: SignCtx = {}) {
   try {
-    return explain(receiver, a, tx, solMessage, btcPlan, tronRaw, xrpTx);
+    return explain(receiver, a, ctx);
   } catch (e) {
     blocked = true;
     return `<span class="error"><b>Don't approve:</b> ${esc((e as Error).message ?? e)}</span>`;
@@ -1053,7 +1244,8 @@ type Described = {
 };
 
 /** Plain words for a call, worked out from the decoded arguments. */
-function explain(receiver: string, a: Described['external'][0]['actions'][0], tx?: string, solMessage?: string, btcPlan?: string, tronRaw?: string, xrpTx?: string): string {
+function explain(receiver: string, a: Described['external'][0]['actions'][0], ctx: SignCtx = {}): string {
+  const { tx, solMessage, btcPlan, tronRaw, xrpTx, legacyPlan, adaPlan } = ctx;
   if (a.kind === 'transfer') return `<b>Approve:</b> Send <b>${formatNear(a.amount_yocto!)} NEAR</b> to ${receiver.length > 32 ? copyable(receiver) : copyableName(receiver)} on NEAR`;
   if (a.kind !== 'function_call') return `<span class="error">Unrecognised action: ${esc(JSON.stringify(a))}</span>`;
   const ours = receiver === cfg.extension;
@@ -1069,7 +1261,8 @@ function explain(receiver: string, a: Described['external'][0]['actions'][0], tx
         <li>Agent key <span class="mono">${esc(g.public_key.slice(0, 16))}…</span></li>
         <li>May ${venues.length ? venues.join('; ') : 'call nothing'}</li>
         <li>May pay ${pays.length ? pays.join(', ') : 'no one directly'}</li>
-        <li>At most ${g.caps.map((c: any) => `${esc(c.daily)} of ${esc(c.asset)}`).join(', ')} a day</li>
+        ${(g.hl_markets ?? []).map((m: any) => `<li>May trade <b>${esc(hlName(m.asset))}</b> on Hyperliquid testnet, at most <b>${esc(m.max_leverage)}x</b> leverage, signed by your account's EVM address</li>`).join('')}
+        <li>At most ${g.caps.map((c: any) => capWords(c.asset, c.daily)).join(', ')} a day</li>
         <li>Until ${esc(new Date(g.expires_at_ms).toLocaleString())}, or after ${esc(Math.round(g.inactivity_ms / 86_400_000))} days unused</li>
         <li>${g.queue_new_targets ? '<span class="warn">May propose new recipients and contracts: each waits the delay, and you can cancel it</span>' : 'May not propose anything new'}</li>
       </ul>`;
@@ -1104,6 +1297,27 @@ function explain(receiver: string, a: Described['external'][0]['actions'][0], tx
       const pays = d.pays.map((x: any) => `<b>${esc(fmtUnits(BigInt(x.sat), 8, 8))} ${c.sym}</b> to ${copyable(x.to)}`).join(', ');
       return `<b>Approve:</b> Send ${pays} on ${esc(c.name)}<div class="small muted">Network fee ${esc(fmtUnits(BigInt(d.fee_sat), 8, 8))} ${c.sym} · signature ${k + 1} of ${d.sighashes.length}</div>`;
     }
+    if (req?.path in LEGACY_SEND) {
+      // Dogecoin, Bitcoin Cash, Zcash: as for Bitcoin, one signature per
+      // input, each one of the plan's hashes, on the plan's own chain.
+      if (!legacyPlan || req.domain_id !== 0) throw new Error('A signature request with no transaction to show');
+      const d = JSON.parse(core.describe_legacy_plan(legacyPlan));
+      if (d.chain !== req.path) throw new Error('The signature request is for another chain');
+      const c = LEGACY_SEND[d.chain];
+      const k = d.sighashes.indexOf(req.payload_v2?.Ecdsa);
+      if (k < 0) throw new Error('The signature request does not match the transaction shown');
+      const pays = d.pays.map((x: any) => `<b>${esc(fmtUnits(BigInt(x.sat), 8, 8))} ${c.sym}</b> to ${copyable(x.to)}`).join(', ');
+      return `<b>Approve:</b> Send ${pays} on ${esc(c.name)}<div class="small muted">Network fee ${esc(fmtUnits(BigInt(d.fee_sat), 8, 8))} ${c.sym} · signature ${k + 1} of ${d.sighashes.length}</div>`;
+    }
+    if (req?.path === 'cardano') {
+      // Cardano: the key signs the body's hash; show the body, and only if
+      // the hash requested is its hash.
+      if (!adaPlan || req.domain_id !== 1) throw new Error('A Cardano signature request with no transaction to show');
+      const d = JSON.parse(core.describe_cardano_plan(adaPlan));
+      if (req.payload_v2?.Eddsa !== d.hash) throw new Error('The signature request does not match the transaction shown');
+      const pays = d.pays.map((x: any) => `<b>${esc(fmtUnits(BigInt(x.lovelace), 6, 6))} ADA</b> to ${copyable(x.to)}`).join(', ');
+      return `<b>Approve:</b> Send ${pays} on Cardano<div class="small muted">Network fee ${esc(fmtUnits(BigInt(d.fee_lovelace), 6, 6))} ADA</div>`;
+    }
     if (req?.payload_v2?.Eddsa !== undefined) {
       // Solana: show the transfer, and only if the bytes being signed are it.
       if (!solMessage || req.path !== 'solana' || req.domain_id !== 1 || req.payload_v2.Eddsa !== solMessage) {
@@ -1127,7 +1341,11 @@ function explain(receiver: string, a: Described['external'][0]['actions'][0], tx
   return `<span class="warn">Call ${esc(a.method)} on ${esc(receiver)}</span>${ours ? '' : ' <b class="error">(not the Marvii extension)</b>'}`;
 }
 
-function confirm(msgJson: string, ctx: { pendingId?: number; tx?: string; solMessage?: string; btcPlan?: string; tronRaw?: string; xrpTx?: string; after?: (out: Outcome & { mpc_signature?: unknown }) => Promise<string> } = {}) {
+/** What a Confirm sheet decodes alongside the message: the transaction each
+ *  signature request must match. */
+type SignCtx = { tx?: string; solMessage?: string; btcPlan?: string; tronRaw?: string; xrpTx?: string; legacyPlan?: string; adaPlan?: string };
+
+function confirm(msgJson: string, ctx: SignCtx & { pendingId?: number; after?: (out: Outcome & { mpc_signature?: unknown }) => Promise<string> } = {}) {
   const msg = core.normalize_request(msgJson);
   const d: Described = JSON.parse(core.describe_message(msg));
   blocked = false;
@@ -1137,11 +1355,21 @@ function confirm(msgJson: string, ctx: { pendingId?: number; tx?: string; solMes
     const want = [...JSON.parse(core.describe_bitcoin_plan(ctx.btcPlan)).sighashes].sort();
     if (JSON.stringify(asked) !== JSON.stringify(want)) blocked = true;
   }
+  if (ctx.legacyPlan) {
+    const asked = d.external.flatMap((p) => p.actions.map((a) => a.args?.request?.payload_v2?.Ecdsa)).sort();
+    const want = [...JSON.parse(core.describe_legacy_plan(ctx.legacyPlan)).sighashes].sort();
+    if (JSON.stringify(asked) !== JSON.stringify(want)) blocked = true;
+  }
   const m = document.getElementById('modal')!;
-  const ops = d.internal.map((o) => `<li class="error"><b>Changes the wallet itself:</b> ${esc(o.op)} ${esc(o.account_id ?? o.enable ?? '')}</li>`);
+  const known = cfg.known_extensions ?? [];
+  const ops = d.internal.map((o) => {
+    if (o.op === 'add_extension' && o.account_id === cfg.extension) return `<li><b>Move to the current Marvii extension</b> <span class="mono small">${esc(short(o.account_id))}</span>. Your account keeps its address and funds.</li>`;
+    if (o.op === 'remove_extension' && o.account_id && known.includes(o.account_id) && o.account_id !== cfg.extension) return `<li><b>Remove the older Marvii extension</b> <span class="mono small">${esc(short(o.account_id))}</span>. Agents added under it stop working; add them again.</li>`;
+    return `<li class="error"><b>Changes the wallet itself:</b> ${esc(o.op)} ${esc(o.account_id ?? o.enable ?? '')}</li>`;
+  });
   const calls = d.external.flatMap((p) =>
     p.actions.map(
-      (a) => `<li>${explainSafe(p.receiver_id, a, ctx.tx, ctx.solMessage, ctx.btcPlan, ctx.tronRaw, ctx.xrpTx)}
+      (a) => `<li>${explainSafe(p.receiver_id, a, ctx)}
         <div class="small muted">${a.deposit_yocto && a.deposit_yocto !== '0' ? `Attaches ${formatNear(a.deposit_yocto)} NEAR · ` : ''}${a.gas_tgas ? `${a.gas_tgas} TGas` : ''}</div>
         ${a.args === undefined ? '' : `<details><summary class="small">Exact arguments</summary><pre class="mono small">${esc(JSON.stringify(a.args, null, 2))}</pre></details>`}</li>`,
     ),

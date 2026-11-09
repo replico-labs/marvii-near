@@ -535,3 +535,134 @@ fn near_transfer_message_decodes_to_one_transfer() {
     assert!(transfer_message("testnet", w, 7, 1_762_600_000, "Not An Account", "1").is_err());
     assert!(transfer_message("testnet", w, 7, 1_762_600_000, "bob.testnet", "0").is_err());
 }
+
+// ---- Dogecoin, Bitcoin Cash, Zcash (P2PKH) and Cardano ----
+// Key 0x11…11, as above: addresses from chain_addresses_match_reference_libraries.
+const DOGE_FROM: &str = "nsCyVMbwVcbNFQNHBmEtyUsx9YCzMC8mub";
+const BCH_FROM: &str = "bchtest:qr78y59zz80dm3cwuk388r097pupwdguaugjl6473v";
+const ZEC_FROM: &str = "tmYjAZFpvdDXTaJrq2WikAntitBNJJo9VSo";
+const ADA_FROM: &str = "addr_test1vr523hvdkxflk0cv9swltju5vgxds6ly8e8q25ulceutrdgyneq9q";
+
+fn legacy_utxos() -> String {
+    serde_json::json!([{ "txid": "aa".repeat(32), "vout": 1, "value": 600_000_000u64 }, { "txid": "bb".repeat(32), "vout": 0, "value": 250_000_000u64 }]).to_string()
+}
+
+#[test]
+fn legacy_plans_sign_and_assemble() {
+    for (chain, from, to) in [
+        ("dogecoin", DOGE_FROM, "nsCyVMbwVcbNFQNHBmEtyUsx9YCzMC8mub"),
+        ("bitcoin-cash", BCH_FROM, "bchtest:qr78y59zz80dm3cwuk388r097pupwdguaugjl6473v"),
+        ("zcash", ZEC_FROM, "tmYjAZFpvdDXTaJrq2WikAntitBNJJo9VSo"),
+    ] {
+        let plan = legacy_plan(chain, from, to, "700000000", &legacy_utxos(), 1000, 0x7719_0ad9, 3_900_000).unwrap();
+        let d: serde_json::Value = serde_json::from_str(&describe_legacy_plan(&plan).unwrap()).unwrap();
+        assert_eq!(d["chain"], chain);
+        assert_eq!(d["inputs"], 2);
+        let out: serde_json::Value = serde_json::from_str(&legacy_signed_tx(&plan, &btc_mpc_sigs_any(&plan, [0x11; 32])).unwrap()).unwrap();
+        assert!(out["raw"].as_str().unwrap().len() > 400, "{chain}");
+        // Another key's signatures are refused.
+        assert!(legacy_signed_tx(&plan, &btc_mpc_sigs_any(&plan, [0x33; 32])).is_err(), "{chain}");
+        // Tampering with an output is caught.
+        let tampered = plan.replace("\"value\":700000000", "\"value\":700000001");
+        assert!(describe_legacy_plan(&tampered).is_err(), "{chain}");
+        assert!(legacy_plan(chain, from, to, "900000000", &legacy_utxos(), 1000, 0x7719_0ad9, 3_900_000).is_err(), "not enough {chain}");
+    }
+    // Addresses don't cross chains.
+    assert!(legacy_plan("dogecoin", DOGE_FROM, ZEC_FROM, "700000000", &legacy_utxos(), 1000, 0, 0).is_err());
+    assert!(legacy_plan("zcash", ZEC_FROM, DOGE_FROM, "700000000", &legacy_utxos(), 1000, 1, 1).is_err());
+    assert!(legacy_plan("bitcoin-cash", BCH_FROM, "bchtest:qr78y59zz80dm3cwuk388r097pupwdguaugjl6474v", "700000000", &legacy_utxos(), 1, 0, 0).is_err(), "bad checksum");
+    // Zcash without a branch ID is refused.
+    assert!(legacy_plan("zcash", ZEC_FROM, ZEC_FROM, "700000000", &legacy_utxos(), 1, 0, 0).is_err());
+}
+
+#[test]
+fn zcash_fee_is_zip317() {
+    let plan: serde_json::Value = serde_json::from_str(&legacy_plan("zcash", ZEC_FROM, ZEC_FROM, "700000000", &legacy_utxos(), 1, 0x7719_0ad9, 3_900_000).unwrap()).unwrap();
+    assert_eq!(plan["fee"], 10_000);
+}
+
+/// Signs every hash in a plan's `sighashes` with `key`, as the MPC signer answers.
+fn btc_mpc_sigs_any(plan: &str, key: [u8; 32]) -> String {
+    use k256::ecdsa::SigningKey;
+    let key = SigningKey::from_slice(&key).unwrap();
+    let p: serde_json::Value = serde_json::from_str(plan).unwrap();
+    let sigs: Vec<_> = p["sighashes"].as_array().unwrap().iter().rev().map(|h| {
+        let (sig, recid) = key.sign_prehash_recoverable(&hex::decode(h.as_str().unwrap()).unwrap());
+        serde_json::json!({ "big_r": { "affine_point": format!("{:02x}{}", 2 + recid.is_y_odd() as u8, hex::encode(sig.r().to_bytes())) }, "s": { "scalar": hex::encode(sig.s().to_bytes()) }, "recovery_id": recid.to_byte() })
+    }).collect();
+    serde_json::to_string(&sigs).unwrap()
+}
+
+fn ada_utxos() -> String {
+    serde_json::json!([
+        { "tx_hash": "cc".repeat(32), "tx_index": 0, "value": "10000000000", "asset_list": [] },
+        { "tx_hash": "dd".repeat(32), "tx_index": 2, "value": "99000000000", "asset_list": [{ "policy_id": "ee" }] },
+    ]).to_string()
+}
+
+#[test]
+fn cardano_plan_signs_and_refuses() {
+    use ed25519_dalek::{Signer, SigningKey};
+    let key = SigningKey::from_bytes(&[0x22; 32]);
+    let pk = format!("ed25519:{}", bs58::encode(key.verifying_key().to_bytes()).into_string());
+    assert_eq!(chain_address("cardano", &pk).unwrap(), ADA_FROM);
+    let to = "addr_test1qz2fxv2umyhttkxyxp8x0dlpdt3k6cwng5pxj3jhsydzer3jcu5d8ps7zex2k2xt3uqxgjqnnj83ws8lhrn648jjxtwq2ytjqp";
+    let plan = cardano_plan(ADA_FROM, to, "5000000", &ada_utxos(), 140_000_000).unwrap();
+    let p: serde_json::Value = serde_json::from_str(&plan).unwrap();
+    assert_eq!(p["inputs"].as_array().unwrap().len(), 1, "the UTxO carrying tokens is skipped");
+    let fee = p["fee"].as_u64().unwrap();
+    assert!((165_000..200_000).contains(&fee), "{fee}");
+    let d: serde_json::Value = serde_json::from_str(&describe_cardano_plan(&plan).unwrap()).unwrap();
+    assert_eq!(d["pays"][0]["lovelace"], "5000000");
+    let hash = hex::decode(p["hash"].as_str().unwrap()).unwrap();
+    let sig = serde_json::json!({ "scheme": "Ed25519", "signature": key.sign(&hash).to_bytes().to_vec() }).to_string();
+    let out: serde_json::Value = serde_json::from_str(&cardano_signed_tx(&plan, &sig, &pk).unwrap()).unwrap();
+    // The fee was computed for exactly this size.
+    let size = out["cbor"].as_str().unwrap().len() as u64 / 2;
+    assert!(fee >= 44 * (size + 6) + 155_381 && fee <= 44 * (size + 16) + 155_381, "fee {fee} for {size} bytes");
+    let other = SigningKey::from_bytes(&[0x23; 32]);
+    let bad = serde_json::json!({ "signature": other.sign(&hash).to_bytes().to_vec() }).to_string();
+    assert!(cardano_signed_tx(&plan, &bad, &pk).is_err());
+    assert!(describe_cardano_plan(&plan.replace("5000000", "5000001")).is_err());
+    assert!(cardano_plan(ADA_FROM, "addr1vx2fxv2umyhttkxyxp8x0dlpdt3k6cwng5pxj3jhsydzers66hrl8", "5000000", &ada_utxos(), 1).is_err(), "mainnet");
+    assert!(cardano_plan(ADA_FROM, to, "500000", &ada_utxos(), 1).is_err(), "below the minimum ADA");
+}
+
+/// Fixed vectors, each from the chain's own reference library on the same
+/// plan (key 0x11…11, inputs aa…:1 6 coins and bb…:0 2.5 coins, 7 coins to
+/// self): Zcash from zcash_primitives 0.31 (txid and both ZIP-244 hashes;
+/// the raw transaction parses and round-trips), Bitcoin Cash from
+/// bitcore-lib-cash 10 (identical raw transaction), Dogecoin from
+/// bitcoinjs-lib 6 (`hashForSignature`, both inputs).
+#[test]
+fn legacy_matches_reference_libraries() {
+    for (chain, from, rate, txid, hashes) in [
+        ("zcash", ZEC_FROM, 1, "6b3382e5bf2d4c400dfdf1a6c7ece12bc631de34e8e0d87356ed0f6530018242", ["d94586719b3fdf4a278657190ffec949bd76d1546529d9d462992639539f4e52", "97ac0fd59bc4416181ec6af4e039ce5f2b2c56bae56c91a0441f5188951e4c31"]),
+        ("bitcoin-cash", BCH_FROM, 1, "83531402da639da222b22dc2b595870388d0ef58915a3c1172d17258415481a8", ["", ""]),
+        ("dogecoin", DOGE_FROM, 1000, "1c69d65937fc63127bc915283265cb457fffcabd5fab2c786f79274ae6857223", ["3a187f024f749dda5fc65ad5aa65fa344e20474e4a253c35fd9f3240e7a0720e", "f96b9011bc8b570f12657887a992baa0d1ee078d92c6e69429fabeed0bd69caf"]),
+    ] {
+        let plan = legacy_plan(chain, from, from, "700000000", &legacy_utxos(), rate, 0x7719_0ad9, 3_900_000).unwrap();
+        let p: serde_json::Value = serde_json::from_str(&plan).unwrap();
+        for (i, h) in hashes.iter().enumerate() {
+            if !h.is_empty() {
+                assert_eq!(p["sighashes"][i], *h, "{chain} input {i}");
+            }
+        }
+        let out: serde_json::Value = serde_json::from_str(&legacy_signed_tx(&plan, &btc_mpc_sigs_any(&plan, [0x11; 32])).unwrap()).unwrap();
+        assert_eq!(out["txid"], txid, "{chain}");
+    }
+}
+
+#[test]
+fn extension_move_adds_then_removes() {
+    let w = "0s3465557e026f471c0e84898f799c8032f356c77a";
+    let (new, old) = ("cd1cd8fe1383641c975a832c077b612ef8c95935377636241d84803223f20deb", "2dc4e98d9de62211b1263a9a75d3c71caf45795719b790f12921198af309ba18");
+    let m = extension_move_message("testnet", w, 7, 1_800_000_000, new, &format!("[\"{old}\"]")).unwrap();
+    let d: serde_json::Value = serde_json::from_str(&describe_message(&m).unwrap()).unwrap();
+    assert_eq!(d["internal"][0]["op"], "add_extension");
+    assert_eq!(d["internal"][0]["account_id"], new);
+    assert_eq!(d["internal"][1]["op"], "remove_extension");
+    assert_eq!(d["internal"][1]["account_id"], old);
+    assert!(d["external"].as_array().unwrap().is_empty());
+    assert!(extension_move_message("testnet", w, 7, 1_800_000_000, new, &format!("[\"{new}\"]")).is_err());
+}

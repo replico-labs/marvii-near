@@ -6,6 +6,10 @@
 //   node agent.mjs approve <usdc>               approve the Aave pool for <usdc> USDC
 //   node agent.mjs supply <usdc>                supply <usdc> USDC to Aave
 //   node agent.mjs transfer <usdc> <0x address> try to send USDC away (must be refused)
+//   node agent.mjs hl-leverage <n>              set ETH leverage on Hyperliquid testnet
+//   node agent.mjs hl-order <buy|sell> <size> <price> [Gtc|Ioc|Alo]
+//                                               place an ETH order on Hyperliquid testnet
+//   node agent.mjs hl-cancel <order id>         cancel it
 //
 // Env: MARVII_NEAR_KEYS (keeps demo-agent.json; never printed), RELAYER
 // (default http://localhost:8787), WALLET (the NEAR wallet account), EVM_RPC
@@ -15,7 +19,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {
   createPublicClient, http, keccak256, serializeTransaction, recoverTransactionAddress,
-  encodeFunctionData, parseAbi, getAddress,
+  encodeFunctionData, parseAbi, getAddress, recoverAddress,
 } from 'viem';
 import { baseSepolia } from 'viem/chains';
 
@@ -154,6 +158,61 @@ async function send(to, data) {
   return rc.status === 'success';
 }
 
+// ---- Hyperliquid (testnet) ----
+// The agent sends the order's fields; the extension encodes the action and
+// builds the EIP-712 digest itself (source "b": Hyperliquid testnet only).
+const HL = process.env.HL_API ?? 'https://api.hyperliquid-testnet.xyz';
+const HL_ETH = 4; // ETH perp on testnet (`meta` universe index)
+
+async function viewExtension(cfg, method, args) {
+  const a = Buffer.from(JSON.stringify(args)).toString('base64');
+  const r = await fetch(cfg.rpc, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'query', params: { request_type: 'call_function', finality: 'final', account_id: cfg.extension, method_name: method, args_base64: a } }) }).then((r) => r.json());
+  if (r.error || r.result?.error) throw new Error(JSON.stringify(r.error ?? r.result.error));
+  return JSON.parse(Buffer.from(r.result.result).toString());
+}
+
+/** The JSON action Hyperliquid receives, in the same field order the
+ *  extension encodes. */
+function hlWire(a) {
+  if (a.type === 'hl_order') return { type: 'order', orders: [{ a: a.asset, b: a.is_buy, p: a.price, s: a.size, r: a.reduce_only, t: { limit: { tif: a.tif } } }], grouping: 'na' };
+  if (a.type === 'hl_cancel') return { type: 'cancel', cancels: [{ a: a.asset, o: a.oid }] };
+  if (a.type === 'hl_leverage') return { type: 'updateLeverage', asset: a.asset, isCross: a.is_cross, leverage: a.leverage };
+  throw new Error('not a Hyperliquid action');
+}
+
+async function hl(action) {
+  const cfg = await relayer('/config');
+  const from = await walletAddress(cfg);
+  const msg = JSON.stringify({
+    domain: 'marvii-session-v1', extension: cfg.extension, wallet: WALLET, key_id: 'aave-agent',
+    nonce: await nextSessionNonce(cfg), deadline_ms: Date.now() + 300_000, action,
+  });
+  const out = await relayer('/agent/execute', { msg, signature: crypto.sign(null, crypto.createHash('sha256').update(msg).digest(), agentKey()).toString('hex') });
+  console.log(`  NEAR tx ${out.tx_hash ?? '-'}`);
+  if (!out.ok || !out.mpc_signature) {
+    console.log(`  REFUSED by the extension: ${out.reason ?? out.error ?? 'no signature'}`);
+    return false;
+  }
+  // The digest the extension had signed, from its own view; the signature
+  // must recover to the account's EVM address over exactly that.
+  const digest = '0x' + (await viewExtension(cfg, 'hl_signing_hash', { action }));
+  const sig = out.mpc_signature;
+  const r = BigInt('0x' + sig.big_r.affine_point.slice(2));
+  let s = BigInt('0x' + sig.s.scalar);
+  let yParity = sig.recovery_id;
+  if (s > N / 2n) { s = N - s; yParity ^= 1; }
+  const rs = { r: '0x' + r.toString(16).padStart(64, '0'), s: '0x' + s.toString(16).padStart(64, '0'), v: 27 + yParity };
+  const signer = await recoverAddress({ hash: digest, signature: { r: rs.r, s: rs.s, yParity } });
+  if (signer !== from) throw new Error(`signature recovers to ${signer}, not ${from}`);
+  console.log(`  signed by ${from} (Hyperliquid account), digest ${digest.slice(0, 18)}…`);
+  const res = await fetch(`${HL}/exchange`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ action: hlWire(action), nonce: action.nonce, signature: rs, vaultAddress: null }),
+  }).then((r) => r.json());
+  console.log(`  Hyperliquid: ${JSON.stringify(res)}`);
+  return res.status === 'ok';
+}
+
 const usdc = (x) => BigInt(Math.round(Number(x) * 1e6));
 const [cmd, a1, a2] = process.argv.slice(2);
 if (cmd === 'keygen') {
@@ -169,6 +228,16 @@ if (cmd === 'keygen') {
 } else if (cmd === 'transfer') {
   console.log(`transfer ${a1} USDC to ${a2}`);
   await send(USDC, encodeFunctionData({ abi, functionName: 'transfer', args: [a2, usdc(a1)] }));
+} else if (cmd === 'hl-leverage') {
+  console.log(`set ETH leverage to ${a1}x (cross) on Hyperliquid testnet`);
+  await hl({ type: 'hl_leverage', asset: HL_ETH, is_cross: true, leverage: Number(a1), nonce: Date.now() });
+} else if (cmd === 'hl-order') {
+  const [side, size, price, tif = 'Gtc'] = process.argv.slice(3);
+  console.log(`${side} ${size} ETH at ${price} (${tif}) on Hyperliquid testnet`);
+  await hl({ type: 'hl_order', asset: HL_ETH, is_buy: side === 'buy', price, size, reduce_only: false, tif, nonce: Date.now() });
+} else if (cmd === 'hl-cancel') {
+  console.log(`cancel ETH order ${a1} on Hyperliquid testnet`);
+  await hl({ type: 'hl_cancel', asset: HL_ETH, oid: Number(a1), nonce: Date.now() });
 } else {
-  console.log('usage: agent.mjs keygen | approve <usdc> | supply <usdc> | transfer <usdc> <0x address>');
+  console.log('usage: agent.mjs keygen | approve <usdc> | supply <usdc> | transfer <usdc> <0x address> | hl-leverage <n> | hl-order <buy|sell> <size> <price> [tif] | hl-cancel <oid>');
 }

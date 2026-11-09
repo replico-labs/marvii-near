@@ -10,14 +10,18 @@ description = "Pays gas for Marvii wallets on NEAR testnet: relays passkey-signe
 anyhow = "1"
 axum = "0.8"
 tower-http = { version = "0.6", features = ["cors"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "io-util", "net"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 hex = "0.4"
 bs58 = "0.5"
 ed25519-dalek = "2"
 near-kit = { version = "0.20.1" }
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "http2"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+webpki-roots = "1"
+sha2 = "0.10"
 marvii-near-core = { path = "../core" }
 
 # Pinned to the near/intents commit we built and read (32cd1f9, 4 November 2026).
