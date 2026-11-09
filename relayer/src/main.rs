@@ -20,23 +20,27 @@
 //! - `MARVII_NAMES_REGISTRY` (e.g. `marvii.testnet`; locally, `names.json`'s
 //!   account): the name registry. The relayer forwards NEAR that lands on a
 //!   name to its wallet, paying the gas. It holds no key for the registry.
+//! - Spending limits (`limits.rs`): `MARVII_LIMIT_WALLET_DAY`,
+//!   `MARVII_LIMIT_HOUR`, `MARVII_FUND_DAY`, `MARVII_FUND_RESERVE_NEAR`.
 
 use anyhow::{Context, Result, anyhow};
-use axum::{Json, Router, extract::{Path, Query, State}, http::{HeaderValue, StatusCode}, routing::{get, post}};
+use axum::{Json, Router, extract::{Path, Query, State}, http::{HeaderMap, HeaderValue, StatusCode}, routing::{get, post}};
 use defuse_wallet::RequestMessage;
 use defuse_wallet_sdk::relayer::{WalletRelayRequest, WalletRelayer};
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signature, SigningKey, Verifier, VerifyingKey};
 use near_kit::{
     Gas, Near, NearToken,
     rpc::{BlockReference, ExecutionStatus, FinalExecutionOutcome, Finality, RpcError},
     transaction::Final,
 };
 use serde::Deserialize;
+use sha2::Digest;
 use serde_json::{Value, json};
-use std::{collections::HashSet, fs, path::PathBuf, sync::{Arc, Mutex}};
+use std::{fs, path::PathBuf, sync::{Arc, Mutex}};
 use tower_http::cors::CorsLayer;
 
 mod chains;
+mod limits;
 
 fn env_or(k: &str, d: &str) -> String {
     std::env::var(k).unwrap_or_else(|_| d.to_string())
@@ -47,6 +51,9 @@ const FUND: NearToken = NearToken::from_millinear(100);
 
 struct App {
     near: Near,
+    /// The paying account.
+    payer: String,
+    limits: limits::Limits,
     chain: String,
     rpc: String,
     signer: String,
@@ -56,7 +63,6 @@ struct App {
     /// address comes from the one it was created with; it may have moved to
     /// a newer one since.
     known_extensions: Vec<String>,
-    funded: Mutex<HashSet<String>>,
     /// Agent requests the extension refused for being over the cap, waiting
     /// for the owner's passkey. In memory: a demo, not a queue.
     pending: Mutex<Vec<Value>>,
@@ -134,13 +140,14 @@ async fn main() -> Result<()> {
     let near = Near::custom(rpc.clone(), chain.clone()).credentials(secret, payer.as_str())?.build();
     let app = Arc::new(App {
         near,
+        payer: payer.clone(),
+        limits: limits::Limits::from_env(),
         chain,
         rpc,
         signer: env_or("MARVII_NEAR_SIGNER", "v1.signer-prod.testnet"),
         extension,
         code_hash,
         known_extensions,
-        funded: Mutex::new(HashSet::new()),
         pending: Mutex::new(Vec::new()),
         names,
     });
@@ -320,6 +327,7 @@ async fn relay(State(a): State<Shared>, Json(b): Json<RelayBody>) -> Reply {
     if !marvii_near_core::verify_proof(&b.public_key, &msg_json, &b.proof).map_err(bad)? {
         return Err(bad("passkey signature does not verify"));
     }
+    a.limits.charge(b.msg.signer_id.as_str()).map_err(bad)?;
     let mut req = WalletRelayRequest::new(b.msg.clone(), b.proof);
     if !initialized(&a, b.msg.signer_id.as_str()).await.map_err(bad)? {
         // The state the wallet was created with: the extension version whose
@@ -358,13 +366,80 @@ struct FundBody {
 
 /// Testnet only: gives a new Marvii wallet 0.1 NEAR once, so it can pay
 /// the extension's grant deposit.
-async fn fund(State(a): State<Shared>, Json(b): Json<FundBody>) -> Reply {
+async fn fund(State(a): State<Shared>, headers: HeaderMap, Json(b): Json<FundBody>) -> Reply {
     our_wallet(&a, &b.public_key, &b.wallet).map_err(bad)?;
-    if !a.funded.lock().unwrap().insert(b.wallet.clone()) {
+    // Already holds NEAR (funded before, or by its owner): nothing to give.
+    // Checked on-chain, so a relayer restart doesn't reopen it.
+    if near_balance(&a, &b.wallet).await.map_err(bad)? >= FUND.as_yoctonear() / 2 {
         return Err(bad("already funded"));
     }
-    let out = a.near.transfer(b.wallet.as_str(), FUND).wait_until::<Final>().await.map_err(bad)?;
-    Ok(Json(summarize(&a, &out)))
+    let reserve = NearToken::from_near(a.limits.fund_reserve_near as u128).as_yoctonear();
+    if near_balance(&a, &a.payer).await.map_err(bad)? < reserve + FUND.as_yoctonear() {
+        return Err(bad("the relayer is low on NEAR; new-wallet NEAR is paused"));
+    }
+    let ip = client_ip(&headers);
+    a.limits.take_fund(&ip).map_err(bad)?;
+    match a.near.transfer(b.wallet.as_str(), FUND).wait_until::<Final>().await {
+        Ok(out) => Ok(Json(summarize(&a, &out))),
+        Err(e) => {
+            a.limits.undo_fund(&ip);
+            Err(bad(e))
+        }
+    }
+}
+
+/// The caller's address as the host's proxy saw it (Railway sets
+/// X-Forwarded-For; its first entry is the client).
+fn client_ip(headers: &HeaderMap) -> String {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "direct".into())
+}
+
+/// An account's NEAR balance in yoctoNEAR; 0 if it doesn't exist yet.
+async fn near_balance(a: &App, account: &str) -> Result<u128, String> {
+    let id: near_kit::AccountId = account.parse().map_err(|_| "bad account id".to_string())?;
+    match a.near.rpc().view_account(&id, BlockReference::Finality(Finality::Final)).await {
+        Ok(acc) => Ok(acc.amount.as_yoctonear()),
+        Err(RpcError::AccountNotFound { .. }) => Ok(0),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Checks an agent's message before paying gas for it: a live session, its
+/// signature, the next nonce and an open deadline, the same checks the
+/// extension makes. Junk is refused here for free. Returns the wallet.
+async fn precheck_agent(a: &App, b: &AgentBody) -> Result<String, String> {
+    let m: Value = serde_json::from_str(&b.msg).map_err(|_| "bad message".to_string())?;
+    if m["extension"].as_str() != Some(a.extension.as_str()) {
+        return Err("message is for another extension".into());
+    }
+    let wallet = m["wallet"].as_str().ok_or("bad message")?.to_string();
+    let key_id = m["key_id"].as_str().ok_or("bad message")?;
+    let session: Option<Value> = a.near.view(a.extension.as_str(), "get_session").args(json!({ "wallet": wallet, "key_id": key_id })).await.map_err(|e| e.to_string())?;
+    let session = session.ok_or("unknown session")?;
+    if session["revoked"].as_bool() == Some(true) {
+        return Err("session revoked".into());
+    }
+    let pk: [u8; 32] = session["grant"]["public_key"].as_str().and_then(|h| hex::decode(h).ok()).and_then(|v| v.try_into().ok()).ok_or("bad session key")?;
+    let sig: [u8; 64] = hex::decode(&b.signature).ok().and_then(|v| v.try_into().ok()).ok_or("signature must be 64 bytes hex")?;
+    let digest = sha2::Sha256::digest(b.msg.as_bytes());
+    VerifyingKey::from_bytes(&pk).map_err(|_| "bad session key")?.verify(&digest, &Signature::from_bytes(&sig)).map_err(|_| "bad signature")?;
+    if m["nonce"].as_u64() != session["nonce"].as_u64().map(|n| n + 1) {
+        return Err("wrong nonce".into());
+    }
+    if m["deadline_ms"].as_u64().unwrap_or(0) < now_ms() {
+        return Err("deadline passed".into());
+    }
+    Ok(wallet)
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
 #[derive(Deserialize)]
@@ -377,9 +452,8 @@ struct AgentBody {
 /// extension checks the signature and every rule; this only pays the gas.
 async fn agent_execute(State(a): State<Shared>, Json(b): Json<AgentBody>) -> Reply {
     let m: Value = serde_json::from_str(&b.msg).map_err(bad)?;
-    if m["extension"].as_str() != Some(a.extension.as_str()) {
-        return Err(bad("message is for another extension"));
-    }
+    let wallet = precheck_agent(&a, &b).await.map_err(bad)?;
+    a.limits.charge(&wallet).map_err(bad)?;
     let out = a
         .near
         .call(a.extension.as_str(), "execute")
@@ -448,10 +522,8 @@ async fn pending_reject(State(a): State<Shared>, Path(id): Path<u64>) -> Reply {
 /// Forwards an agent's proposal (a new recipient or venue) to the extension,
 /// which queues it behind the delay. Returns the queue id and ready time.
 async fn agent_propose(State(a): State<Shared>, Json(b): Json<AgentBody>) -> Reply {
-    let m: Value = serde_json::from_str(&b.msg).map_err(bad)?;
-    if m["extension"].as_str() != Some(a.extension.as_str()) {
-        return Err(bad("message is for another extension"));
-    }
+    let wallet = precheck_agent(&a, &b).await.map_err(bad)?;
+    a.limits.charge(&wallet).map_err(bad)?;
     let out = a
         .near
         .call(a.extension.as_str(), "propose")
@@ -478,9 +550,22 @@ async fn agent_propose(State(a): State<Shared>, Json(b): Json<AgentBody>) -> Rep
     Ok(Json(s))
 }
 
+#[derive(Deserialize)]
+struct QueuedBody {
+    /// The wallet the queued request belongs to.
+    wallet: String,
+}
+
 /// Runs a queued request after its delay. The extension checks the delay
 /// and the session again; this only pays the gas.
-async fn queued_execute(State(a): State<Shared>, Path(id): Path<u64>) -> Reply {
+async fn queued_execute(State(a): State<Shared>, Path(id): Path<u64>, Json(b): Json<QueuedBody>) -> Reply {
+    // Only a request that exists and is past its delay costs gas.
+    let queued: Vec<(u64, Value)> = a.near.view(a.extension.as_str(), "list_queued").args(json!({ "wallet": b.wallet })).await.map_err(bad)?;
+    let (_, q) = queued.iter().find(|(i, _)| *i == id).ok_or_else(|| bad("no such queued request for this wallet"))?;
+    if q["ready_at_ms"].as_u64().unwrap_or(u64::MAX) > now_ms() {
+        return Err(bad("still in its delay"));
+    }
+    a.limits.charge(&b.wallet).map_err(bad)?;
     let out = a
         .near
         .call(a.extension.as_str(), "execute_queued")

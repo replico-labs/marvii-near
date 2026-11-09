@@ -159,7 +159,8 @@ To host the relayer, see `relayer/Dockerfile`. Build it from this directory: `do
 - The extension's owner can pause sessions. Pausing only restricts; it can't move funds or grant anything.
 - Known limits:
   - testnet only, unaudited
-  - the relayer's list of requests awaiting approval lives in memory, and it has no rate limits
+  - the relayer's list of requests awaiting approval lives in memory. Its spending limits (per account per day, per hour, new-wallet NEAR per day and per IP) are in memory too, so a restart resets them; it checks agents' signatures and nonces before paying gas
+  - passkeys belong to `near.marvii.xyz`: the live page refuses to create or use one anywhere else, so a wallet can't end up tied to a preview address. The dev server uses `localhost`; `VITE_RP_ID` overrides both
   - NEAR sent to a name waits on the name until forwarded (a plain transfer runs no code); the relayer forwards every 20 seconds
   - during the hackathon we keep a key to `marvii.testnet`. It can't touch existing names (they have no keys and their target is fixed), but it could redeploy the registry or create names directly; it's deleted before mainnet
   - caps count `approve` allowances; a venue that pulls funds another way would need its own amount rule
@@ -182,10 +183,11 @@ To host the relayer, see `relayer/Dockerfile`. Build it from this directory: `do
 - NEAR Intents 1Click API (quotes)
 - [viem](https://viem.sh): EVM transaction serialization in the demo agent
 - Aave V3 Base Sepolia addresses from [bgd-labs/aave-address-book](https://github.com/bgd-labs/aave-address-book)
+- [Uniswap V3](https://github.com/Uniswap/swap-router-contracts) on Base Sepolia: SwapRouter02 `0x94cc0aac535ccdb3c01d6787d6413c739ae12bc4` and QuoterV2 `0xc5290058841028f1614f3a6f0f5816cad0df5e27`, each checked on-chain (`factory()`, `WETH9()`)
 
 ## Disclosure
 
-The same team also submitted **Protean-NEAR**. The two projects share no code.
+The same team also submitted **[Protean-NEAR](https://github.com/replico-labs/protean-near)**. The two projects share no code.
 
 ## License
 

@@ -4,7 +4,7 @@ import '@fontsource-variable/geist';
 import '@fontsource-variable/geist-mono';
 import './style.css';
 import init, * as core from './core/core.js';
-import { createPasskey, signChallenge, type Passkey } from './passkey';
+import { createPasskey, onPasskeyDomain, RP_ID, signChallenge, type Passkey } from './passkey';
 import { RELAYER, account, formatNear, relayer, setRpc, view, type Config } from './near';
 import { hasHistory, history } from './history';
 
@@ -377,7 +377,8 @@ function start() {
       <h1>One passkey, every chain</h1>
       <p>No seed phrase, no password. Give agents and apps limited, revocable permission to act for you, and approve anything outside it with one tap.</p>
       ${cfg.names ? `<label class="small">Choose your name <span class="row"><input id="name" class="mono" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="alice"><span class="muted mono">.${esc(cfg.names)}</span></span></label><p class="small muted" id="name-note">Anyone can send to it from any wallet or exchange. Optional; you can choose one later.</p>` : ''}
-      <button id="create" class="primary">Create with a passkey</button>
+      <button id="create" class="primary"${onPasskeyDomain() ? '' : ' disabled'}>Create with a passkey</button>
+      ${onPasskeyDomain() ? '' : `<p class="notice">Marvii passkeys belong to <a href="https://${esc(RP_ID)}">${esc(RP_ID)}</a>. Create and use your wallet there.</p>`}
       <p class="muted small">Testnet only. Unaudited.</p>
       <div id="status" class="status"></div>
     </section>`);
@@ -405,10 +406,13 @@ function start() {
       busy('Setting up your wallet…');
       const created = await until(() => account(wallet), 60000);
       if (!created) throw new Error('Activation did not go through. Please try again.');
-      await within(relayer('/wallet/fund', { public_key: p.publicKey, wallet }), 30000).catch(() => {});
+      // The relayer's gift towards grant deposits; it can say no (daily
+      // limits). The wallet works without it, but granting needs some NEAR.
+      const fundError = await within(relayer('/wallet/fund', { public_key: p.publicKey, wallet }), 30000).then(() => null, (e) => String((e as Error).message ?? e));
       busy('Opening your wallet…');
       await backToWallet();
       busy(null);
+      if (fundError && fundError !== 'already funded') status(`Your account is ready. The free testnet NEAR wasn't sent (${fundError}). To give apps and agents permission, deposit about 0.1 NEAR from the NEAR row first.`, 'error');
       const named = chosen && cfg.names ? await view<string | null>(cfg.names, 'name_of', { wallet }).catch(() => null) : null;
       if (chosen && !named) status(`Your account is ready, but the name ${chosen} couldn't be registered. Choose a name from the NEAR row.`, 'error');
     } catch (e) {

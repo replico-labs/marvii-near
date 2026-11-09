@@ -132,7 +132,7 @@ async function send(to, data) {
       if (!p.queue_id) { console.log(`  proposal refused: ${p.reason ?? p.error}`); return false; }
       console.log(`  queued as ${p.queue_id}, ready at ${new Date(p.ready_at_ms).toISOString()} (NEAR tx ${p.tx_hash}); the owner can cancel until then`);
       await new Promise((r) => setTimeout(r, Math.max(0, p.ready_at_ms - Date.now()) + 5000));
-      out = await relayer(`/queued/${p.queue_id}/execute`, {});
+      out = await relayer(`/queued/${p.queue_id}/execute`, { wallet: WALLET });
       console.log(`  executed after the delay (NEAR tx ${out.tx_hash})`);
       if (!out.ok || !out.mpc_signature) { console.log(`  REFUSED at execution: ${out.reason ?? out.error}`); return false; }
       mpcSignature = out.mpc_signature;
