@@ -3,6 +3,8 @@
 //!   devtool publish-wallet <wallet.wasm>         deploy the wallet code as an immutable global contract
 //!   devtool deploy-extension <extension.wasm>    create the extension's account, deploy and initialize it
 //!   devtool e2e                                  passkey wallet + agent session + Chain Signatures request
+//!   devtool outlayer-upload <module.wasm>        publish the agent's OutLayer module on FastFS
+//!   devtool outlayer-run <module.wasm> '<input>'  run it in OutLayer's TEE, from the `tee-operator` account
 //!
 //! Keys live in $MARVII_NEAR_KEYS (a directory outside the repo) and are
 //! never printed. Testnet only.
@@ -89,6 +91,8 @@ async fn main() -> Result<()> {
             demo(None, None, false, None).await
         }
         Some("e2e") => e2e().await,
+        Some("outlayer-upload") => outlayer_upload(args.get(2).context("module wasm")?).await,
+        Some("outlayer-run") => outlayer_run(args.get(2).context("module wasm")?, args.get(3).context("input JSON")?).await.map(|v| println!("{v}")),
         Some("fund") => fund(args.get(2).context("account")?, args.get(3).context("NEAR amount")?).await,
         Some("demo-wallet") => demo_wallet(None, None, false).await,
         Some("demo-sign-solana") => {
@@ -204,6 +208,124 @@ async fn fund(account: &str, near: &str) -> Result<()> {
     }
     println!("sent {near} NEAR to {account}, tx {}", out.transaction_hash());
     Ok(())
+}
+
+/// OutLayer's contract and FastFS host on testnet.
+fn outlayer() -> String { env_or("MARVII_OUTLAYER", "outlayer.testnet") }
+fn fastfs() -> String { env_or("MARVII_FASTFS", "https://test.fastfs.io") }
+
+/// The account that runs the OutLayer module. Its key is derived from this
+/// account and the build, so it stays the same account; it holds only NEAR
+/// for runs. Created and funded from the deployer on first use.
+async fn tee_operator() -> Result<Key> {
+    let k = Key::create("tee-operator")?;
+    let r: Value = reqwest::Client::new()
+        .post(rpc())
+        .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": "query", "params": { "request_type": "view_account", "finality": "final", "account_id": k.account_id } }))
+        .send().await?.json().await?;
+    if r.get("result").is_none() {
+        fund(&k.account_id, "1").await?;
+    }
+    Ok(k)
+}
+
+fn module_url(operator: &str, hash: &str) -> String {
+    format!("{}/{operator}/{}/{hash}.wasm", fastfs(), outlayer())
+}
+
+/// Publishes the module on FastFS: one transaction whose arguments are the
+/// file (Borsh `FastfsData::Simple`). It runs out of gas on purpose; FastFS
+/// indexes the arguments, not the outcome.
+async fn outlayer_upload(path: &str) -> Result<()> {
+    let wasm = fs::read(path)?;
+    if wasm.len() > 1 << 20 {
+        bail!("modules over 1 MB need chunked upload");
+    }
+    let hash = hex::encode(code_hash(&wasm));
+    let op = tee_operator().await?;
+    let le = |n: usize| (n as u32).to_le_bytes();
+    let rel = format!("{hash}.wasm");
+    let mime = "application/wasm";
+    let mut payload = vec![0u8];
+    payload.extend(le(rel.len()));
+    payload.extend(rel.as_bytes());
+    payload.push(1);
+    payload.extend(le(mime.len()));
+    payload.extend(mime.as_bytes());
+    payload.extend(le(wasm.len()));
+    payload.extend(&wasm);
+    let out = op.near()?.call(&outlayer(), "__fastdata_fastfs").args_raw(payload).gas(Gas::from_ggas(1)).send().wait_until::<Final>().await?;
+    println!("uploaded {} bytes, sha256 {hash}, tx {}", wasm.len(), out.transaction_hash());
+    println!("url {}", module_url(&op.account_id, &hash));
+    Ok(())
+}
+
+/// Runs the module once in OutLayer's TEE through `request_execution` and
+/// returns its JSON output. The result arrives when a worker resumes the
+/// yield, so this polls the transaction until it is final.
+async fn outlayer_run(path: &str, input: &str) -> Result<Value> {
+    let wasm = fs::read(path)?;
+    let hash = hex::encode(code_hash(&wasm));
+    serde_json::from_str::<Value>(input).context("input must be JSON")?;
+    let op = tee_operator().await?;
+    let limits = json!({ "max_instructions": 1_000_000_000u64, "max_memory_mb": 64, "max_execution_seconds": 20 });
+    let near = op.near()?;
+    let cost: String = near.view(&outlayer(), "estimate_execution_cost").args(json!({ "resource_limits": limits, "input_len": input.len() })).await?;
+    let deposit = NearToken::from_yoctonear(cost.parse::<u128>()?);
+    let sent = near
+        .call(&outlayer(), "request_execution")
+        .args(json!({
+            "source": { "WasmUrl": { "url": module_url(&op.account_id, &hash), "hash": hash, "build_target": "wasm32-wasip2" } },
+            "resource_limits": limits,
+            "input_data": input,
+            "response_format": "Json",
+        }))
+        .deposit(deposit)
+        .gas(Gas::from_tgas(150))
+        .send()
+        .wait_until::<near_kit::transaction::Included>()
+        .await?;
+    let tx = sent.transaction_hash.to_string();
+    eprintln!("requested execution, tx {tx}");
+    for _ in 0..60 {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let r: Value = reqwest::Client::new()
+            .post(rpc())
+            .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tx", "params": { "tx_hash": tx, "sender_account_id": op.account_id, "wait_until": "FINAL" } }))
+            .send().await?.json().await?;
+        let status = &r["result"]["status"];
+        if let Some(v) = status.get("SuccessValue").and_then(Value::as_str) {
+            let bytes = base64_decode(v)?;
+            let out: Value = serde_json::from_slice(&bytes).context("output")?;
+            if out.is_null() {
+                let logs: Vec<String> = r["result"]["receipts_outcome"].as_array().into_iter().flatten()
+                    .flat_map(|o| o["outcome"]["logs"].as_array().cloned().unwrap_or_default()).filter_map(|l| l.as_str().map(String::from)).collect();
+                bail!("the run produced nothing; tx {tx}; logs: {}", logs.join(" | "));
+            }
+            return Ok(json!({ "near_tx": tx, "wasm_sha256": hash, "operator": op.account_id, "output": out }));
+        }
+        if let Some(f) = status.get("Failure") {
+            bail!("request failed: {f}; tx {tx}");
+        }
+    }
+    bail!("no result after 3 minutes; tx {tx}")
+}
+
+fn base64_decode(s: &str) -> Result<Vec<u8>> {
+    const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = vec![];
+    let (mut buf, mut bits) = (0u32, 0);
+    for c in s.bytes().filter(|c| *c != b'=') {
+        let v = A.iter().position(|x| *x == c).context("base64")? as u32;
+        buf = buf << 6 | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+            buf &= (1 << bits) - 1;
+        }
+    }
+    Ok(out)
 }
 
 async fn publish_wallet(path: &str) -> Result<()> {

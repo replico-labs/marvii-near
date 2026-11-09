@@ -54,7 +54,7 @@ Confirm decodes each plan and refuses a request whose hashes aren't exactly the 
 - Cardano preprod, 5 ADA, fee 0.167789 ADA: [`66f4e383…7300a3`](https://preprod.cardanoscan.io/transaction/66f4e383673baec595d304f386572324c43383dc514c451ec53e68258b7300a3). Koios's first node answered with a submit-socket error; the relayer now retries that error.
 - Zcash testnet, 0.01 ZEC with 0.0899 ZEC of change back to the account, fee 0.0001 ZEC (ZIP-317): [`e2f07643…57734297`](https://testnet.zcashexplorer.app/transactions/e2f07643ad86605804a5e16475c8fc69dbbf5bffde9d54f3bd2f042f57734297). Both outputs then showed in lightwalletd's UTXO list.
 
-Bitcoin Cash: the demo account holds 0.02 BCH on chipnet from the BCH Ninja faucet (`bd0970e5…81ab`). The first hosted relayer answered 502 on its Electrum route. Its TLS setup used rustls's default builder, which panics when two crypto providers are linked (a test now shows it). It names ring explicitly now; the send waits for that build on Railway.
+Bitcoin Cash: the demo account holds 0.02 BCH on chipnet from the BCH Ninja faucet (`bd0970e5…81ab`). The first hosted relayer answered 502 on its Electrum route. Its TLS setup used rustls's default builder, which panics when two crypto providers are linked (a test now shows it). It names ring explicitly now. Once Railway ran that build, the demo account's passkey sent 0.005 BCH through the hosted relayer, with a 452-sat fee and change back ([`f72072bb…`](https://explorer.selene.cash/tx/f72072bb04ceee882651006c517d1fe3a06ec2d1aaeb7b016ede92f4b2942e0d?network=chipnet)).
 
 Dogecoin: built and tested against bitcoinjs-lib. QED's public testnet Esplora was down (Cloudflare 522), so nothing was broadcast.
 
@@ -87,18 +87,6 @@ A bug was found along the way: the demo agents' copy of the secp256k1 order was 
 Browser tests on v4 pass:
 - `e2e/testnet.mjs` now also grants Hyperliquid through the form. Confirm shows the market and leverage, the agent's order is signed, and 9x is refused.
 - `e2e/move.mjs`: an account created on v3 is offered the update and moved with one tap; its address is unchanged.
-
-## TEE agent (9 November 2026)
-
-`agent/tee/agent.mjs` derives its session key from dstack's key service and publishes a TDX quote. The quote's report data is SHA-256 of `marvii-agent-key:<public key>`.
-
-Run locally against a stand-in for dstack (not a TEE):
-- the passkey granted its key a `tee-agent` session ([`GrmrqcGc…`](https://testnet.nearblocks.io/txns/GrmrqcGcZVQuWL32gFH2nwjSQ7cJzLkWeQbYrzc71oQa))
-- its ETH order was signed ([`Cz6suK7x…`](https://testnet.nearblocks.io/txns/Cz6suK7xFjcToQ8d9G9wr1rpQBzE4JNXMxUbNU8uf5Xc))
-- 20x leverage was refused ([`xBRXGsY4…`](https://testnet.nearblocks.io/txns/xBRXGsY4hRk2123iSt7AvL3hZ1itQtADhWZ2cC5CH2B))
-- a request without its token was refused (401)
-
-`docker-compose.yml`'s bootstrap was also run locally: it fetches the three files, checks their SHA-256 and runs the agent. Deploying it on Phala Cloud gives the real enclave and quote.
 
 ## NEAR Intents (quotes)
 
@@ -133,3 +121,24 @@ On 9 November 2026, 10 wNEAR quoted 36.14 USDC, at least 35.78 after 1% slippage
 - Paid 0.001 ZEC on Zcash testnet to the listed address ([`c7185528…`](https://testnet.zcashexplorer.app/transactions/c71855287429ee67eb7c6b67f29e970765740b0de3741aaa7898a44145cca29c)).
 
 **A deploy mistake, fixed.** The first v5 deploy failed for lack of NEAR, after devtool had already written the new extension's key. The demo account was moved to that empty account, then straight back to v4 ([`FFsC3LPL…`](https://testnet.nearblocks.io/txns/FFsC3LPLNo3zs3EBVLN6oVxWjBJJzhSBQs2rt26zPniL)). devtool now prepares a new extension under `extension-next` and makes it current only once the contract is live.
+
+## Agent key in a TEE: OutLayer (9 November 2026)
+
+The demo agent's key now lives in [OutLayer](https://github.com/out-layer/outlayer), NEAR's TEE compute (Intel TDX), paid in testnet NEAR (about 0.007 NEAR a run).
+
+- **The module** (`near/agent/outlayer/`, sha256 `4d8e953d…2d8a`) was published on FastFS (tx [`B4jwBY76…`](https://testnet.nearblocks.io/txns/B4jwBY76qHmjbfRGawM3dzV2qhsSx9J8HGrr4ySgciYX)) by the `tee-operator` account, `8f58bd66…d804`.
+- **Its key**, derived inside the enclave for that build and that operator: `59af18dd0f96c837e85fd8d7ab0302ccdf81502852e958e3346f4b047e12f15f` (run [`121oaFvR…`](https://testnet.nearblocks.io/txns/121oaFvR4gnZWiepNyHcK92eeu2jqx74o2dr1ba2v5xJ)).
+- **The demo account's passkey granted it** as session `tee-agent` ([`2dehpvwL…`](https://testnet.nearblocks.io/txns/2dehpvwLjWgSug9ZNp5119e1SqsadskoyhGq7MKD3MLN)), with the same Hyperliquid rules as the other agent.
+
+Each action below is one OutLayer run (the module signs inside the TEE), then the extension on NEAR checks the rules and asks Chain Signatures to sign:
+
+| Action | OutLayer run | Extension | Result |
+|---|---|---|---|
+| Leverage 3x on ETH | [`8fBvC93D…`](https://testnet.nearblocks.io/txns/8fBvC93DYmHYqmkH7D9VB6s2SHMTCv8d2kjekmafuSHF) | [`E2gvmpVy…`](https://testnet.nearblocks.io/txns/E2gvmpVyzgyLnZdwDRM35zG1PEVPE26UjEGDJo5AVFti) | Hyperliquid: ok |
+| Buy 0.01 ETH at 1,900 | [`4G2Eaofy…`](https://testnet.nearblocks.io/txns/4G2EaofyW7Y7ySVPPfHyDp2c8SXgwjvS65y1mi5FZ7pW) | [`GdvT8DaQ…`](https://testnet.nearblocks.io/txns/GdvT8DaQLyb2o3if8zJ2NRAGUhBRu3Tj8Gen4cnk6uKT) | resting, oid 64929897011 |
+| Cancel it | [`8bzwF99w…`](https://testnet.nearblocks.io/txns/8bzwF99wrmJYo1iLGsa5ydxfmqShc2J8a5ioyxoTpHaJ) | [`EfanM9NQ…`](https://testnet.nearblocks.io/txns/EfanM9NQ8AksGMuzzg5pF85E3VsXjYjRcuEHtWtshfz5) | success |
+| Leverage 20x | [`8W1WbF7L…`](https://testnet.nearblocks.io/txns/8W1WbF7LQrUvMSBqpgSGrpmhYKiQnUWCHZGuPyyAhbkP) | [`Gff9v19T…`](https://testnet.nearblocks.io/txns/Gff9v19TCsf6kN5Dx37hidFmm6C4ZqACpnAU3REPkjGw) | refused: "leverage above what the grant allows" |
+
+**Checking a run's quote:** `https://testnet-api.outlayer.ai/attestations/by-tx/<OutLayer run tx>`. Its report data commits to the module's sha256, the input and the output. Not fetched from this environment (its network doesn't allow that host).
+
+**What OutLayer's own docs say is still centralised:** the coordinator is closed source, and OutLayer holds single governance keys (measurement approval, contract upgrades). The extension's rules and caps on NEAR don't depend on any of that: a compromised TEE could only sign what the session already allows.

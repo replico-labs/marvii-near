@@ -1,0 +1,12 @@
+{
+  "display": {
+    "name": "Marvii agent key"
+  },
+  "operations": ["public_key", "sign"],
+  "capabilities": {
+    "network": []
+  },
+  "signing_keys": [
+    {"path": "marvii-agent", "type": "ed25519", "bind": "wasm"}
+  ]
+}

@@ -15,7 +15,7 @@ Marvii is a passkey wallet: self-custody secured by your phone's Face ID or fing
   - Over the cap, the request waits for one passkey tap.
   - New recipients and contracts wait in a delay queue, where the passkey can cancel them.
   - Revoke any agent instantly.
-- **An agent's key can live in a TEE.** The demo agent also runs inside an Intel TDX enclave on Phala Cloud. Its session key is derived there and never leaves, and a quote proves which code holds it.
+- **An agent's key can live in a TEE.** The demo agent's key also lives in OutLayer, NEAR's TEE compute (Intel TDX). It is derived inside the enclave for one exact build of our code and never leaves it; each run's TDX quote names that build.
 - **Swap quotes from NEAR Intents.** Live prices between every chain's coin.
 
 Testnet only. The contracts are unaudited.
@@ -85,7 +85,7 @@ All of the following ran on NEAR testnet and each chain's testnet (8–9 Novembe
   - Confirm, which decodes exactly what the passkey signs
   - approvals, the queue, and a one-tap move to a newer extension
 - **`agent/`** is a demo agent. It holds only a session key. Before broadcasting, it checks the signature recovers to the account's address for its own transaction. It supplies to Aave on Base Sepolia and trades on Hyperliquid testnet.
-  - **`agent/tee/`** is the same agent for a TEE (Phala Cloud, dstack). Its key comes from dstack's key service inside the enclave. A TDX quote whose report data is SHA-256 of `marvii-agent-key:<public key>` ties that key to the code. `docker-compose.yml` pins the code by hash, so the quote's compose hash names it.
+  - **`agent/outlayer/`** holds the agent's key in OutLayer's TEE. A Rust module (wasm32-wasip2, 156 KB) declares one ed25519 key bound to its own build (`bind: "wasm"`). OutLayer derives the key inside the enclave and signs only through host calls, so the module never sees it. The module builds the agent's message itself, for Hyperliquid actions only, with the deadline taken from the NEAR block's time; it never signs bytes it is handed. Each run is a NEAR transaction to `outlayer.testnet`, and `testnet-api.outlayer.ai/attestations/by-tx/<tx>` returns its TDX quote. `agent.mjs` holds no key: it asks the module to sign, then sends to the relayer and Hyperliquid.
 - **`names/`** and **`forwarder/`** give each account a name, e.g. `alice.marvii.testnet`. NEAR wallet apps and exchanges don't yet accept `0s…` accounts (NEP-616) as recipients; a name works everywhere.
   - `names/` is the registry, deployed at `marvii.testnet`. The account calls `register("alice")` itself, so only its passkey can claim a name for it, and the page puts this in the same tap that activates the account. One name per account; a name is never reassigned.
   - The registry creates `alice.marvii.testnet` with no keys, running `forwarder/` (shared global code, published once by hash), with the account as its only target. NEAR sent to the name is forwarded by the relayer within about 20 seconds (anyone may call `forward`); tokens sent with `ft_transfer_call` are forwarded at once, and with a plain `ft_transfer` by `forward_ft`.
@@ -175,7 +175,7 @@ To host the relayer, see `relayer/Dockerfile`. Build it from this directory: `do
 - NEAR Chain Signatures (`v1.signer-prod.testnet`)
 - [web3icons](https://github.com/0xa3k5/web3icons) (MIT): chain and token logos, copied into `web/src/icons.ts` by `web/scripts/gen-icons.mjs`
 - [qrcode-generator](https://github.com/kazuhikoarase/qrcode-generator) (MIT): Deposit QR codes
-- [@phala/dstack-sdk](https://github.com/Dstack-TEE/dstack) (Apache-2.0): key derivation and quotes for the TEE agent
+- [OutLayer](https://github.com/out-layer/outlayer): `wit/signing-keys.wit` is a copy of its signing-key interface (MIT OR Apache-2.0); [wit-bindgen](https://github.com/bytecodealliance/wit-bindgen) (Apache-2.0 WITH LLVM-exception OR MIT)
 - [blake2b_simd](https://crates.io/crates/blake2b_simd) (MIT): Zcash ZIP-244 and Cardano hashes
 - [webpki-roots](https://crates.io/crates/webpki-roots), tokio-rustls: the relayer's Electrum (TLS) client for Bitcoin Cash
 - Reference implementations used only in tests: zcash_primitives, bitcore-lib-cash, bitcoinjs-lib, cardano-serialization-lib, hyperliquid-python-sdk
