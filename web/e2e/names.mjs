@@ -31,7 +31,7 @@ async function freshPage() {
 }
 
 async function nearRow(page) {
-  await page.click('#chain-near summary');
+  await page.evaluate(() => (location.hash = '#/chain-near'));
   await page.waitForSelector('#chain-near [data-copy]', { state: 'attached', timeout: 60_000 });
   return (await page.textContent('#chain-near .assets')).replace(/\s+/g, ' ').trim();
 }
@@ -44,7 +44,7 @@ const p1 = await freshPage();
 await p1.fill('#name', a);
 await p1.waitForSelector(`#name-note >> text=is available`, { timeout: 30_000 });
 await p1.click('#create');
-await p1.waitForSelector('text=Balances', { timeout: 240_000 });
+await p1.waitForSelector('.tiles3', { timeout: 240_000 });
 await p1.waitForSelector(`#chain-near [data-copy="${a}.${cfg.names}"]`, { state: 'attached', timeout: 60_000 }).catch(() => (ok = false));
 console.log('1. created with a name:', await nearRow(p1));
 
@@ -57,7 +57,7 @@ console.log('   the same name again:', await p2.textContent('#name-note'));
 // 2. No name at creation, chosen later.
 await p2.fill('#name', '');
 await p2.click('#create');
-await p2.waitForSelector('text=Balances', { timeout: 240_000 });
+await p2.waitForSelector('.tiles3', { timeout: 240_000 });
 console.log('2. created without a name:', await nearRow(p2));
 const b = rand();
 await p2.click('[data-name]');

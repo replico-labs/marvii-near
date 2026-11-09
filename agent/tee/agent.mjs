@@ -28,7 +28,7 @@ const KEY_ID = process.env.KEY_ID ?? 'tee-agent';
 const HL = process.env.HL_API ?? 'https://api.hyperliquid-testnet.xyz';
 const TOKEN = process.env.AGENT_TOKEN ?? '';
 const HL_ETH = 4; // ETH perp on Hyperliquid testnet (`meta` universe index)
-const N = 0xffffffffffffffffffffffffffffffffbaaedce6af48a03bbfd25e8cd0364141n;
+const N = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n;
 if (!WALLET) throw new Error('set WALLET');
 if (TOKEN.length < 16) throw new Error('set AGENT_TOKEN (at least 16 characters)');
 

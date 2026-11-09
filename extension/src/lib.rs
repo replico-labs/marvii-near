@@ -21,6 +21,7 @@
 
 pub mod evm;
 mod hl;
+mod utxo;
 pub mod rules;
 
 use defuse_wallet::{
@@ -335,17 +336,31 @@ impl Extension {
     /// Has the wallet carry out a checked plan. Never any wallet ops: a
     /// session can't add or remove extensions or change the signature mode.
     fn act(&self, wallet: AccountId, plan: rules::Plan, deposit: NearToken) -> Promise {
-        let promise = match plan.kind {
-            rules::Kind::Near { receiver_id, method, args, deposit } => NearPromise::new(receiver_id)
-                .function_call(FunctionCall::name(method).args(args).attach_deposit(deposit).gas(CALL_GAS)),
-            rules::Kind::Evm { path, hash } => NearPromise::new(self.signer.clone()).function_call(
+        let sign = |path: &str, hash: [u8; 32]| {
+            NearPromise::new(self.signer.clone()).function_call(
                 FunctionCall::name("sign")
                     .args_json(serde_json::json!({
                         "request": { "path": path, "payload_v2": { "Ecdsa": hex::encode(hash) }, "domain_id": 0 }
                     }))
                     .attach_deposit(NearToken::from_yoctonear(1))
                     .gas(SIGN_GAS),
-            ),
+            )
+        };
+        if let rules::Kind::Utxo { path, hashes } = &plan.kind {
+            // One signature per input.
+            let request = Request { internal: vec![], external: hashes.iter().map(|h| sign(path, *h)).collect() };
+            return Promise::new(wallet).function_call(
+                "w_execute_extension".to_string(),
+                serde_json::to_vec(&serde_json::json!({ "request": request })).unwrap(),
+                deposit,
+                Gas::from_tgas(100),
+            );
+        }
+        let promise = match plan.kind {
+            rules::Kind::Near { receiver_id, method, args, deposit } => NearPromise::new(receiver_id)
+                .function_call(FunctionCall::name(method).args(args).attach_deposit(deposit).gas(CALL_GAS)),
+            rules::Kind::Evm { path, hash } => sign(&path, hash),
+            rules::Kind::Utxo { .. } => unreachable!(),
         };
         let request = Request { internal: vec![], external: vec![promise] };
         Promise::new(wallet).function_call(

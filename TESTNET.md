@@ -50,7 +50,13 @@ Reads and broadcasts go through the relayer, under `/chain/{chain}/…`:
 
 Confirm decodes each plan and refuses a request whose hashes aren't exactly the plan's, as for Bitcoin.
 
-On testnet, the demo account received 0.02 BCH on chipnet from the BCH Ninja faucet (`bd0970e5…81ab`).
+**Broadcast on 9 November 2026**, through the page, with the demo account's passkey:
+- Cardano preprod, 5 ADA, fee 0.167789 ADA: [`66f4e383…7300a3`](https://preprod.cardanoscan.io/transaction/66f4e383673baec595d304f386572324c43383dc514c451ec53e68258b7300a3). Koios's first node answered with a submit-socket error; the relayer now retries that error.
+- Zcash testnet, 0.01 ZEC with 0.0899 ZEC of change back to the account, fee 0.0001 ZEC (ZIP-317): [`e2f07643…57734297`](https://testnet.zcashexplorer.app/transactions/e2f07643ad86605804a5e16475c8fc69dbbf5bffde9d54f3bd2f042f57734297). Both outputs then showed in lightwalletd's UTXO list.
+
+Bitcoin Cash: the demo account holds 0.02 BCH on chipnet from the BCH Ninja faucet (`bd0970e5…81ab`). The first hosted relayer answered 502 on its Electrum route. Its TLS setup used rustls's default builder, which panics when two crypto providers are linked (a test now shows it). It names ring explicitly now; the send waits for that build on Railway.
+
+Dogecoin: built and tested against bitcoinjs-lib. QED's public testnet Esplora was down (Cloudflare 522), so nothing was broadcast.
 
 ## Hyperliquid (extension v4, 9 November 2026)
 
@@ -66,7 +72,17 @@ On testnet, through the relayer:
 - A 120 USD order: refused, "over the daily cap" ([`4fFx7BVe…`](https://testnet.nearblocks.io/txns/4fFx7BVeoAQaUSCfjqJZhr9YmXTaxKTb7t9ot2hyf4Ls)).
 - A 20 USD order (0.01 ETH at 2000): signed ([`5PZ1T2A5…`](https://testnet.nearblocks.io/txns/5PZ1T2A57RJx7tSDAc2Fwj4Eknwvf2B3cpAMvnDZ1Lmg)). Hyperliquid again recovered the account's address.
 
-Orders rest once the account holds testnet USDC on Hyperliquid.
+**With funds (9 November 2026).**
+- 50 USDC was sent to the account on Hyperliquid. It landed in spot, as all transfers between Hyperliquid users do.
+- The owner moved 40 USDC to perps from the page's Hyperliquid card: one passkey tap. The page builds the `usdClassTransfer` EIP-712 digest itself, with `hyperliquidChain` "Testnet"; the digest matches hyperliquid-python-sdk. The account's EVM key signs it through Chain Signatures. Spot went from 50 to 10 USDC and perps from 0 to 40.
+
+Then the agent, through the hosted relayer (`relayer.marvii.xyz`):
+- Leverage 3x cross: accepted ([`7ZL1fv6F…`](https://testnet.nearblocks.io/txns/7ZL1fv6FVN8i7TFwUPh8EVbycZPQgGWGfB4aJ47Vgw5D)).
+- Buy 0.01 ETH at 1500, Gtc: resting as order 64921782656 ([`5T4BPjof…`](https://testnet.nearblocks.io/txns/5T4BPjof1CYPefrVtRdDN6MV1FJPS77TioVKaFyUPd7G)).
+- Cancel it: success ([`3ZTigCx1…`](https://testnet.nearblocks.io/txns/3ZTigCx1QzmHSdHr4MtF3cbe88VhnpbytuybbTQGbM5m)).
+- Buy 0.01 ETH, Ioc at 1% over the mid: filled at 2124.77 ([`FELTSwmL…`](https://testnet.nearblocks.io/txns/FELTSwmLn1wi9LQaYPPmeu9ncmpqxz6d8jWkH99286Fi)). The account holds 0.01 ETH long, 3x cross.
+
+A bug was found along the way: the demo agents' copy of the secp256k1 order was wrong. It was slightly too large, so a high-S signature would almost never have been normalized. Both agents now use the right constant, and the page's is checked too.
 
 Browser tests on v4 pass:
 - `e2e/testnet.mjs` now also grants Hyperliquid through the form. Confirm shows the market and leverage, the agent's order is signed, and 9x is refused.
@@ -89,3 +105,31 @@ Run locally against a stand-in for dstack (not a TEE):
 The Swap card asks NEAR Intents' 1Click API for a quote through the relayer, which always sends `dry: true`, so no deposit address is ever created. The quote is between balances the account would hold inside Intents.
 
 On 9 November 2026, 10 wNEAR quoted 36.14 USDC, at least 35.78 after 1% slippage, in about 10 seconds. No solver quoted wNEAR to BTC inside Intents at that moment; the page says so.
+
+## Extension v5: venue rules, Uniswap, payments (9 November 2026)
+
+**Deployed** at `d591504aa95d1d7164f11dfac2016363dd18788458040c7fc3ee32cd4344e0ec` (tx [`95i8K91i…`](https://testnet.nearblocks.io/txns/95i8K91iCS7dHv85hn8wBnNrfc3n1fr1xyiWG9snuc6k)).
+- The demo account's passkey moved it from v4 ([`83auiuwr…`](https://testnet.nearblocks.io/txns/83auiuwrmejz5drXJoFcJ6tf2eP455fXMAYKo9apuGsc)).
+- It then granted the agent, in [`Gd7NuqdT…`](https://testnet.nearblocks.io/txns/Gd7NuqdTRW3fkSSRYxVPkJHhQvQeeRpNuP9br5jADqVq):
+  - Aave V3 supply, withdraw and repay
+  - Uniswap V3 swaps
+  - Hyperliquid ETH perps
+  - payments on Bitcoin and Zcash, to one listed address each
+  - the account's own EVM address, named in the grant
+
+**What v5 adds.**
+- **Venue arguments.** For Aave `supply`, `withdraw`, `repay` and Uniswap V3 `exactInputSingle`, the extension reads where the result goes. It must be the account's own address. v4 checked only the contract and function, so an agent could have supplied or swapped for someone else, up to its cap.
+- **Uniswap V3 on Base Sepolia.** SwapRouter02 `0x94cc…12bc4` and QuoterV2 `0xc529…5e27`. Their `factory()` and `WETH9()` were checked on-chain, and the USDC/WETH 0.3% pool holds liquidity.
+- **Agent payments on Bitcoin, Litecoin, Bitcoin Cash and Zcash.** The extension builds the signing hashes itself, one per input. Its hashes are tested to equal core's on all four chains. Dogecoin isn't offered: its digest doesn't commit to amounts.
+
+**On testnet**, by the agent through the relayer:
+- Approved the Uniswap router for 5 USDC ([`0x9cb05d9b…`](https://sepolia.basescan.org/tx/0x9cb05d9bb4901027d83c2d68b8e9ff55a80408d403bc2ce27834e949b7c15fbc)).
+- Swapped 5 USDC for at least 0.0336 WETH, output to the account ([`0xce471eb8…`](https://sepolia.basescan.org/tx/0xce471eb804b2b0e4b24b0e7b6eb3c67e5582ef41106e102278b7d82085b97793)).
+- The same swap with the output to `0x…dEaD`: refused on NEAR ([`EhYuDDjo…`](https://testnet.nearblocks.io/txns/EhYuDDjoq4va9b5YRkp5aqS2QYczvrBEFdczwdAteZ7u)).
+- Withdrew 10 USDC from Aave to the account ([`0x13721a60…`](https://sepolia.basescan.org/tx/0x13721a60a543b28a8de88db15db55b10b38805a0a26b1dcf90a7662309f46a82)).
+- Paid 2,000 sats on Bitcoin testnet4 to the listed address, with change back and a 282-sat fee ([`89753105…`](https://mempool.space/testnet4/tx/897531058dea65e6f3ad0ec55f7c2fbc8a4c85af4bf342af0fedbd18d54cd846)).
+- Paid an unlisted Bitcoin address: refused, "recipient not allowed" ([`5QPNzVR5…`](https://testnet.nearblocks.io/txns/5QPNzVR5hHm6ucvnovhHDNktW8AuRN2bwwivyLgzmf2W)).
+- Paid 0.001 BTC with 2,282 sats of the 100,000-sat cap already used: refused, "over the daily cap" ([`BwV7SWT9…`](https://testnet.nearblocks.io/txns/BwV7SWT9Ea7GAWfXDtb9M6hKR6hxn6MTxwV6naEcnUkZ)).
+- Paid 0.001 ZEC on Zcash testnet to the listed address ([`c7185528…`](https://testnet.zcashexplorer.app/transactions/c71855287429ee67eb7c6b67f29e970765740b0de3741aaa7898a44145cca29c)).
+
+**A deploy mistake, fixed.** The first v5 deploy failed for lack of NEAR, after devtool had already written the new extension's key. The demo account was moved to that empty account, then straight back to v4 ([`FFsC3LPL…`](https://testnet.nearblocks.io/txns/FFsC3LPLNo3zs3EBVLN6oVxWjBJJzhSBQs2rt26zPniL)). devtool now prepares a new extension under `extension-next` and makes it current only once the contract is live.

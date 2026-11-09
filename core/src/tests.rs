@@ -666,3 +666,55 @@ fn extension_move_adds_then_removes() {
     assert!(d["external"].as_array().unwrap().is_empty());
     assert!(extension_move_message("testnet", w, 7, 1_800_000_000, new, &format!("[\"{new}\"]")).is_err());
 }
+
+/// Reference: hyperliquid-python-sdk `user_signed_payload` with
+/// USD_CLASS_TRANSFER_SIGN_TYPES and eth_account's EIP-712 hash, testnet,
+/// signatureChainId 0x66eee: 49.5 USDC to perps at nonce 1794197767416.
+#[test]
+fn hl_transfer_matches_python_sdk() {
+    assert_eq!(hl_transfer_hash("49.5", true, 1_794_197_767_416).unwrap(), "d2ac30285e8c22abc0a3488db648ca40915c2219902061d47fc20fdcdb137a2b");
+    for bad in ["49.50", "049", "0", "-1", "1e3", "1.1234567", "", "."] {
+        assert!(hl_transfer_hash(bad, true, 1).is_err(), "{bad}");
+    }
+    let m = owner_hl_transfer_message("testnet", "0s3465557e026f471c0e84898f799c8032f356c77a", 1, 1_800_000_000, "v1.signer-prod.testnet", "49.5", true, 1_794_197_767_416).unwrap();
+    let d: serde_json::Value = serde_json::from_str(&describe_message(&m).unwrap()).unwrap();
+    let req = &d["external"][0]["actions"][0]["args"]["request"];
+    assert_eq!(req["path"], "evm");
+    assert_eq!(req["payload_v2"]["Ecdsa"], "d2ac30285e8c22abc0a3488db648ca40915c2219902061d47fc20fdcdb137a2b");
+}
+
+#[test]
+fn uniswap_swap_and_aave_withdraw_decode() {
+    let w = |h: &str| format!("{:0>64}", h.trim_start_matches("0x"));
+    let usdc = "0xba50cd2a20f6da35d788639e581bca8d0b5d4d5f";
+    let weth = "0x4200000000000000000000000000000000000006";
+    let me = "0x48f0deef2c7e15ea9b4398a6875b43b5ab6ea81e";
+    let data = format!("0x04e45aaf{}{}{}{}{}{}{}", w(usdc), w(weth), w("bb8"), w(me), w("4c4b40"), w("1"), w("0"));
+    let tx = serde_json::json!({ "chain_id": 84532, "nonce": 1, "max_priority_fee_per_gas": "1", "max_fee_per_gas": "2", "gas_limit": 200000, "to": "0x94cc0aac535ccdb3c01d6787d6413c739ae12bc4", "value": "0", "data": data }).to_string();
+    let d: serde_json::Value = serde_json::from_str(&describe_evm_tx(&tx).unwrap()).unwrap();
+    assert_eq!(d["call"]["kind"], "uniswap_swap");
+    assert_eq!(d["call"]["recipient"], me);
+    assert_eq!(d["call"]["amount_in"], "5000000");
+    assert_eq!(d["call"]["fee"], "3000");
+    let data = format!("0x69328dec{}{}{}", w(usdc), w("5"), w(me));
+    let tx = serde_json::json!({ "chain_id": 84532, "nonce": 1, "max_priority_fee_per_gas": "1", "max_fee_per_gas": "2", "gas_limit": 200000, "to": "0x8bab6d1b75f19e9ed9fce8b9bd338844ff79ae27", "value": "0", "data": data }).to_string();
+    let d: serde_json::Value = serde_json::from_str(&describe_evm_tx(&tx).unwrap()).unwrap();
+    assert_eq!(d["call"]["kind"], "aave_withdraw");
+    assert_eq!(d["call"]["to"], me);
+}
+
+#[test]
+fn utxo_scripts_round_trip() {
+    for (chain, a) in [
+        ("bitcoin", "tb1ql3e9pgs3mmwuwrh95fecme0s0qtn28804khrk8"),
+        ("bitcoin", "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"),
+        ("litecoin", "tltc1ql3e9pgs3mmwuwrh95fecme0s0qtn2880v74axw"),
+        ("bitcoin-cash", "bchtest:qr78y59zz80dm3cwuk388r097pupwdguaugjl6473v"),
+        ("zcash", "tmYjAZFpvdDXTaJrq2WikAntitBNJJo9VSo"),
+    ] {
+        let s = utxo_script(chain, a).unwrap();
+        assert_eq!(utxo_address(chain, &s).unwrap(), a, "{chain}");
+    }
+    assert!(utxo_address("bitcoin", "6a0568656c6c6f").is_err());
+    assert!(utxo_address("dogecoin", "76a914fc7250a211deddc70ee5a2738de5f07817351cef88ac").is_err());
+}

@@ -33,16 +33,20 @@ await page.evaluate(([id, pk, w]) => localStorage.setItem('marvii-near:passkey',
 await page.reload();
 const chain = process.env.CHAIN ?? '84532';
 await page.waitForSelector(`#chain-${chain} [data-send]`, { state: 'attached', timeout: 90_000 });
-await page.click(`#chain-${chain} summary`);
+await page.evaluate((c) => (location.hash = `#/chain-${c}`), chain);
 await page.click(`#chain-${chain} [data-send]`);
-if (await page.$('select[name=asset]')) {
-  const opts = await page.$$eval('select[name=asset] option', (o) => o.map((x) => [x.value, x.textContent]));
-  await page.selectOption('select[name=asset]', opts.find(([, t]) => t.startsWith('USDC'))[0]);
+if (await page.$('#send select[name=asset]')) {
+  const opts = await page.$$eval('#send select[name=asset] option', (o) => o.map((x) => [x.value, x.textContent]));
+  await page.selectOption('#send select[name=asset]', opts.find(([, t]) => t.startsWith('USDC'))[0]);
 }
-await page.fill('input[name=to]', to);
-await page.fill('input[name=amount]', amount);
+await page.fill('#send input[name=to]', to);
+await page.fill('#send input[name=amount]', amount);
 await page.click('#send button.primary');
-await page.waitForSelector('.sheet >> text=Approve:', { timeout: 60_000 });
+await page.waitForSelector('.sheet >> text=Approve:', { timeout: 60_000 }).catch(async (e) => {
+  const modal = await page.textContent('#modal').catch(() => '?');
+  console.log('send form says:', await page.textContent('#send #status').catch(() => '?'), '| modal:', modal.replace(/\s+/g, ' ').slice(0, 400));
+  throw e;
+});
 console.log('Confirm shows:', (await page.textContent('.sheet .list')).replace(/\s+/g, ' ').trim().slice(0, 200));
 await page.click('#yes');
 await page.waitForSelector('.status.ok, .sheet .status.error', { timeout: 180_000 });

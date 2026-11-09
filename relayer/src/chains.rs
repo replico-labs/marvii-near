@@ -222,7 +222,11 @@ async fn electrum(method: &str, params: Value) -> Result<Value, (StatusCode, Jso
     let host = server.split(':').next().unwrap_or("").to_string();
     let run = async {
         let tcp = tokio::net::TcpStream::connect(&server).await.map_err(|e| e.to_string())?;
-        let config = rustls::ClientConfig::builder()
+        // Two crypto providers are linked (ring here, aws-lc-rs via reqwest),
+        // so name one: `builder()` would panic choosing between them.
+        let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .map_err(|e| e.to_string())?
             .with_root_certificates(rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() })
             .with_no_client_auth();
         let name = rustls::pki_types::ServerName::try_from(host).map_err(|e| e.to_string())?;
@@ -334,20 +338,28 @@ pub async fn broadcast(Path(chain): Path<String>, body: String) -> Reply {
     let bytes = hex::decode(raw).map_err(bad)?;
     match chain.as_str() {
         "cardano" => {
-            let r = reqwest::Client::new()
-                .post(format!("{KOIOS}/submittx"))
-                .header("content-type", "application/cbor")
-                .body(bytes)
-                .timeout(Duration::from_secs(15))
-                .send()
-                .await
-                .map_err(bad)?;
-            let ok = r.status().is_success();
-            let text = r.text().await.map_err(bad)?;
-            if !ok {
-                return Err(bad(text));
+            // Koios balances requests across nodes; one with its node's
+            // socket down answers TxCmdTxSubmitConnectionError. Try again.
+            for attempt in 1..=3 {
+                let r = reqwest::Client::new()
+                    .post(format!("{KOIOS}/submittx"))
+                    .header("content-type", "application/cbor")
+                    .body(bytes.clone())
+                    .timeout(Duration::from_secs(15))
+                    .send()
+                    .await
+                    .map_err(bad)?;
+                let ok = r.status().is_success();
+                let text = r.text().await.map_err(bad)?;
+                if ok {
+                    return Ok(Json(json!({ "txid": text.trim().trim_matches('"') })));
+                }
+                if !text.contains("ConnectionError") || attempt == 3 {
+                    return Err(bad(text));
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
             }
-            Ok(Json(json!({ "txid": text.trim().trim_matches('"') })))
+            unreachable!()
         }
         "zcash" => {
             let mut m = vec![];
@@ -481,6 +493,18 @@ fn format_rfc3339(secs: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tls_config_names_its_provider() {
+        // With two providers linked, the default builder can't choose.
+        assert!(std::panic::catch_unwind(|| rustls::ClientConfig::builder()).is_err());
+        let c = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() })
+            .with_no_client_auth();
+        assert!(!c.alpn_protocols.iter().any(|p| p.is_empty()));
+    }
+
     #[test]
     fn rfc3339() {
         assert_eq!(super::format_rfc3339(0), "1970-01-01T00:00:00Z");

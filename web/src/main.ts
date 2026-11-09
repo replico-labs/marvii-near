@@ -6,6 +6,7 @@ import './style.css';
 import init, * as core from './core/core.js';
 import { createPasskey, signChallenge, type Passkey } from './passkey';
 import { RELAYER, account, formatNear, relayer, setRpc, view, type Config } from './near';
+import { hasHistory, history } from './history';
 
 // EVM test chains shown on the dashboard. One address on all of them: the
 // MPC signer's derived_public_key for the wallet and path `evm`.
@@ -96,17 +97,37 @@ const TOKEN_BALANCES = [
 // Aave's test USDC on Base Sepolia (bgd-labs/aave-address-book, checked on-chain).
 const TOKENS: Record<string, { symbol: string; decimals: number }> = {
   '84532:0xba50cd2a20f6da35d788639e581bca8d0b5d4d5f': { symbol: 'USDC', decimals: 6 },
+  '84532:0x4200000000000000000000000000000000000006': { symbol: 'WETH', decimals: 18 },
 };
 /** Hyperliquid testnet perps by asset index (`meta` universe, checked
  *  9 November 2026). */
 const HL_MARKETS: Record<number, string> = { 0: 'SOL', 3: 'BTC', 4: 'ETH', 54: 'NEAR' };
 const hlName = (a: number) => (HL_MARKETS[a] ? `${HL_MARKETS[a]} perps` : `market #${a}`);
 /** Cap amounts in plain words where the page knows the asset. */
+/** The payment-only chains agents may pay on (Dogecoin's signatures don't
+ *  commit to amounts, so its fees can't be capped: not offered). */
+const PAY_CHAINS: Record<string, string> = { bitcoin: 'BTC', litecoin: 'LTC', 'bitcoin-cash': 'BCH', zcash: 'ZEC' };
+const PAY_NAMES: Record<string, string> = { bitcoin: 'Bitcoin', litecoin: 'Litecoin', 'bitcoin-cash': 'Bitcoin Cash', zcash: 'Zcash' };
 function capWords(asset: string, daily: string): string {
   if (asset === 'hyperliquid:usd') return `$${esc(fmtUnits(BigInt(daily), 6, 2))} of Hyperliquid orders`;
+  if (asset.startsWith('utxo:') && PAY_CHAINS[asset.slice(5)]) return `${esc(fmtUnits(BigInt(daily), 8, 8))} ${PAY_CHAINS[asset.slice(5)]} (fees included)`;
   return `${esc(daily)} of ${esc(asset)}`;
 }
-const POOLS: Record<string, string> = { '84532:0x8bab6d1b75f19e9ed9fce8b9bd338844ff79ae27': 'Aave V3 pool' };
+const POOLS: Record<string, string> = {
+  '84532:0x8bab6d1b75f19e9ed9fce8b9bd338844ff79ae27': 'Aave V3 pool',
+  '84532:0x94cc0aac535ccdb3c01d6787d6413c739ae12bc4': 'Uniswap V3 router',
+};
+/** Venue functions by selector (keccak256 of the signature). The extension
+ *  checks where each one's result goes (v5). */
+const FN_NAMES: Record<string, string> = { '0x617ba037': 'supply', '0x69328dec': 'withdraw', '0x573ade81': 'repay', '0x04e45aaf': 'swap' };
+/** Venues the grant form offers by name. Aave V3 from bgd-labs/aave-address-book
+ *  (checked on-chain); Uniswap V3 SwapRouter02 on Base Sepolia, whose
+ *  factory() and WETH9() were checked on-chain. */
+const VENUES = [
+  { id: 'aave', name: 'Aave V3', what: 'supply, withdraw, repay', chain: 84532, to: '0x8bab6d1b75f19e9ed9fce8b9bd338844ff79ae27', selectors: ['0x617ba037', '0x69328dec', '0x573ade81'] },
+  { id: 'uniswap', name: 'Uniswap V3', what: 'swap', chain: 84532, to: '0x94cc0aac535ccdb3c01d6787d6413c739ae12bc4', selectors: ['0x04e45aaf'] },
+];
+const fnName = (sel: string) => FN_NAMES[sel.toLowerCase()] ?? `function ${sel}`;
 const chainName = (id: number) => EVM_CHAINS.find((c) => c.id === id)?.name ?? `chain ${id}`;
 function amount(chain: number, token: string, raw: string) {
   const t = TOKENS[`${chain}:${token}`];
@@ -224,9 +245,15 @@ async function fillNear() {
        <div class="row between small"><span class="muted">Account</span><span>${copyable(wallet)}</span></div>`
     : `<div class="row between small"><span class="muted">Address</span><span>${copyable(wallet)}</span></div>`;
   const choose = !name && cfg.names ? `<div class="row end"><button class="secondary small-btn" data-name="1">Choose a name</button></div>` : '';
-  deposits['chain-near'] = { address: wallet, name: name ?? undefined };
+  deposits['chain-near'] = { address: wallet, name: name ?? undefined, explorer: `https://testnet.nearblocks.io/address/${wallet}` };
+  const an = document.getElementById('acct-name');
+  if (an) an.innerHTML = name ? copyableName(name) : copyable(wallet);
+  const tb = document.querySelector('#tile-chain-near .bal');
+  if (tb) tb.textContent = bal;
   nearBalance = a ? a.amount : '0';
-  d.querySelector('.assets')!.innerHTML = rows + `<div class="row between"><span>NEAR</span><span>${esc(bal.split(' ')[0])}</span></div>` + actions('chain-near', 'near') + choose;
+  setActions('chain-near', 'near');
+  const icon = `<span class="coin small" aria-hidden="true">${ICONS['chain-near'] ?? ''}</span>`;
+  d.querySelector('.assets')!.innerHTML = `<div class="row between asset"><span class="chain-name">${icon}NEAR</span><span>${esc(bal.split(' ')[0])}</span></div>` + rows + choose;
   if (name) {
     // Deposits sent to the name wait there until forwarded; ask now rather
     // than wait for the relayer's next round.
@@ -459,18 +486,24 @@ type Session = {
 };
 
 /** What the Deposit sheet shows for each row. */
-const deposits: Record<string, { address: string; name?: string }> = {};
-/** Send (where this page can send on that chain) and Deposit, on every row. */
-function actions(id: string, sendChain?: number | string) {
-  const send = sendChain !== undefined ? `<button class="secondary small-btn" data-send="${sendChain}">Send</button>` : `<span class="muted small">Send coming soon</span>`;
-  return `<div class="row end">${send}<button class="secondary small-btn" data-deposit="${id}">Deposit</button></div>`;
+const deposits: Record<string, { address: string; name?: string; explorer?: string }> = {};
+const ARROW_UP = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5M5 12l7-7 7 7" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+const ARROW_DOWN = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12l7 7 7-7" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+/** Send and Receive, at the top of a chain's page. */
+function setActions(id: string, sendChain?: number | string) {
+  const el = document.querySelector(`#${id} .acts`);
+  if (!el) return;
+  const send = sendChain !== undefined
+    ? `<button class="act" data-send="${sendChain}"><span class="act-ic">${ARROW_UP}</span>Send</button>`
+    : `<button class="act" disabled title="Not yet on this chain"><span class="act-ic">${ARROW_UP}</span>Send</button>`;
+  el.innerHTML = `${send}<button class="act" data-deposit="${id}"><span class="act-ic">${ARROW_DOWN}</span>Receive</button>`;
 }
 
 /** Deposit: the address to send to, as text and a QR code. */
 function depositSheet(id: string) {
   const d = deposits[id];
   if (!d?.address) return;
-  const chain = document.querySelector(`#${id} summary b`)?.textContent ?? '';
+  const chain = document.querySelector(`#${id} h1`)?.textContent ?? '';
   const shown = d.name ?? d.address;
   const qr = qrcode(0, 'M');
   qr.addData(shown);
@@ -491,24 +524,101 @@ function depositSheet(id: string) {
   document.getElementById('cancel')!.onclick = () => (document.getElementById('modal')!.innerHTML = '');
 }
 
-function chainRow(id: string, name: string) {
+/** A chain's tile on the Assets page. */
+function chainTile(id: string, name: string) {
   const icon = ICONS[id] ? `<span class="coin" aria-hidden="true">${ICONS[id]}</span>` : '';
-  return `<li><details id="${id}"><summary class="row between"><span class="chain-name">${icon}<b>${esc(name)}</b></span><span class="muted bal">…</span></summary><div class="assets"></div></details></li>`;
+  return `<a class="chain-tile" id="tile-${id}" href="#/${id}">${icon}<span class="tile-name">${esc(name)}</span><span class="bal muted">…</span></a>`;
+}
+
+/** A chain's own page: balance, Send and Receive, what it holds, history. */
+function chainView(id: string, name: string) {
+  const icon = ICONS[id] ? `<span class="coin big-coin" aria-hidden="true">${ICONS[id]}</span>` : '';
+  return `<section class="view" data-view="${id}" id="${id}">
+    <a class="back" href="#/assets">‹ Assets</a>
+    <div class="card chain-head">
+      ${icon}<h1>${esc(name)}</h1>
+      <div class="big bal">…</div>
+      <div class="acts"></div>
+    </div>
+    <div class="card"><h2>Assets</h2><div class="assets"><p class="muted small">Loading…</p></div></div>
+    ${id === 'chain-998' ? HL_CARD : ''}
+    <div class="card"><h2>History</h2><ul class="list history" data-history="${id}"><li class="muted small">Open to load.</li></ul></div>
+  </section>`;
 }
 
 /** Fills a chain row: the native balance on the row, and in its dropdown the
  *  address and every asset held there. */
 function fillChain(id: string, address: string, native: string, assets: string[], explorer?: string, sendChain?: number | string) {
-  const d = document.getElementById(id)!;
+  const d = document.getElementById(id);
+  if (!d) return;
   d.querySelector('.bal')!.textContent = native;
+  const tile = document.querySelector(`#tile-${id} .bal`);
+  if (tile) tile.textContent = native;
   const link = explorer ? ` <a class="small" target="_blank" rel="noopener" href="${esc(explorer)}">Explorer</a>` : '';
-  deposits[id] = { address };
-  const send = actions(id, sendChain);
+  deposits[id] = { address, explorer };
+  setActions(id, sendChain);
+  const sym = native.split(' ').pop()!;
+  const icon = ICONS[id] ? `<span class="coin small" aria-hidden="true">${ICONS[id]}</span>` : '';
   d.querySelector('.assets')!.innerHTML =
-    `<div class="row between small"><span class="muted">Address</span><span>${copyable(address)}${link}</span></div>` +
-    [`<div class="row between"><span>${esc(native.split(' ').pop()!)}</span><span>${esc(native.split(' ')[0])}</span></div>`, ...assets].join('') +
-    send;
+    [`<div class="row between asset"><span class="chain-name">${icon}${esc(sym)}</span><span>${esc(native.split(' ')[0])}</span></div>`, ...assets].join('') +
+    `<div class="row between small addr-row"><span class="muted">Address</span><span>${copyable(address)}${link}</span></div>`;
 }
+
+// ---- Views: Home, Assets (a page per chain), Swap, Apps & agents ----
+
+const VIEW_TITLES: Record<string, string> = { home: 'Marvii', assets: 'Assets', swap: 'Swap', agents: 'Apps & agents' };
+/** Shows the view the URL's hash names (#/assets, #/chain-84532, …). */
+function route() {
+  const want = location.hash.replace(/^#\/?/, '') || 'home';
+  const views = Array.from(document.querySelectorAll<HTMLElement>('.view'));
+  const v = views.find((x) => x.dataset.view === want) ?? views.find((x) => x.dataset.view === 'home');
+  views.forEach((x) => x.classList.toggle('on', x === v));
+  document.title = VIEW_TITLES[v?.dataset.view ?? ''] ? `${VIEW_TITLES[v!.dataset.view!]} · Marvii` : 'Marvii';
+  if (v?.dataset.view?.startsWith('chain-')) loadHistory(v.dataset.view).catch(() => {});
+  window.scrollTo(0, 0);
+}
+window.addEventListener('hashchange', route);
+
+/** A chain's recent transactions, loaded when its page opens. */
+async function loadHistory(id: string) {
+  const ul = document.querySelector<HTMLElement>(`[data-history="${id}"]`);
+  if (!ul || ul.dataset.loaded) return;
+  const chain = id.replace(/^chain-/, '');
+  const d = deposits[id];
+  if (!d?.address && chain !== 'near') {
+    ul.innerHTML = '<li class="muted small">Loading…</li>';
+    await until(async () => deposits[id]?.address, 20000);
+  }
+  const addr = deposits[id]?.address ?? '';
+  const explorer = deposits[id]?.explorer;
+  const more = explorer ? `<li class="small"><a target="_blank" rel="noopener" href="${esc(explorer)}">Everything on the explorer ›</a></li>` : '';
+  if (!hasHistory(chain)) {
+    ul.innerHTML = explorer ? `<li class="muted small">This chain's history is on its explorer.</li>${more}` : '<li class="muted small">No history source for this chain yet.</li>';
+    ul.dataset.loaded = '1';
+    return;
+  }
+  ul.innerHTML = '<li class="muted small">Loading…</li>';
+  try {
+    const items = await history(chain, addr, wallet);
+    ul.dataset.loaded = '1';
+    ul.innerHTML = (items.length
+      ? items.map((t) => `<li class="hist"><div class="row between"><span>${esc(t.label)}${t.ok === false ? ' <span class="pill bad">failed</span>' : ''}</span><a class="small mono" target="_blank" rel="noopener" href="${esc(t.link)}">${esc(t.hash.slice(0, 8))}…</a></div>${t.time ? `<div class="small muted">${esc(new Date(t.time).toLocaleString())}</div>` : ''}</li>`).join('')
+      : '<li class="muted small">Nothing yet.</li>') + more;
+  } catch {
+    ul.innerHTML = `<li class="muted small">History is unavailable right now.</li>${more}`;
+  }
+}
+
+const ICON_ASSETS = `<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="6" width="18" height="13" rx="3" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M3 10h18M16 14.5h2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>`;
+const ICON_SWAP = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 4v13M7 17l-3-3M7 17l3-3M17 20V7M17 7l-3 3M17 7l3 3" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+const ICON_AGENTS = `<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="8" width="14" height="11" rx="3" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M12 8V5M9.5 13h.01M14.5 13h.01M9 16.5h6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><circle cx="12" cy="4" r="1.2" fill="currentColor"/></svg>`;
+
+const HL_CARD = `<section class="card" id="hl-card" hidden>
+      <div class="row between"><h2>Hyperliquid</h2><span class="pill">testnet</span></div>
+      <div class="row between"><span>Spot USDC</span><b id="hl-spot">–</b></div>
+      <div class="row between"><span>Perps (margin for agents)</span><b id="hl-perps">–</b></div>
+      <div class="row end"><button class="secondary small-btn" id="hl-move">Move to perps</button></div>
+    </section>`;
 
 /** What each EVM chain holds, for the Send form. */
 type Held = { symbol: string; token: string; decimals: number; balance: string };
@@ -877,6 +987,66 @@ async function moveCard() {
   document.getElementById('move')!.onclick = () => confirm(core.extension_move_message(cfg.chain_id, wallet, nonce(), createdAt(), cfg.extension, JSON.stringify(old)));
 }
 
+const HL_API = 'https://api.hyperliquid-testnet.xyz';
+const hlInfo = (type: string, user: string) => post(`${HL_API}/info`, { type, user });
+
+/** The account's Hyperliquid balances (same address as on every EVM
+ *  chain), and moving USDC from spot to perps, where agents' orders draw
+ *  margin. Money sent to the account on Hyperliquid lands in spot. */
+async function hlCard() {
+  const addr = await evmAddress();
+  const [spot, perps] = await Promise.all([hlInfo('spotClearinghouseState', addr), hlInfo('clearinghouseState', addr)]);
+  const usdc = spot.balances?.find((b: any) => b.coin === 'USDC');
+  const spotTotal = usdc ? Number(usdc.total) - Number(usdc.hold) : 0;
+  const card = document.getElementById('hl-card');
+  if (!card) return;
+  if (!usdc && Number(perps.marginSummary?.accountValue ?? 0) === 0) return; // nothing on Hyperliquid
+  card.hidden = false;
+  document.getElementById('hl-spot')!.textContent = `${spotTotal.toFixed(2)} USDC`;
+  document.getElementById('hl-perps')!.textContent = `${Number(perps.marginSummary?.accountValue ?? 0).toFixed(2)} USDC`;
+  const btn = document.getElementById('hl-move') as HTMLButtonElement;
+  btn.disabled = spotTotal <= 0 || document.body.classList.contains('readonly');
+  btn.onclick = () => {
+    const m = document.getElementById('modal')!;
+    m.innerHTML = `
+      <div class="backdrop"><form class="card sheet" id="send">
+        <h2>Move to perps</h2>
+        <p class="small muted">Spot ${esc(spotTotal.toFixed(2))} USDC. Agents trade perps with this as margin, within the limits you gave them.</p>
+        <label>Amount (USDC) <input name="amount" required inputmode="decimal" value="${esc(String(Math.floor(spotTotal)))}"></label>
+        <div class="row end"><button type="button" class="secondary" id="cancel">Cancel</button><button class="primary">Review</button></div>
+        <div id="status" class="status"></div>
+      </form></div>`;
+    document.getElementById('cancel')!.onclick = () => (m.innerHTML = '');
+    (document.getElementById('send') as HTMLFormElement).onsubmit = (ev) => {
+      ev.preventDefault();
+      try {
+        // Hyperliquid's amount string: plain digits, no trailing zeros.
+        const amount = String(Number(String(new FormData(ev.target as HTMLFormElement).get('amount')).trim()));
+        const nonce = Date.now();
+        const msg = core.owner_hl_transfer_message(cfg.chain_id, wallet, nonce32(), createdAt(), cfg.signer, amount, true, BigInt(nonce));
+        confirm(msg, {
+          hlTransfer: { amount, to_perp: true, nonce },
+          after: async (out) => {
+            if (!out.mpc_signature) throw new Error('No signature came back');
+            const sig = out.mpc_signature as any;
+            const N = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n;
+            let sv = BigInt('0x' + sig.s.scalar);
+            let v = sig.recovery_id;
+            if (sv > N / 2n) { sv = N - sv; v ^= 1; }
+            const signature = { r: '0x' + sig.big_r.affine_point.slice(2), s: '0x' + sv.toString(16).padStart(64, '0'), v: 27 + v };
+            const action = JSON.parse(core.hl_transfer_action(amount, true, BigInt(nonce)));
+            const r = await post(`${HL_API}/exchange`, { action, nonce, signature });
+            if (r.status !== 'ok') throw new Error(`Hyperliquid: ${typeof r.response === 'string' ? r.response : JSON.stringify(r)}`);
+            return `Moved ${esc(amount)} USDC to perps on Hyperliquid testnet.`;
+          },
+        });
+      } catch (e) {
+        status(String((e as Error).message ?? e), 'error');
+      }
+    };
+  };
+}
+
 type IntentsToken = { asset: string; symbol: string; chain: string; decimals: number; price: number };
 
 /** The Swap card: a dry NEAR Intents quote (1Click, through the relayer,
@@ -925,44 +1095,69 @@ function swapCard() {
 }
 
 async function dashboard() {
+  const all: [string, string][] = [['chain-near', 'NEAR'], ...EVM_CHAINS.map((c) => [`chain-${c.id}`, c.name] as [string, string]), ...OTHER_CHAINS.map((c) => [`chain-${c.id}`, c.name] as [string, string])];
   render(`
-    <section class="card">
-      <div class="row between"><h1>Balances</h1><span class="pill">${esc(cfg.chain_id === 'mainnet' ? 'Mainnet' : 'Testnet')}</span></div>
-      <ul class="list chains">${chainRow('chain-near', 'NEAR')}${EVM_CHAINS.map((c) => chainRow(`chain-${c.id}`, c.name)).join('')}${OTHER_CHAINS.map((c) => chainRow(`chain-${c.id}`, c.name)).join('')}</ul>
-      <div id="status" class="status"></div>
+    <div id="status" class="status notice"></div>
+    <section class="view" data-view="home">
+      <div class="card account-card">
+        <div class="small muted">Your account · ${esc(cfg.chain_id === 'mainnet' ? 'Mainnet' : 'Testnet')}</div>
+        <div class="acct-name" id="acct-name">${esc(short(wallet))}</div>
+        <div class="small muted">One passkey, ${all.length} chains.</div>
+      </div>
+      <nav class="tiles3">
+        <a class="tile" href="#/assets"><span class="tile-ic">${ICON_ASSETS}</span><b>Assets</b><span class="small muted">${all.length} chains</span></a>
+        <a class="tile" href="#/swap"><span class="tile-ic">${ICON_SWAP}</span><b>Swap</b><span class="small muted">NEAR Intents</span></a>
+        <a class="tile" href="#/agents"><span class="tile-ic">${ICON_AGENTS}</span><b>Apps &amp; agents</b><span class="small muted" id="agents-note">Limits you set</span></a>
+      </nav>
+      <a class="card alert" id="pending-alert" href="#/agents" hidden><b>Waiting for you</b><span class="small" id="pending-alert-text"></span></a>
+      <section class="card" id="move-card" hidden>
+        <h2>Update available</h2>
+        <p class="small">A newer Marvii extension gives agents more venues (Uniswap, Aave, Hyperliquid) within limits you set. One tap moves your account to it; the address and funds stay the same. Agents added before need adding again.</p>
+        <div class="row end"><button class="primary" id="move">Update with passkey</button></div>
+      </section>
     </section>
-    <section class="card" id="move-card" hidden>
-      <h2>Update available</h2>
-      <p class="small">A newer Marvii extension lets agents trade on Hyperliquid within limits you set. One tap moves your account to it; the address and funds stay the same. Agents added before need adding again.</p>
-      <div class="row end"><button class="primary" id="move">Update with passkey</button></div>
+    <section class="view" data-view="assets">
+      <a class="back" href="#/">‹ Home</a>
+      <div class="row between"><h1>Assets</h1><span class="pill">${esc(cfg.chain_id === 'mainnet' ? 'Mainnet' : 'Testnet')}</span></div>
+      <div class="chain-grid">${all.map(([id, n]) => chainTile(id, n)).join('')}</div>
     </section>
-    <section class="card" id="swap-card">
-      <div class="row between"><h2>Swap</h2><span class="pill">NEAR Intents · mainnet quote</span></div>
-      <form id="swap" class="stack">
-        <div class="row"><label class="grow">From <select name="from"></select></label><label class="grow">To <select name="to"></select></label></div>
-        <label>Amount <input name="amount" required inputmode="decimal" placeholder="0.0"></label>
-        <div class="row end"><button class="secondary">Get quote</button></div>
-        <div id="swap-out" class="small"></div>
-      </form>
-      <p class="muted small">Live prices from NEAR Intents' solvers, between balances held in NEAR Intents by this account. Quote only: Intents runs on mainnet, and this testnet wallet never deposits.</p>
+    ${all.map(([id, n]) => chainView(id, n)).join('')}
+    <section class="view" data-view="swap">
+      <a class="back" href="#/">‹ Home</a>
+      <section class="card" id="swap-card">
+        <div class="row between"><h1>Swap</h1><span class="pill">NEAR Intents · mainnet quote</span></div>
+        <form id="swap" class="stack">
+          <div class="row"><label class="grow">From <select name="from"></select></label><label class="grow">To <select name="to"></select></label></div>
+          <label>Amount <input name="amount" required inputmode="decimal" placeholder="0.0"></label>
+          <div class="row end"><button class="primary">Get quote</button></div>
+          <div id="swap-out" class="small"></div>
+        </form>
+        <p class="muted small">Live prices from NEAR Intents' solvers, between balances held in NEAR Intents by this account. Quote only: Intents runs on mainnet, and this testnet wallet never deposits.</p>
+      </section>
     </section>
-    <section class="card" id="pending-card" hidden>
-      <h2>Waiting for you</h2>
-      <p class="muted small">Requests outside an agent's limits. Nothing happens unless you approve.</p>
-      <ul id="pending" class="list"></ul>
-    </section>
-    <section class="card" id="queued-card" hidden>
-      <h2>Queued</h2>
-      <p class="muted small">New recipients or contracts an agent asked for. Each runs only after its wait, unless you cancel it.</p>
-      <ul id="queued" class="list"></ul>
-    </section>
-    <section class="card">
-      <div class="row between"><h2>Agents and Apps</h2><button id="add" class="secondary">Add</button></div>
-      <ul id="sessions" class="list"><li class="muted">Loading…</li></ul>
+    <section class="view" data-view="agents">
+      <a class="back" href="#/">‹ Home</a>
+      <section class="card" id="pending-card" hidden>
+        <h2>Waiting for you</h2>
+        <p class="muted small">Requests outside an agent's limits. Nothing happens unless you approve.</p>
+        <ul id="pending" class="list"></ul>
+      </section>
+      <section class="card" id="queued-card" hidden>
+        <h2>Queued</h2>
+        <p class="muted small">New recipients or contracts an agent asked for. Each runs only after its wait, unless you cancel it.</p>
+        <ul id="queued" class="list"></ul>
+      </section>
+      <section class="card">
+        <div class="row between"><h1>Apps &amp; agents</h1><button id="add" class="primary">Add</button></div>
+        <p class="muted small">Each gets a key that NEAR checks on every request: which venues, how much a day, until when. Revoke any of them instantly.</p>
+        <ul id="sessions" class="list"><li class="muted">Loading…</li></ul>
+      </section>
     </section>
     <div id="modal"></div>`);
+  route();
   document.getElementById('add')!.onclick = grantForm;
   swapCard();
+  hlCard().catch(() => {});
   if (!document.body.classList.contains('readonly')) moveCard().catch(() => {});
   app.onclick = (e) => {
     const b = (e.target as HTMLElement).closest<HTMLElement>('[data-copy]');
@@ -1035,6 +1230,10 @@ function explainAction(json: string): string {
   const a = JSON.parse(json);
   if (a.type === 'evm_tx') return explainEvm(JSON.parse(core.describe_evm_tx(JSON.stringify(a.tx))));
   if (a.type === 'near_call') return `Call ${esc(a.method)} on ${esc(a.receiver_id)} with ${formatNear(a.deposit)} NEAR`;
+  if (a.type === 'utxo_pay' && PAY_CHAINS[a.chain]) {
+    const pays = a.outputs.map((o: any) => `${esc(fmtUnits(BigInt(o.value), 8, 8))} ${PAY_CHAINS[a.chain]} to ${copyable(core.utxo_address(a.chain, o.script))}`).join(', ');
+    return `Pay on ${esc(PAY_NAMES[a.chain])}: ${pays} (outputs include any change back to you)`;
+  }
   return `<span class="error">Unrecognised action</span>`;
 }
 
@@ -1076,6 +1275,9 @@ function explainEvm(d: EvmDescribed): string {
     case 'erc20_approve': return `Allow ${named(d.chain_id, c.spender)} to take up to ${amount(d.chain_id, c.token, c.amount)} ${on}`;
     case 'erc20_transfer': return `Send ${amount(d.chain_id, c.token, c.amount)} to <span class="mono">${esc(c.recipient)}</span> ${on}`;
     case 'aave_supply': return `Supply ${amount(d.chain_id, c.asset, c.amount)} to ${named(d.chain_id, c.pool)} for <span class="mono">${esc(c.on_behalf_of)}</span> ${on}`;
+    case 'aave_withdraw': return `Withdraw ${amount(d.chain_id, c.asset, c.amount)} from ${named(d.chain_id, c.pool)} to <span class="mono">${esc(c.to)}</span> ${on}`;
+    case 'aave_repay': return `Repay ${amount(d.chain_id, c.asset, c.amount)} to ${named(d.chain_id, c.pool)} for <span class="mono">${esc(c.on_behalf_of)}</span> ${on}`;
+    case 'uniswap_swap': return `Swap ${amount(d.chain_id, c.token_in, c.amount_in)} for at least ${amount(d.chain_id, c.token_out, c.min_out)} on ${named(d.chain_id, c.router)}, to <span class="mono">${esc(c.recipient)}</span> ${on}`;
     case 'native_transfer': return `Send ${esc(d.value)} wei to <span class="mono">${esc(d.to)}</span> ${on}`;
     default: return `<span class="error">Unrecognised call ${esc(c.selector)} to ${esc(c.contract)} ${on}</span>`;
   }
@@ -1085,6 +1287,11 @@ async function loadPending() {
   const items = (await relayer<Pending[]>(`/pending?wallet=${encodeURIComponent(wallet)}`).catch(() => [] as Pending[])).filter((p) => p.status === 'pending');
   const card = document.getElementById('pending-card')!;
   card.hidden = !items.length;
+  const alert = document.getElementById('pending-alert');
+  if (alert) {
+    alert.hidden = !items.length;
+    document.getElementById('pending-alert-text')!.textContent = `${items.length} request${items.length === 1 ? '' : 's'} from your agents need${items.length === 1 ? 's' : ''} your approval.`;
+  }
   const ul = document.getElementById('pending')!;
   ul.innerHTML = items
     .map((p) => {
@@ -1123,6 +1330,9 @@ async function loadSessions() {
     return;
   }
   const now = Date.now();
+  const active = rows.filter(([, s]) => !s.revoked && now < s.grant.expires_at_ms && now < s.last_used_ms + s.grant.inactivity_ms).length;
+  const note = document.getElementById('agents-note');
+  if (note) note.textContent = `${active} active`;
   ul.innerHTML = rows
     .map(([k, s]) => {
       const expired = now >= s.grant.expires_at_ms || now >= s.last_used_ms + s.grant.inactivity_ms;
@@ -1133,9 +1343,10 @@ async function loadSessions() {
         return `${capWords(c.asset, c.daily)} a day`;
       }).join(', ') || 'no spending';
       const venues = [
-        ...s.grant.evm_venues.map((v) => `${v.selector === '0x617ba037' ? 'supply on ' : `function ${esc(v.selector)} on `}${named(v.chain_id, v.to)}, ${esc(chainName(v.chain_id))}`),
+        ...s.grant.evm_venues.map((v) => `${esc(fnName(v.selector))} on ${named(v.chain_id, v.to)}, ${esc(chainName(v.chain_id))}`),
         ...s.grant.near_venues.map((v) => `${esc(v.receiver_id)}.${esc(v.method)}`),
         ...(s.grant.hl_markets ?? []).map((m) => `Hyperliquid ${esc(hlName(m.asset))} up to ${esc(m.max_leverage)}x`),
+        ...((s.grant as any).utxo ?? []).map((u: any) => `payments on ${esc(PAY_NAMES[u.chain] ?? u.chain)} to ${u.recipients.map((r: string) => esc(short(core.utxo_address(u.chain, r)))).join(', ') || 'no one'}`),
       ].join('; ') || 'none';
       return `<li class="session">
         <div class="row between"><b>${esc(s.grant.label)}</b> ${state}</div>
@@ -1167,7 +1378,11 @@ function grantForm() {
         <label>Lasts (days) <input name="days" type="number" min="1" max="90" value="7"></label>
         <label>Stops if unused for (days) <input name="idle" type="number" min="1" max="90" value="3"></label>
       </div>
-      <fieldset><legend>Allowed contract on an EVM chain</legend>
+      <fieldset><legend>Venues on Base Sepolia</legend>
+        ${VENUES.map((v) => `<label class="row check"><input type="checkbox" name="venue" value="${v.id}" style="width:auto"${v.id === 'aave' ? ' checked' : ''}> <span><b>${esc(v.name)}</b> <span class="muted small">${esc(v.what)}</span></span></label>`).join('')}
+        <p class="small muted">Whatever these return (deposits, withdrawals, swap output) always goes to your own account; the extension refuses anything else.</p>
+      </fieldset>
+      <fieldset><legend>Another contract (optional)</legend>
         <div class="grid2">
           <label>Chain ID <input name="chain_id" type="number" value="84532"></label>
           <label>Function selector <input name="selector" placeholder="0x617ba037" pattern="0x[0-9a-fA-F]{8}" class="mono"></label>
@@ -1185,6 +1400,14 @@ function grantForm() {
           <label>Most leverage <input name="hl_lev" type="number" min="1" max="50" value="5"></label>
         </div>
         <label>Most order value per day (USD) <input name="hl_daily" inputmode="decimal" value="100"></label>
+      </fieldset>
+      <fieldset><legend>Payments on Bitcoin-style chains</legend>
+        <div class="grid2">
+          <label>Chain <select name="pay_chain"><option value="">None</option>${Object.entries(PAY_NAMES).map(([k, n]) => `<option value="${k}">${n}</option>`).join('')}</select></label>
+          <label>Most per day, fees included <input name="pay_daily" inputmode="decimal" placeholder="0.001"></label>
+        </div>
+        <label>Who it may pay (addresses, comma-separated) <input name="pay_to" class="mono" placeholder="tb1q…"></label>
+        <p class="small muted">Change always comes back to your account. Dogecoin isn't offered: its signatures don't cover amounts, so fees couldn't be capped.</p>
       </fieldset>
       <label class="row"><input type="checkbox" name="queue" style="width:auto"> Let it propose new recipients and contracts; they wait <span id="delay">the delay</span> and you can cancel</label>
       <p class="muted small">Otherwise the extension refuses anything else: other contracts, other functions, other recipients, or more than the cap.</p>
@@ -1206,13 +1429,29 @@ function grantForm() {
       expires_at_ms: now + Number(g('days')) * 86_400_000,
       inactivity_ms: Number(g('idle')) * 86_400_000,
       near_venues: [],
-      evm_venues: g('to') && g('selector') ? [{ chain_id: chain, to: g('to').toLowerCase(), selector: g('selector').toLowerCase() }] : [],
+      evm_venues: [
+        ...VENUES.filter((v) => f.getAll('venue').includes(v.id)).flatMap((v) => v.selectors.map((selector) => ({ chain_id: v.chain, to: v.to, selector }))),
+        ...(g('to') && g('selector') ? [{ chain_id: chain, to: g('to').toLowerCase(), selector: g('selector').toLowerCase() }] : []),
+      ],
       near_recipients: [],
       evm_recipients: [],
       caps: [{ asset: g('token') ? `evm:${chain}:${g('token').toLowerCase()}` : `evm:${chain}`, daily: g('daily') }],
       queue_new_targets: f.get('queue') === 'on',
       hl_markets: [] as { asset: number; max_leverage: number }[],
+      // The account's own EVM address: venue results must go here.
+      evm_self: evmAddr ? evmAddr.toLowerCase() : undefined,
     };
+    const payChain = g('pay_chain');
+    if (payChain) {
+      const own = utxoAccounts[payChain]?.address ?? legacyAccounts[payChain]?.address;
+      if (!own) {
+        alert('Your address on that chain is still loading. Try again in a moment.');
+        return;
+      }
+      const recipients = g('pay_to').split(',').map((x) => x.trim()).filter(Boolean).map((a) => core.utxo_script(payChain, a));
+      (grant as any).utxo = [{ chain: payChain, self_script: core.utxo_script(payChain, own), recipients }];
+      grant.caps.push({ asset: `utxo:${payChain}`, daily: toUnits(g('pay_daily') || '0', 8) });
+    }
     if (f.get('hl') === 'on') {
       grant.hl_markets.push({ asset: Number(g('hl_asset')), max_leverage: Number(g('hl_lev')) });
       grant.caps.push({ asset: 'hyperliquid:usd', daily: toUnits(g('hl_daily'), 6) });
@@ -1245,14 +1484,14 @@ type Described = {
 
 /** Plain words for a call, worked out from the decoded arguments. */
 function explain(receiver: string, a: Described['external'][0]['actions'][0], ctx: SignCtx = {}): string {
-  const { tx, solMessage, btcPlan, tronRaw, xrpTx, legacyPlan, adaPlan } = ctx;
+  const { tx, solMessage, btcPlan, tronRaw, xrpTx, legacyPlan, adaPlan, hlTransfer } = ctx;
   if (a.kind === 'transfer') return `<b>Approve:</b> Send <b>${formatNear(a.amount_yocto!)} NEAR</b> to ${receiver.length > 32 ? copyable(receiver) : copyableName(receiver)} on NEAR`;
   if (a.kind !== 'function_call') return `<span class="error">Unrecognised action: ${esc(JSON.stringify(a))}</span>`;
   const ours = receiver === cfg.extension;
   if (ours && a.method === 'grant_session') {
     const g = a.args.grant;
     const venues = [
-      ...g.evm_venues.map((v: any) => `call function ${esc(v.selector)} on ${esc(v.to)} (chain ${esc(v.chain_id)})`),
+      ...g.evm_venues.map((v: any) => `${esc(fnName(v.selector))} on ${POOLS[`${v.chain_id}:${String(v.to).toLowerCase()}`] ? `<b>${esc(POOLS[`${v.chain_id}:${String(v.to).toLowerCase()}`])}</b>` : esc(v.to)} (${esc(chainName(v.chain_id))})`),
       ...g.near_venues.map((v: any) => `call ${esc(v.method)} on ${esc(v.receiver_id)}`),
     ];
     const pays = [...g.evm_recipients, ...g.near_recipients].map(esc);
@@ -1261,6 +1500,8 @@ function explain(receiver: string, a: Described['external'][0]['actions'][0], ct
         <li>Agent key <span class="mono">${esc(g.public_key.slice(0, 16))}…</span></li>
         <li>May ${venues.length ? venues.join('; ') : 'call nothing'}</li>
         <li>May pay ${pays.length ? pays.join(', ') : 'no one directly'}</li>
+        ${g.evm_self ? `<li>Results of those calls go only to your account ${copyable(g.evm_self)}</li>` : ''}
+        ${(g.utxo ?? []).map((u: any) => `<li>May pay on <b>${esc(PAY_NAMES[u.chain] ?? u.chain)}</b>: ${u.recipients.length ? u.recipients.map((r: string) => copyable(core.utxo_address(u.chain, r))).join(', ') : 'no one directly'}; change only to ${copyable(core.utxo_address(u.chain, u.self_script))}</li>`).join('')}
         ${(g.hl_markets ?? []).map((m: any) => `<li>May trade <b>${esc(hlName(m.asset))}</b> on Hyperliquid testnet, at most <b>${esc(m.max_leverage)}x</b> leverage, signed by your account's EVM address</li>`).join('')}
         <li>At most ${g.caps.map((c: any) => capWords(c.asset, c.daily)).join(', ')} a day</li>
         <li>Until ${esc(new Date(g.expires_at_ms).toLocaleString())}, or after ${esc(Math.round(g.inactivity_ms / 86_400_000))} days unused</li>
@@ -1326,6 +1567,12 @@ function explain(receiver: string, a: Described['external'][0]['actions'][0], ct
       const d = JSON.parse(core.describe_solana_message(solMessage));
       return `<b>Approve:</b> Send <b>${esc(fmtUnits(BigInt(d.lamports), 9))} SOL</b> to ${copyable(d.to)} on Solana`;
     }
+    if (hlTransfer) {
+      // Hyperliquid spot↔perps: the digest is rebuilt here from the fields.
+      const h = core.hl_transfer_hash(hlTransfer.amount, hlTransfer.to_perp, BigInt(hlTransfer.nonce));
+      if (req?.path !== 'evm' || req.domain_id !== 0 || req.payload_v2?.Ecdsa !== h) throw new Error('The signature request does not match the transfer shown');
+      return `<b>Approve:</b> Move <b>${esc(hlTransfer.amount)} USDC</b> from ${hlTransfer.to_perp ? 'spot to perps' : 'perps to spot'} on Hyperliquid testnet<div class="small muted">Within your own Hyperliquid account; nothing leaves it.</div>`;
+    }
     if (!tx) return `<span class="error">A signature request with no transaction to show. Don't approve.</span>`;
     const d: EvmDescribed = JSON.parse(core.describe_evm_tx(tx));
     if (req?.path !== 'evm' || req?.payload_v2?.Ecdsa !== d.hash || req?.domain_id !== 0) {
@@ -1343,7 +1590,7 @@ function explain(receiver: string, a: Described['external'][0]['actions'][0], ct
 
 /** What a Confirm sheet decodes alongside the message: the transaction each
  *  signature request must match. */
-type SignCtx = { tx?: string; solMessage?: string; btcPlan?: string; tronRaw?: string; xrpTx?: string; legacyPlan?: string; adaPlan?: string };
+type SignCtx = { tx?: string; solMessage?: string; btcPlan?: string; tronRaw?: string; xrpTx?: string; legacyPlan?: string; adaPlan?: string; hlTransfer?: { amount: string; to_perp: boolean; nonce: number } };
 
 function confirm(msgJson: string, ctx: SignCtx & { pendingId?: number; after?: (out: Outcome & { mpc_signature?: unknown }) => Promise<string> } = {}) {
   const msg = core.normalize_request(msgJson);

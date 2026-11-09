@@ -35,7 +35,7 @@ page.on('pageerror', (e) => console.log('page error:', e.message));
 
 await page.goto(PAGE);
 await page.click('#create');
-await page.waitForSelector('text=Balances', { timeout: 120_000 });
+await page.waitForSelector('.tiles3', { timeout: 120_000 });
 await page.waitForSelector('#chain-near [data-copy]', { state: 'attached', timeout: 60_000 });
 const wallet = await page.getAttribute('#chain-near [data-copy]', 'data-copy');
 console.log('NEAR account', wallet, 'balance', await page.textContent('#chain-near .bal'));
@@ -43,6 +43,7 @@ await page.waitForSelector('#chain-84532 [data-copy]', { state: 'attached', time
 console.log('EVM address (every EVM chain)', await page.getAttribute('#chain-84532 [data-copy]', 'data-copy'));
 
 // Grant: approve to the pool only, up to 50 USDC a day.
+await page.evaluate(() => (location.hash = '#/agents'));
 await page.click('#add');
 await page.fill('input[name=public_key]', agentPk);
 await page.fill('input[name=to]', POOL);

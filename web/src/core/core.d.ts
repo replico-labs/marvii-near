@@ -143,6 +143,16 @@ export function evm_signed_tx(tx_json: string, mpc_signature_json: string): stri
 export function extension_move_message(chain_id: string, wallet: string, nonce: number, created_at_secs: bigint, add: string, remove_json: string): string;
 
 /**
+ * The exact action Hyperliquid receives, for the page to send.
+ */
+export function hl_transfer_action(amount: string, to_perp: boolean, nonce: bigint): string;
+
+/**
+ * The EIP-712 digest of a spot↔perps USDC transfer on Hyperliquid testnet.
+ */
+export function hl_transfer_hash(amount: string, to_perp: boolean, nonce: bigint): string;
+
+/**
  * Plans a send on Dogecoin, Bitcoin Cash or Zcash: coins largest first
  * (at most 6), change back to `from` unless it's dust. `fee_rate` is per
  * byte (Dogecoin, Bitcoin Cash); Zcash's fee is ZIP-317's, 5,000 zatoshis
@@ -197,6 +207,12 @@ export function owner_eddsa_sign_message(chain_id: string, wallet: string, nonce
 export function owner_evm_sign_message(chain_id: string, wallet: string, nonce: number, created_at_secs: bigint, signer: string, tx_json: string): string;
 
 /**
+ * The passkey's request: the wallet asks the MPC signer to sign that
+ * digest with its EVM key (path `evm`).
+ */
+export function owner_hl_transfer_message(chain_id: string, wallet: string, nonce: number, created_at_secs: bigint, signer: string, amount: string, to_perp: boolean, hl_nonce: bigint): string;
+
+/**
  * The 32 bytes the passkey signs as its WebAuthn challenge:
  * `SHA3-256("NEAR_WALLET_CONTRACT/V1" || borsh(msg))`, as hex.
  */
@@ -233,6 +249,19 @@ export function tron_signed_tx(raw_hex: string, mpc_signature_json: string, from
  * `{ raw_hex, txid }`, where txid = sha256(raw) is what gets signed.
  */
 export function tron_transfer_raw(from: string, to: string, amount_sun: string, ref_block_bytes_hex: string, ref_block_hash_hex: string, expiration_ms: bigint, timestamp_ms: bigint): string;
+
+/**
+ * The testnet address an output script pays, for showing agent payment
+ * grants and requests in words. Refuses scripts that aren't standard.
+ */
+export function utxo_address(chain: string, script_hex: string): string;
+
+/**
+ * The output script (hex) for a testnet address on any Bitcoin-family
+ * chain here (SegWit too, for Bitcoin and Litecoin): what agent payment
+ * grants and requests carry.
+ */
+export function utxo_script(chain: string, address: string): string;
 
 /**
  * Checks a proof against a public key and message, with the wallet's own
@@ -286,6 +315,8 @@ export interface InitOutput {
     readonly evm_send_tx: (a: bigint, b: bigint, c: number, d: number, e: number, f: number, g: bigint, h: number, i: number, j: number, k: number, l: number, m: number) => [number, number, number, number];
     readonly evm_signed_tx: (a: number, b: number, c: number, d: number) => [number, number, number, number];
     readonly extension_move_message: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number, h: number, i: number, j: number) => [number, number, number, number];
+    readonly hl_transfer_action: (a: number, b: number, c: number, d: bigint) => [number, number, number, number];
+    readonly hl_transfer_hash: (a: number, b: number, c: number, d: bigint) => [number, number, number, number];
     readonly legacy_plan: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number) => [number, number, number, number];
     readonly legacy_script_pubkey: (a: number, b: number, c: number, d: number) => [number, number, number, number];
     readonly legacy_signed_tx: (a: number, b: number, c: number, d: number) => [number, number, number, number];
@@ -294,12 +325,15 @@ export interface InitOutput {
     readonly owner_ecdsa_multi_sign_message: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number, h: number, i: number, j: number, k: number, l: number) => [number, number, number, number];
     readonly owner_eddsa_sign_message: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number, h: number, i: number, j: number, k: number, l: number) => [number, number, number, number];
     readonly owner_evm_sign_message: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number, h: number, i: number, j: number) => [number, number, number, number];
+    readonly owner_hl_transfer_message: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number, h: number, i: number, j: number, k: number, l: bigint) => [number, number, number, number];
     readonly request_hash: (a: number, b: number) => [number, number, number, number];
     readonly solana_signed_tx: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
     readonly solana_transfer_message: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => [number, number, number, number];
     readonly transfer_message: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number, h: number, i: number, j: number) => [number, number, number, number];
     readonly tron_signed_tx: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
     readonly tron_transfer_raw: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: bigint, l: bigint) => [number, number, number, number];
+    readonly utxo_address: (a: number, b: number, c: number, d: number) => [number, number, number, number];
+    readonly utxo_script: (a: number, b: number, c: number, d: number) => [number, number, number, number];
     readonly verify_proof: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number];
     readonly wallet_account_id: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
     readonly xrp_payment: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number) => [number, number, number, number];

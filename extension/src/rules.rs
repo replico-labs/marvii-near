@@ -3,6 +3,7 @@
 
 use crate::evm::{self, Decoded, Eip1559};
 use crate::hl;
+use crate::utxo;
 use near_sdk::{AccountId, NearToken, json_types::U128, near};
 
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
@@ -31,6 +32,18 @@ pub struct EvmVenue {
 pub struct HlMarket {
     pub asset: u32,
     pub max_leverage: u32,
+}
+
+/// Payments on a payment-only chain (Bitcoin, Litecoin, Bitcoin Cash,
+/// Zcash): the account's own output script (for change) and the scripts the
+/// agent may pay, all hex. Caps use the asset `utxo:<chain>`, counted as
+/// everything that leaves the account, fee included.
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UtxoGrant {
+    pub chain: String,
+    pub self_script: String,
+    pub recipients: Vec<String>,
 }
 
 /// The cap asset for Hyperliquid orders: their value, price × size, in
@@ -75,6 +88,14 @@ pub struct Grant {
     /// against the `hyperliquid:usd` cap.
     #[serde(default)]
     pub hl_markets: Vec<HlMarket>,
+    /// The account's own EVM address (from Chain Signatures, path `evm`),
+    /// as the passkey saw it. Venue calls with a known layout (Aave supply,
+    /// withdraw, repay; Uniswap swaps) must send their result here.
+    #[serde(default)]
+    pub evm_self: Option<String>,
+    /// Payment-only chains the agent may pay on.
+    #[serde(default)]
+    pub utxo: Vec<UtxoGrant>,
 }
 
 #[near(serializers = [borsh, json])]
@@ -137,6 +158,34 @@ pub enum Action {
     HlCancel { asset: u32, oid: u64, nonce: u64 },
     /// Sets the leverage on a Hyperliquid market.
     HlLeverage { asset: u32, is_cross: bool, leverage: u32, nonce: u64 },
+    /// A payment on a payment-only chain: the coins spent and every output.
+    /// Zcash also takes its consensus branch ID and expiry height.
+    UtxoPay {
+        chain: String,
+        inputs: Vec<UtxoIn>,
+        outputs: Vec<UtxoOut>,
+        #[serde(default)]
+        branch_id: u32,
+        #[serde(default)]
+        expiry_height: u32,
+    },
+}
+
+#[near(serializers = [json])]
+#[derive(Clone, Debug)]
+pub struct UtxoIn {
+    /// As explorers show it, hex.
+    pub txid: String,
+    pub vout: u32,
+    pub value: u64,
+}
+
+#[near(serializers = [json])]
+#[derive(Clone, Debug)]
+pub struct UtxoOut {
+    /// The output script, hex.
+    pub script: String,
+    pub value: u64,
 }
 
 /// How far a Hyperliquid nonce (a timestamp) may be from the block time:
@@ -175,6 +224,8 @@ impl EvmTx {
 pub enum Kind {
     Near { receiver_id: AccountId, method: String, args: Vec<u8>, deposit: NearToken },
     Evm { path: String, hash: [u8; 32] },
+    /// One signature per input, on the chain's own path.
+    Utxo { path: String, hashes: Vec<[u8; 32]> },
 }
 
 /// `Direct`: everything must be on the grant's lists. `Queued`: recipients
@@ -238,6 +289,30 @@ pub fn validate_grant(
         chain.parse::<u64>().map_err(|_| "bad chain id in evm recipient")?;
         evm::parse_address(addr)?;
     }
+    if let Some(a) = &g.evm_self {
+        evm::parse_address(a)?;
+    }
+    for (i, u) in g.utxo.iter().enumerate() {
+        if !utxo::CHAINS.contains(&u.chain.as_str()) {
+            return Err("agents can pay only on Bitcoin, Litecoin, Bitcoin Cash and Zcash");
+        }
+        if g.utxo[..i].iter().any(|x| x.chain == u.chain) {
+            return Err("a chain is listed twice");
+        }
+        let own = hex::decode(&u.self_script).map_err(|_| "scripts must be hex")?;
+        if !utxo::self_script_ok(&u.chain, &own) {
+            return Err("the account's own script has the wrong shape for that chain");
+        }
+        if u.recipients.len() > 16 {
+            return Err("too many recipients");
+        }
+        for r in &u.recipients {
+            let s = hex::decode(r).map_err(|_| "scripts must be hex")?;
+            if !utxo::recipient_script_ok(&u.chain, &s) || r != &r.to_lowercase() {
+                return Err("a recipient script isn't a standard lowercase script for that chain");
+            }
+        }
+    }
     for (i, m) in g.hl_markets.iter().enumerate() {
         if m.max_leverage == 0 || m.max_leverage > 50 {
             return Err("max leverage must be 1 to 50");
@@ -251,7 +326,7 @@ pub fn validate_grant(
             return Err("cap assets must be lowercase");
         }
     }
-    if g.near_venues.len() + g.evm_venues.len() + g.near_recipients.len() + g.evm_recipients.len() + g.caps.len() + g.hl_markets.len() > 64 {
+    if g.near_venues.len() + g.evm_venues.len() + g.near_recipients.len() + g.evm_recipients.len() + g.caps.len() + g.hl_markets.len() + g.utxo.len() > 64 {
         return Err("grant too large");
     }
     Ok(())
@@ -370,9 +445,65 @@ pub fn check(
                     if !queued && !g.evm_venues.iter().any(|v| v.chain_id == chain && v.to.to_lowercase() == to && v.selector.to_lowercase() == sel) {
                         return Err("not an allowed venue");
                     }
+                    // Where a venue call's result goes, for layouts we know:
+                    // always the account itself, queued or not.
+                    if let Some(b) = evm::beneficiary(&t.data)? {
+                        let own = g.evm_self.as_deref().ok_or("this grant doesn't name the account's EVM address")?;
+                        if b != evm::parse_address(own)? {
+                            return Err("venue call sends the result to someone else");
+                        }
+                    }
                 }
             }
             Plan { kind: Kind::Evm { path: EVM_PATH.to_string(), hash: t.signing_hash() }, spends }
+        }
+        Action::UtxoPay { chain, inputs, outputs, branch_id, expiry_height } => {
+            let u = g.utxo.iter().find(|u| &u.chain == chain).ok_or("payments on this chain not allowed")?;
+            if inputs.is_empty() || inputs.len() > utxo::MAX_INPUTS || outputs.is_empty() || outputs.len() > utxo::MAX_OUTPUTS {
+                return Err("1 to 2 inputs and 1 to 3 outputs");
+            }
+            if chain == "zcash" && (*branch_id == 0 || *expiry_height == 0) {
+                return Err("Zcash needs a branch ID and expiry height");
+            }
+            let own = hex::decode(&u.self_script).unwrap();
+            let mut ins = vec![];
+            let mut total_in: u64 = 0;
+            for i in inputs {
+                let txid: [u8; 32] = hex::decode(&i.txid).ok().and_then(|v| v.try_into().ok()).ok_or("txid must be 32 bytes hex")?;
+                if ins.iter().any(|x: &utxo::Input| x.txid == txid && x.vout == i.vout) {
+                    return Err("an input is listed twice");
+                }
+                total_in = total_in.checked_add(i.value).ok_or("overflow")?;
+                ins.push(utxo::Input { txid, vout: i.vout, value: i.value });
+            }
+            let mut outs = vec![];
+            let (mut total_out, mut change): (u64, u64) = (0, 0);
+            for o in outputs {
+                let script = hex::decode(&o.script).map_err(|_| "scripts must be hex")?;
+                if o.value == 0 {
+                    return Err("an output pays nothing");
+                }
+                if script == own {
+                    change = change.checked_add(o.value).ok_or("overflow")?;
+                } else {
+                    if !utxo::recipient_script_ok(chain, &script) {
+                        return Err("an output script isn't a standard script");
+                    }
+                    if !queued && !u.recipients.contains(&o.script.to_lowercase()) {
+                        return Err("recipient not allowed");
+                    }
+                }
+                total_out = total_out.checked_add(o.value).ok_or("overflow")?;
+                outs.push(utxo::Output { script, value: o.value });
+            }
+            if total_out > total_in {
+                return Err("outputs exceed inputs");
+            }
+            // What leaves the account: payments plus the fee. The digest
+            // commits to every input's amount, so these totals are real.
+            let spends = vec![(format!("utxo:{chain}"), (total_in - change) as u128)];
+            let hashes = utxo::sighashes(chain, &own, &ins, &outs, *branch_id, *expiry_height);
+            Plan { kind: Kind::Utxo { path: chain.clone(), hashes }, spends }
         }
         Action::HlOrder { .. } | Action::HlCancel { .. } | Action::HlLeverage { .. } => {
             if queued {

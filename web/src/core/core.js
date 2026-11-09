@@ -763,6 +763,66 @@ export function extension_move_message(chain_id, wallet, nonce, created_at_secs,
 }
 
 /**
+ * The exact action Hyperliquid receives, for the page to send.
+ * @param {string} amount
+ * @param {boolean} to_perp
+ * @param {bigint} nonce
+ * @returns {string}
+ */
+export function hl_transfer_action(amount, to_perp, nonce) {
+    let deferred5_0;
+    let deferred5_1;
+    try {
+        const val2 = +to_perp;
+        const val3 = BigInt.asIntN(64, nonce);
+        const ptr0 = passStringToWasm0(amount, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.hl_transfer_action(ptr0, len0, val2, val3);
+        var ptr4 = ret[0];
+        var len4 = ret[1];
+        if (ret[3]) {
+            ptr4 = 0; len4 = 0;
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        deferred5_0 = ptr4;
+        deferred5_1 = len4;
+        return getStringFromWasm0(ptr4, len4);
+    } finally {
+        wasm.__wbindgen_free(deferred5_0, deferred5_1, 1);
+    }
+}
+
+/**
+ * The EIP-712 digest of a spot↔perps USDC transfer on Hyperliquid testnet.
+ * @param {string} amount
+ * @param {boolean} to_perp
+ * @param {bigint} nonce
+ * @returns {string}
+ */
+export function hl_transfer_hash(amount, to_perp, nonce) {
+    let deferred5_0;
+    let deferred5_1;
+    try {
+        const val2 = +to_perp;
+        const val3 = BigInt.asIntN(64, nonce);
+        const ptr0 = passStringToWasm0(amount, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.hl_transfer_hash(ptr0, len0, val2, val3);
+        var ptr4 = ret[0];
+        var len4 = ret[1];
+        if (ret[3]) {
+            ptr4 = 0; len4 = 0;
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        deferred5_0 = ptr4;
+        deferred5_1 = len4;
+        return getStringFromWasm0(ptr4, len4);
+    } finally {
+        wasm.__wbindgen_free(deferred5_0, deferred5_1, 1);
+    }
+}
+
+/**
  * Plans a send on Dogecoin, Bitcoin Cash or Zcash: coins largest first
  * (at most 6), change back to `from` unless it's dust. `fee_rate` is per
  * byte (Dogecoin, Bitcoin Cash); Zcash's fee is ZIP-317's, 5,000 zatoshis
@@ -1121,6 +1181,59 @@ export function owner_evm_sign_message(chain_id, wallet, nonce, created_at_secs,
 }
 
 /**
+ * The passkey's request: the wallet asks the MPC signer to sign that
+ * digest with its EVM key (path `evm`).
+ * @param {string} chain_id
+ * @param {string} wallet
+ * @param {number} nonce
+ * @param {bigint} created_at_secs
+ * @param {string} signer
+ * @param {string} amount
+ * @param {boolean} to_perp
+ * @param {bigint} hl_nonce
+ * @returns {string}
+ */
+export function owner_hl_transfer_message(chain_id, wallet, nonce, created_at_secs, signer, amount, to_perp, hl_nonce) {
+    let deferred10_0;
+    let deferred10_1;
+    try {
+        const val5 = +nonce;
+        const val6 = BigInt.asIntN(64, created_at_secs);
+        const val7 = +to_perp;
+        const val8 = BigInt.asIntN(64, hl_nonce);
+        let ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3;
+        try {
+            ptr0 = passStringToWasm0(chain_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            len0 = WASM_VECTOR_LEN;
+            ptr1 = passStringToWasm0(wallet, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            len1 = WASM_VECTOR_LEN;
+            ptr2 = passStringToWasm0(signer, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            len2 = WASM_VECTOR_LEN;
+            ptr3 = passStringToWasm0(amount, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            len3 = WASM_VECTOR_LEN;
+        } catch (e) {
+            if (ptr3) { wasm.__wbindgen_free(ptr3, len3 * 1, 1); }
+            if (ptr2) { wasm.__wbindgen_free(ptr2, len2 * 1, 1); }
+            if (ptr1) { wasm.__wbindgen_free(ptr1, len1 * 1, 1); }
+            if (ptr0) { wasm.__wbindgen_free(ptr0, len0 * 1, 1); }
+            throw e;
+        }
+        const ret = wasm.owner_hl_transfer_message(ptr0, len0, ptr1, len1, val5, val6, ptr2, len2, ptr3, len3, val7, val8);
+        var ptr9 = ret[0];
+        var len9 = ret[1];
+        if (ret[3]) {
+            ptr9 = 0; len9 = 0;
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        deferred10_0 = ptr9;
+        deferred10_1 = len9;
+        return getStringFromWasm0(ptr9, len9);
+    } finally {
+        wasm.__wbindgen_free(deferred10_0, deferred10_1, 1);
+    }
+}
+
+/**
  * The 32 bytes the passkey signs as its WebAuthn challenge:
  * `SHA3-256("NEAR_WALLET_CONTRACT/V1" || borsh(msg))`, as hex.
  * @param {string} msg_json
@@ -1375,6 +1488,81 @@ export function tron_transfer_raw(from, to, amount_sun, ref_block_bytes_hex, ref
         return getStringFromWasm0(ptr8, len8);
     } finally {
         wasm.__wbindgen_free(deferred9_0, deferred9_1, 1);
+    }
+}
+
+/**
+ * The testnet address an output script pays, for showing agent payment
+ * grants and requests in words. Refuses scripts that aren't standard.
+ * @param {string} chain
+ * @param {string} script_hex
+ * @returns {string}
+ */
+export function utxo_address(chain, script_hex) {
+    let deferred4_0;
+    let deferred4_1;
+    try {
+        let ptr0, len0, ptr1, len1;
+        try {
+            ptr0 = passStringToWasm0(chain, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            len0 = WASM_VECTOR_LEN;
+            ptr1 = passStringToWasm0(script_hex, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            len1 = WASM_VECTOR_LEN;
+        } catch (e) {
+            if (ptr1) { wasm.__wbindgen_free(ptr1, len1 * 1, 1); }
+            if (ptr0) { wasm.__wbindgen_free(ptr0, len0 * 1, 1); }
+            throw e;
+        }
+        const ret = wasm.utxo_address(ptr0, len0, ptr1, len1);
+        var ptr3 = ret[0];
+        var len3 = ret[1];
+        if (ret[3]) {
+            ptr3 = 0; len3 = 0;
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        deferred4_0 = ptr3;
+        deferred4_1 = len3;
+        return getStringFromWasm0(ptr3, len3);
+    } finally {
+        wasm.__wbindgen_free(deferred4_0, deferred4_1, 1);
+    }
+}
+
+/**
+ * The output script (hex) for a testnet address on any Bitcoin-family
+ * chain here (SegWit too, for Bitcoin and Litecoin): what agent payment
+ * grants and requests carry.
+ * @param {string} chain
+ * @param {string} address
+ * @returns {string}
+ */
+export function utxo_script(chain, address) {
+    let deferred4_0;
+    let deferred4_1;
+    try {
+        let ptr0, len0, ptr1, len1;
+        try {
+            ptr0 = passStringToWasm0(chain, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            len0 = WASM_VECTOR_LEN;
+            ptr1 = passStringToWasm0(address, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            len1 = WASM_VECTOR_LEN;
+        } catch (e) {
+            if (ptr1) { wasm.__wbindgen_free(ptr1, len1 * 1, 1); }
+            if (ptr0) { wasm.__wbindgen_free(ptr0, len0 * 1, 1); }
+            throw e;
+        }
+        const ret = wasm.utxo_script(ptr0, len0, ptr1, len1);
+        var ptr3 = ret[0];
+        var len3 = ret[1];
+        if (ret[3]) {
+            ptr3 = 0; len3 = 0;
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        deferred4_0 = ptr3;
+        deferred4_1 = len3;
+        return getStringFromWasm0(ptr3, len3);
+    } finally {
+        wasm.__wbindgen_free(deferred4_0, deferred4_1, 1);
     }
 }
 

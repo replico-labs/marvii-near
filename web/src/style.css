@@ -73,7 +73,7 @@ pre { white-space: pre-wrap; word-break: break-all; background: var(--mv-paper);
 .status.ok { color: var(--mv-success); word-break: break-all; }
 @media (max-width: 480px) { .grid2 { grid-template-columns: 1fr; } }
 /* Read-only view: nothing that needs the passkey. */
-.readonly #add, .readonly [data-revoke], .readonly [data-approve], .readonly [data-reject], .readonly [data-cancel], .readonly [data-send], .readonly [data-name] { display: none; }
+.readonly #add, .readonly [data-revoke], .readonly [data-approve], .readonly [data-reject], .readonly [data-cancel], .readonly [data-send], .readonly [data-name], .readonly #hl-move { display: none; }
 /* Chains: native balance on the row, everything held in the dropdown. */
 .chains details summary { list-style: none; cursor: pointer; }
 .chains details summary::-webkit-details-marker { display: none; }
@@ -113,3 +113,56 @@ pre { white-space: pre-wrap; word-break: break-all; background: var(--mv-paper);
 .stack { display: grid; gap: 10px; }
 .grow { flex: 1; min-width: 130px; }
 #swap-out .row { padding: 2px 0; }
+
+/* ---- Views: one at a time ---- */
+.view { display: none; gap: 16px; }
+.view.on { display: grid; animation: mv-in .18s ease-out; }
+@keyframes mv-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+@media (prefers-reduced-motion: reduce) { .view.on { animation: none; } }
+.back { color: var(--mv-ink2); text-decoration: none; font-size: 14px; width: fit-content; padding: 4px 0; }
+.back:hover { color: var(--mv-ink); }
+
+/* Home: the account, then three big tiles. */
+.account-card { padding: 22px 20px; background: linear-gradient(135deg, color-mix(in srgb, var(--mv-iris) 10%, var(--mv-surface)), var(--mv-surface) 70%); }
+.acct-name { font-size: 22px; font-weight: 600; letter-spacing: -0.02em; margin: 4px 0; word-break: break-all; }
+.acct-name .addr { font-size: inherit; font-weight: inherit; color: var(--mv-ink); }
+.tiles3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+.tile { display: grid; gap: 6px; justify-items: start; padding: 18px 16px; border-radius: 18px; background: var(--mv-surface); border: 1px solid var(--mv-line); color: var(--mv-ink); text-decoration: none; transition: transform .12s ease, border-color .12s ease, box-shadow .12s ease; }
+.tile:hover, .tile:focus-visible { transform: translateY(-2px); border-color: color-mix(in srgb, var(--mv-iris) 45%, var(--mv-line)); box-shadow: 0 6px 18px rgb(0 0 0 / 0.06); outline: none; }
+.tile b { font-size: 16px; }
+.tile-ic { width: 40px; height: 40px; border-radius: 12px; display: grid; place-items: center; background: color-mix(in srgb, var(--mv-iris) 12%, transparent); color: var(--mv-iris); }
+.tile-ic svg { width: 22px; height: 22px; }
+@media (max-width: 480px) { .tiles3 { grid-template-columns: 1fr; } .tile { grid-template-columns: auto 1fr; align-items: center; column-gap: 12px; } .tile .tile-ic { grid-row: span 2; } }
+.alert { display: grid; gap: 2px; text-decoration: none; color: var(--mv-ink); border-color: color-mix(in srgb, var(--mv-brass) 60%, var(--mv-line)); background: color-mix(in srgb, var(--mv-brass) 10%, var(--mv-surface)); }
+
+/* Assets: a tile per chain. */
+.chain-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
+.chain-tile { display: grid; grid-template-columns: auto 1fr; grid-template-rows: auto auto; column-gap: 10px; align-items: center; padding: 14px; border-radius: 14px; background: var(--mv-surface); border: 1px solid var(--mv-line); color: var(--mv-ink); text-decoration: none; transition: transform .12s ease, border-color .12s ease; min-width: 0; }
+.chain-tile:hover, .chain-tile:focus-visible { transform: translateY(-1px); border-color: color-mix(in srgb, var(--mv-iris) 45%, var(--mv-line)); outline: none; }
+.chain-tile .coin { grid-row: span 2; width: 30px; height: 30px; }
+.chain-tile .tile-name { font-weight: 600; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.chain-tile .bal { font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* A chain's page. */
+.chain-head { display: grid; justify-items: center; text-align: center; gap: 4px; padding: 24px 20px; }
+.chain-head h1 { margin: 6px 0 0; font-size: 18px; color: var(--mv-ink2); font-weight: 500; }
+.chain-head .big { font-size: 30px; letter-spacing: -0.02em; }
+.big-coin { width: 44px; height: 44px; }
+.acts { display: flex; gap: 28px; margin-top: 14px; }
+.act { display: grid; justify-items: center; gap: 6px; background: none; border: 0; padding: 0; color: var(--mv-ink); font-size: 13px; }
+.act-ic { width: 48px; height: 48px; border-radius: 50%; display: grid; place-items: center; background: var(--mv-iris); color: #fff; transition: transform .12s ease; }
+.act:hover .act-ic { transform: scale(1.06); }
+.act:disabled .act-ic { background: var(--mv-line); color: var(--mv-ink2); }
+.act-ic svg { width: 22px; height: 22px; }
+.asset { padding: 6px 0; font-size: 16px; }
+.addr-row { border-top: 1px solid var(--mv-line); padding-top: 10px; margin-top: 4px; }
+.history .hist { font-size: 14px; }
+
+/* hidden always wins over a component's display. */
+[hidden] { display: none !important; }
+
+/* The result of the last action, above whichever view is open. */
+.notice:empty { display: none; }
+.notice { margin: 0; padding: 12px 14px; border-radius: 12px; background: var(--mv-surface); border: 1px solid var(--mv-line); }
+
+.check { display: flex; align-items: center; gap: 10px; margin: 6px 0; }

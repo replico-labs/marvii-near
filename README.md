@@ -5,8 +5,9 @@ Marvii is a passkey wallet: self-custody secured by your phone's Face ID or fing
 - **Your passkey owns the account.** It's a [`defuse-wallet`](https://github.com/near/intents) contract that checks the passkey's P-256 signature on-chain (NEAR's `p256_verify`). No server holds a key that can move your funds.
 - **One account, many chains.** The same account holds NEAR, has one address on every EVM chain, and has its own address on Bitcoin, Solana, TRON, XRP, Cardano, Litecoin, Dogecoin, Bitcoin Cash and Zcash, all signed through NEAR Chain Signatures.
 - **Agents and apps get session keys** with rules NEAR checks on every request:
-  - which contracts and functions they may call, on NEAR and every EVM chain
+  - which contracts and functions they may call, on NEAR and every EVM chain. Named venues: Aave V3 (supply, withdraw, repay) and Uniswap V3 (swap). Whatever a venue call returns goes only to the account itself; the extension decodes the call and checks
   - which Hyperliquid markets they may trade, and at what leverage
+  - on payment-only chains (Bitcoin, Litecoin, Bitcoin Cash, Zcash), who they may pay, with change only back to the account and the fee counted against the cap
   - who they may pay
   - a daily cap per asset
   - an expiry, and an inactivity expiry
@@ -32,12 +33,17 @@ All of the following ran on NEAR testnet and each chain's testnet (8–9 Novembe
 | It proposes the same payment instead | queued for 10 minutes, then run and broadcast |
 | A second proposal | cancelled by the passkey; it can never run |
 | The passkey revokes the agent | its next request is refused |
-| The owner sends from the dashboard: 1 USDC on Base, 0.01 SOL on Solana, 10,000 sats on Bitcoin, 0.002 LTC on Litecoin, 5 TRX on TRON, 5 XRP on XRP | each approved with the passkey, signed, broadcast |
+| The owner sends from the dashboard: 1 USDC on Base, 0.01 SOL on Solana, 10,000 sats on Bitcoin, 0.002 LTC on Litecoin, 5 TRX on TRON, 5 XRP on XRP, 5 ADA on Cardano, 0.01 ZEC on Zcash | each approved with the passkey, signed, broadcast |
 | The passkey grants an agent ETH perps on Hyperliquid testnet: at most 5x, up to 100 USD of orders a day | granted on NEAR (extension v4) |
-| The agent sets 3x leverage and orders 0.01 ETH at 2000 | the extension builds the EIP-712 digest itself and has it signed; Hyperliquid recovers the account's own address |
+| The owner moves 40 USDC from spot to perps on Hyperliquid | one passkey tap; the page builds the digest, Chain Signatures signs it |
+| The agent sets 3x leverage, places a resting order, cancels it, then buys 0.01 ETH | all accepted by Hyperliquid testnet; the buy filled at 2124.77, the account holds 0.01 ETH long at 3x |
 | The agent asks for 10x leverage, then a 120 USD order | refused (above the grant's leverage; over the daily cap) |
 | A TEE agent (key derived inside the enclave) is granted its own session | its order is signed; 20x leverage refused |
 | An account created on extension v3 | moved to v4 with one passkey tap; same address |
+| The agent swaps 5 USDC for WETH on Uniswap V3, then withdraws 10 USDC from Aave | both broadcast on Base Sepolia; the output and the withdrawal go to the account |
+| It tries the same swap with the output to another address | refused on NEAR: "venue call sends the result to someone else" |
+| The agent pays 2,000 sats on Bitcoin and 0.001 ZEC on Zcash to listed recipients | signed one signature per input, broadcast |
+| It pays an unlisted Bitcoin address, then 0.001 BTC over its daily cap | both refused on NEAR |
 
 ## How it works
 
@@ -56,8 +62,10 @@ All of the following ran on NEAR testnet and each chain's testnet (8–9 Novembe
 
 - **`extension/`** is the session-key extension (Rust, near-sdk). The wallet's owner installs it, and it holds no funds.
   - It decodes every request itself: NEAR calls, NEP-141 transfers, and EIP-1559 transactions, from which it builds the signing hash.
+  - For venue calls whose layout it knows (Aave `supply`, `withdraw`, `repay`; Uniswap V3 `exactInputSingle`), it reads where the result goes (`onBehalfOf`, `to`, `recipient`). That must be the account's own EVM address, named in the grant the passkey signed, so an agent can't deposit or swap for someone else. Extra or dirty data is refused (extension v5).
   - For Hyperliquid, the agent sends an order's fields, never bytes to sign. The extension encodes the action as Hyperliquid's SDK does (MessagePack) and builds the EIP-712 digest itself, with the source fixed to Hyperliquid testnet. A signature from it is valid only on that exchange and network, and can't be an EVM transaction.
   - Order value (price × size) counts against a daily USD cap; leverage is capped per market; the nonce must be within 5 minutes of now.
+  - For Bitcoin, Litecoin, Bitcoin Cash and Zcash, the agent sends a payment's inputs and outputs (at most 2 and 3), and the extension builds every signing hash itself: BIP-143, BIP-143 with FORKID, and ZIP-244. Each of these digests commits to the amounts being spent, so an agent that misstates them gets a signature the chain rejects. The totals the extension counts are real: everything that leaves the account, fee included, counts against the cap. Every output must go to a listed recipient or back to the account. Dogecoin isn't offered to agents: its legacy digest doesn't commit to amounts, so a hidden fee couldn't be capped. The extension's hashes are tested to equal core's, which match bitcoinjs-lib, bitcore-lib-cash and zcash_primitives.
   - It checks venue, recipient and cap.
   - It has the wallet act through `w_execute_extension`. The wallet itself calls the MPC signer, so the EVM address belongs to the wallet, not to the extension.
   - A session can never call the wallet, the extension or the signer directly, and never sends wallet operations.
@@ -69,8 +77,10 @@ All of the following ran on NEAR testnet and each chain's testnet (8–9 Novembe
 - **`relayer/`** pays gas and nothing else. It only relays for wallets built from our code, and checks the passkey's proof before spending gas. Everything it forwards is checked again on-chain.
 - **`web/`** is the page:
   - create with a passkey
-  - balances per chain, with Deposit (address and QR code) and Send on every chain: NEAR, nine EVM chains, Bitcoin, Solana, TRON, XRP, Cardano, Litecoin, Dogecoin, Bitcoin Cash and Zcash
+  - Home: the account, then Assets, Swap, and Apps & agents
+  - Assets: a tile per chain. Each chain's page has Send and Receive (address and QR code), what it holds, and its recent history from the chain's explorer. Send works on every chain: NEAR, nine EVM chains, Bitcoin, Solana, TRON, XRP, Cardano, Litecoin, Dogecoin, Bitcoin Cash and Zcash
   - Swap: a live NEAR Intents quote (1Click, always `dry: true`; Intents runs on mainnet only)
+  - Hyperliquid: the account's spot and perps USDC, and Move to perps with the passkey
   - agents and apps, with Hyperliquid markets in the grant
   - Confirm, which decodes exactly what the passkey signs
   - approvals, the queue, and a one-tap move to a newer extension
@@ -87,7 +97,7 @@ All of the following ran on NEAR testnet and each chain's testnet (8–9 Novembe
 | | |
 |---|---|
 | Wallet code (`defuse-wallet-webauthn-p256`, near/intents `32cd1f9`), immutable global contract | `909f39dd861604db7f75eafad948b6cf288ffc81db1fb59177030f227721c98e` |
-| Marvii extension v4 (Hyperliquid) | `cd1cd8fe1383641c975a832c077b612ef8c95935377636241d84803223f20deb` (v3, `2dc4e98d…ba18`, still accepted; the page offers the move) |
+| Marvii extension v5 (venue rules, Uniswap, payments) | `d591504aa95d1d7164f11dfac2016363dd18788458040c7fc3ee32cd4344e0ec` (v3 and v4 still accepted; the page offers the move) |
 | Chain Signatures | `v1.signer-prod.testnet` |
 | Names registry; forwarder code hash | `marvii.testnet`; `9428c9b6ea5401af2ecd8487170c5ceb409daa81133b8b62d70f59105d7f795e` |
 | Demo account | `0s3465557e026f471c0e84898f799c8032f356c77a`, EVM `0x48f0deef2c7e15ea9b4398a6875b43b5ab6ea81e` |
@@ -96,7 +106,7 @@ All of the following ran on NEAR testnet and each chain's testnet (8–9 Novembe
 
 Requirements: Rust 1.97 with `wasm32-unknown-unknown`, Node 22, and a funded NEAR testnet account for the relayer.
 
-1. **Test the contracts.** Expect 44 extension tests, 36 core tests, 6 registry tests and 8 forwarder tests to pass:
+1. **Test the contracts.** Expect 52 extension tests, 39 core tests, 6 registry tests and 8 forwarder tests to pass:
    ```sh
    cd extension && cargo test
    cd ../core && cargo test
@@ -107,7 +117,7 @@ Requirements: Rust 1.97 with `wasm32-unknown-unknown`, Node 22, and a funded NEA
    ```sh
    cd relayer
    MARVII_RELAYER_SECRET_KEY=ed25519:… MARVII_RELAYER_ACCOUNT=<account> \
-   MARVII_NEAR_EXTENSION=cd1cd8fe1383641c975a832c077b612ef8c95935377636241d84803223f20deb \
+   MARVII_NEAR_EXTENSION=d591504aa95d1d7164f11dfac2016363dd18788458040c7fc3ee32cd4344e0ec \
    MARVII_NEAR_WALLET_CODE_HASH=909f39dd861604db7f75eafad948b6cf288ffc81db1fb59177030f227721c98e \
    cargo run
    ```
@@ -130,7 +140,7 @@ Requirements: Rust 1.97 with `wasm32-unknown-unknown`, Node 22, and a funded NEA
    cd agent && WALLET=0s… node agent.mjs hl-leverage 3
    node agent.mjs hl-order buy 0.01 2000
    ```
-   Expect `signed by 0x…` (the account's EVM address) and Hyperliquid's answer. An account needs testnet USDC on Hyperliquid before its orders rest.
+   Expect `signed by 0x…` (the account's EVM address) and Hyperliquid's answer. Orders need margin in perps: send testnet USDC to the account on Hyperliquid (it lands in spot), then use Move to perps on the page.
 
 To host the relayer, see `relayer/Dockerfile`. Build it from this directory: `docker build -f relayer/Dockerfile .`.
 

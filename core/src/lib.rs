@@ -285,6 +285,8 @@ pub fn describe_message(msg_json: &str) -> Result<String, String> {
 mod evm;
 mod legacy;
 mod cardano;
+mod hyperliquid;
+pub use hyperliquid::*;
 pub use legacy::*;
 pub use cardano::*;
 
@@ -352,6 +354,18 @@ pub fn describe_evm_tx(tx_json: &str) -> Result<String, String> {
         evm::Decoded::Call { selector } if selector == SEL_AAVE_SUPPLY && t.data.len() == 4 + 128 => {
             let d = &t.data[4..];
             json!({ "kind": "aave_supply", "pool": evm::fmt_address(&t.to), "asset": word_addr(&d[0..32])?, "amount": word_dec(&d[32..64])?, "on_behalf_of": word_addr(&d[64..96])?, "referral": word_dec(&d[96..128])? })
+        }
+        evm::Decoded::Call { selector } if selector == evm::SEL_AAVE_WITHDRAW && t.data.len() == 4 + 96 => {
+            let d = &t.data[4..];
+            json!({ "kind": "aave_withdraw", "pool": evm::fmt_address(&t.to), "asset": word_addr(&d[0..32])?, "amount": word_dec(&d[32..64])?, "to": word_addr(&d[64..96])? })
+        }
+        evm::Decoded::Call { selector } if selector == evm::SEL_AAVE_REPAY && t.data.len() == 4 + 128 => {
+            let d = &t.data[4..];
+            json!({ "kind": "aave_repay", "pool": evm::fmt_address(&t.to), "asset": word_addr(&d[0..32])?, "amount": word_dec(&d[32..64])?, "on_behalf_of": word_addr(&d[96..128])? })
+        }
+        evm::Decoded::Call { selector } if selector == evm::SEL_UNI_EXACT_INPUT_SINGLE && t.data.len() == 4 + 224 => {
+            let d = &t.data[4..];
+            json!({ "kind": "uniswap_swap", "router": evm::fmt_address(&t.to), "token_in": word_addr(&d[0..32])?, "token_out": word_addr(&d[32..64])?, "fee": word_dec(&d[64..96])?, "recipient": word_addr(&d[96..128])?, "amount_in": word_dec(&d[128..160])?, "min_out": word_dec(&d[160..192])? })
         }
         evm::Decoded::Call { selector } => json!({ "kind": "unknown_call", "contract": evm::fmt_address(&t.to), "selector": format!("0x{}", hex::encode(selector)), "data": format!("0x{}", hex::encode(&t.data)) }),
     };
@@ -521,8 +535,13 @@ pub(crate) fn cashaddr_polymod(v: &[u8]) -> u64 {
 
 /// CashAddr (Bitcoin Cash), P2PKH: polymod checksum over the prefix.
 fn cashaddr(prefix: &str, hash: &[u8; 20]) -> String {
+    cashaddr_typed(prefix, 0, hash)
+}
+
+/// CashAddr with a version byte: 0 for P2PKH, 8 for P2SH (160-bit hashes).
+pub(crate) fn cashaddr_typed(prefix: &str, version: u8, hash: &[u8; 20]) -> String {
     const CHARSET: &[u8] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
-    let mut payload = vec![0u8]; // version: P2PKH, 160-bit hash
+    let mut payload = vec![version];
     payload.extend(hash);
     // 8-bit to 5-bit groups, padded.
     let (mut acc, mut bits, mut five) = (0u32, 0u32, vec![]);
@@ -766,6 +785,10 @@ fn btc_script(address: &str, hrp_want: &str) -> Result<Vec<u8>, String> {
         0x3a if hrp_want == "tltc" => [&[0xa9, 0x14][..], &raw[1..], &[0x87]].concat(),
         _ => return Err(bad()),
     })
+}
+
+pub(crate) fn btc_script_pub(address: &str, hrp: &str) -> Result<Vec<u8>, String> {
+    btc_script(address, hrp)
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]

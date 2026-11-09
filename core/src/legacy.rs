@@ -463,6 +463,65 @@ pub fn legacy_signed_tx(plan_json: &str, mpc_signatures_json: &str) -> Result<St
     serde_json::to_string(&serde_json::json!({ "raw": hex::encode(raw), "txid": hex::encode(txid) })).map_err(err)
 }
 
+/// The output script (hex) for a testnet address on any Bitcoin-family
+/// chain here (SegWit too, for Bitcoin and Litecoin): what agent payment
+/// grants and requests carry.
+#[wasm_bindgen]
+pub fn utxo_script(chain: &str, address: &str) -> Result<String, String> {
+    match chain {
+        "bitcoin" => Ok(hex::encode(super::btc_script_pub(address, "tb")?)),
+        "litecoin" => Ok(hex::encode(super::btc_script_pub(address, "tltc")?)),
+        _ => legacy_script_pubkey(chain, address),
+    }
+}
+
+/// The testnet address an output script pays, for showing agent payment
+/// grants and requests in words. Refuses scripts that aren't standard.
+#[wasm_bindgen]
+pub fn utxo_address(chain: &str, script_hex: &str) -> Result<String, String> {
+    let s = hex::decode(script_hex).map_err(err)?;
+    let bad = || "not a standard output script".to_string();
+    let p2pkh = s.len() == 25 && s[..3] == [0x76, 0xa9, 0x14] && s[23..] == [0x88, 0xac];
+    let p2sh = s.len() == 23 && s[..2] == [0xa9, 0x14] && s[22] == 0x87;
+    match chain {
+        "bitcoin" | "litecoin" => {
+            let hrp = bech32::Hrp::parse(if chain == "bitcoin" { "tb" } else { "tltc" }).unwrap();
+            if s.len() >= 4 && s.len() <= 42 && s[1] as usize == s.len() - 2 && (s[0] == 0 || (0x51..=0x60).contains(&s[0])) {
+                let v = if s[0] == 0 { 0 } else { s[0] - 0x50 };
+                let fe = bech32::Fe32::try_from(v).map_err(|_| bad())?;
+                return bech32::segwit::encode(hrp, fe, &s[2..]).map_err(|_| bad());
+            }
+            if p2pkh {
+                return Ok(bs58::encode([&[0x6f][..], &s[3..23]].concat()).with_check().into_string());
+            }
+            if p2sh {
+                let v = if chain == "litecoin" { 0x3a } else { 0xc4 };
+                return Ok(bs58::encode([&[v][..], &s[2..22]].concat()).with_check().into_string());
+            }
+            Err(bad())
+        }
+        "bitcoin-cash" => {
+            if p2pkh {
+                return Ok(super::cashaddr_typed("bchtest", 0, &s[3..23].try_into().unwrap()));
+            }
+            if p2sh {
+                return Ok(super::cashaddr_typed("bchtest", 8, &s[2..22].try_into().unwrap()));
+            }
+            Err(bad())
+        }
+        "zcash" => {
+            if p2pkh {
+                return Ok(bs58::encode([&[0x1d, 0x25][..], &s[3..23]].concat()).with_check().into_string());
+            }
+            if p2sh {
+                return Ok(bs58::encode([&[0x1c, 0xba][..], &s[2..22]].concat()).with_check().into_string());
+            }
+            Err(bad())
+        }
+        _ => Err(format!("{chain} isn't offered to agents")),
+    }
+}
+
 /// The output script (hex) for a testnet address on Dogecoin, Bitcoin Cash
 /// or Zcash; the relayer derives Electrum script hashes from it.
 #[wasm_bindgen]

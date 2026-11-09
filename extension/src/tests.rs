@@ -2,7 +2,7 @@
 //! expects it to fail.
 
 use super::*;
-use crate::rules::{Cap, EvmVenue, NearVenue};
+use crate::rules::{Cap, EvmVenue, NearVenue, UtxoGrant};
 use ed25519_dalek::{Signer, SigningKey};
 use near_sdk::{test_utils::VMContextBuilder, testing_env};
 use sha2::{Digest, Sha256};
@@ -14,6 +14,10 @@ const POOL: &str = "0x2222222222222222222222222222222222222222";
 const USDC: &str = "0x4444444444444444444444444444444444444444";
 const FRIEND: &str = "0x5555555555555555555555555555555555555555";
 const STRANGER: &str = "0x6666666666666666666666666666666666666666";
+/// The account's own EVM address, as the grant names it.
+const SELF: &str = "0x7777777777777777777777777777777777777777";
+const ROUTER: &str = "0x8888888888888888888888888888888888888888";
+const WETH: &str = "0x4200000000000000000000000000000000000006";
 /// Aave `supply(address,uint256,address,uint16)`, computed with `cast sig`.
 const DELAY: u64 = 60 * 60 * 1000;
 const SUPPLY: &str = "0x617ba037";
@@ -54,6 +58,8 @@ fn grant() -> Grant {
         ],
         queue_new_targets: false,
         hl_markets: vec![rules::HlMarket { asset: 4, max_leverage: 5 }],
+        evm_self: Some(SELF.into()),
+        utxo: vec![],
     }
 }
 
@@ -89,7 +95,7 @@ fn approve(spender: &str, amount: u128) -> serde_json::Value {
     evm(USDC, 0, format!("0x095ea7b3{}{}", word_addr(spender), word_u(amount)))
 }
 fn supply(amount: u128) -> serde_json::Value {
-    evm(POOL, 0, format!("{SUPPLY}{}{}{}{}", word_addr(USDC), word_u(amount), word_addr("0x00"), word_u(0)))
+    evm(POOL, 0, format!("{SUPPLY}{}{}{}{}", word_addr(USDC), word_u(amount), word_addr(SELF), word_u(0)))
 }
 
 fn exec(c: &mut Extension, nonce: u64, action: serde_json::Value) {
@@ -600,4 +606,193 @@ fn hl_notional_rounds_up() {
     assert_eq!(hl::notional_micro_usd("3.62695", "0.1").unwrap(), 362_695);
     assert_eq!(hl::notional_micro_usd("1.00000001", "1").unwrap(), 1_000_001);
     assert_eq!(hl::notional_micro_usd("75378", "0.00013").unwrap(), 9_799_140);
+}
+
+// ---- Venue arguments: results go only to the account ----
+
+fn venue_grant(c: &mut Extension) {
+    let mut g = grant();
+    g.evm_venues = vec![
+        EvmVenue { chain_id: BASE_SEPOLIA, to: POOL.into(), selector: SUPPLY.into() },
+        EvmVenue { chain_id: BASE_SEPOLIA, to: POOL.into(), selector: "0x69328dec".into() },
+        EvmVenue { chain_id: BASE_SEPOLIA, to: POOL.into(), selector: "0x573ade81".into() },
+        EvmVenue { chain_id: BASE_SEPOLIA, to: ROUTER.into(), selector: "0x04e45aaf".into() },
+    ];
+    ctx(wallet(), GRANT_DEPOSIT, NOW);
+    c.grant_session("agent-1".into(), g);
+}
+
+fn withdraw(to: &str) -> serde_json::Value {
+    evm(POOL, 0, format!("0x69328dec{}{}{}", word_addr(USDC), word_u(5), word_addr(to)))
+}
+fn repay(on_behalf: &str) -> serde_json::Value {
+    evm(POOL, 0, format!("0x573ade81{}{}{}{}", word_addr(USDC), word_u(5), word_u(2), word_addr(on_behalf)))
+}
+fn swap(recipient: &str) -> serde_json::Value {
+    evm(ROUTER, 0, format!("0x04e45aaf{}{}{}{}{}{}{}", word_addr(USDC), word_addr(WETH), word_u(3000), word_addr(recipient), word_u(5_000_000), word_u(1), word_u(0)))
+}
+
+#[test]
+fn venue_results_go_to_the_account() {
+    let mut c = setup();
+    venue_grant(&mut c);
+    assert_eq!(try_action(&c, supply(1), NOW), Ok(()));
+    assert_eq!(try_action(&c, withdraw(SELF), NOW), Ok(()));
+    assert_eq!(try_action(&c, repay(SELF), NOW), Ok(()));
+    assert_eq!(try_action(&c, swap(SELF), NOW), Ok(()));
+}
+
+#[test]
+fn venue_results_to_someone_else_are_refused() {
+    let mut c = setup();
+    venue_grant(&mut c);
+    let other = evm(POOL, 0, format!("{SUPPLY}{}{}{}{}", word_addr(USDC), word_u(1), word_addr(STRANGER), word_u(0)));
+    for a in [other, withdraw(STRANGER), repay(STRANGER), swap(STRANGER)] {
+        assert_eq!(try_action(&c, a, NOW), Err("venue call sends the result to someone else"));
+    }
+    // Queued doesn't loosen it.
+    let s = c.get_session(wallet(), "agent-1".into()).unwrap();
+    let mut s2 = s.clone();
+    s2.grant.queue_new_targets = true;
+    let a: Action = serde_json::from_value(swap(STRANGER)).unwrap();
+    assert_eq!(rules::check(&s2, &a, Mode::Queued, NOW, &wallet(), &ext(), &signer()).err(), Some("venue call sends the result to someone else"));
+}
+
+#[test]
+fn venue_calls_with_extra_or_dirty_data_are_refused() {
+    let mut c = setup();
+    venue_grant(&mut c);
+    // A trailing word.
+    let long = evm(ROUTER, 0, format!("0x04e45aaf{}{}{}{}{}{}{}{}", word_addr(USDC), word_addr(WETH), word_u(3000), word_addr(SELF), word_u(5), word_u(1), word_u(0), word_u(9)));
+    assert_eq!(try_action(&c, long, NOW), Err("venue call data has the wrong length"));
+    // The recipient word with bits above the address (a token or router
+    // reading it differently from us).
+    let dirty = format!("0x04e45aaf{}{}{}{}{}{}{}", word_addr(USDC), word_addr(WETH), word_u(3000), format!("01{}", &word_addr(SELF)[2..]), word_u(5), word_u(1), word_u(0));
+    assert!(try_action(&c, evm(ROUTER, 0, dirty), NOW).is_err());
+}
+
+#[test]
+fn venue_calls_need_the_account_named() {
+    let mut c = setup();
+    let mut g = grant();
+    g.evm_self = None;
+    ctx(wallet(), GRANT_DEPOSIT, NOW);
+    c.grant_session("agent-1".into(), g);
+    assert_eq!(try_action(&c, supply(1), NOW), Err("this grant doesn't name the account's EVM address"));
+    // And a malformed one is refused at grant time.
+    let mut g = grant();
+    g.evm_self = Some("0x1234".into());
+    assert!(rules::validate_grant(&g, "k", NOW, &wallet(), &ext(), &signer()).is_err());
+}
+
+// ---- Payment-only chains ----
+
+/// The same plan as core's reference plans (key 0x11…11, inputs aa…:1 of
+/// 6 coins and bb…:0 of 2.5 coins): the extension must produce exactly the
+/// signing hashes core does, and core's are checked against bitcoinjs-lib,
+/// bitcore-lib-cash and zcash_primitives.
+const BTC_SELF: &str = "0014fc7250a211deddc70ee5a2738de5f07817351cef";
+const BTC_FRIEND: &str = "0014751e76e8199196d454941c45d1b3a323f1433bd6";
+const P2PKH_SELF: &str = "76a914fc7250a211deddc70ee5a2738de5f07817351cef88ac";
+
+fn pay(chain: &str, outs: &[(&str, u64)]) -> serde_json::Value {
+    serde_json::json!({ "type": "utxo_pay", "chain": chain,
+        "inputs": [{ "txid": "aa".repeat(32), "vout": 1, "value": 600_000_000u64 }, { "txid": "bb".repeat(32), "vout": 0, "value": 250_000_000u64 }],
+        "outputs": outs.iter().map(|(s, v)| serde_json::json!({ "script": s, "value": v })).collect::<Vec<_>>(),
+        "branch_id": 0x7719_0ad9u32, "expiry_height": 3_900_000u32 })
+}
+
+fn utxo_session(c: &mut Extension, daily: u128) {
+    let mut g = grant();
+    g.utxo = vec![
+        UtxoGrant { chain: "bitcoin".into(), self_script: BTC_SELF.into(), recipients: vec![BTC_FRIEND.into()] },
+        UtxoGrant { chain: "litecoin".into(), self_script: BTC_SELF.into(), recipients: vec![] },
+        UtxoGrant { chain: "bitcoin-cash".into(), self_script: P2PKH_SELF.into(), recipients: vec![] },
+        UtxoGrant { chain: "zcash".into(), self_script: P2PKH_SELF.into(), recipients: vec![] },
+    ];
+    for ch in ["bitcoin", "litecoin", "bitcoin-cash", "zcash"] {
+        g.caps.push(Cap { asset: format!("utxo:{ch}"), daily: U128(daily) });
+    }
+    ctx(wallet(), GRANT_DEPOSIT, NOW);
+    c.grant_session("agent-1".into(), g);
+}
+
+fn plan_for(c: &Extension, a: serde_json::Value) -> Result<rules::Plan, &'static str> {
+    let s = c.get_session(wallet(), "agent-1".into()).unwrap();
+    let a: Action = serde_json::from_value(a).unwrap();
+    rules::check(&s, &a, Mode::Direct, NOW, &wallet(), &ext(), &signer())
+}
+
+#[test]
+fn utxo_hashes_match_core() {
+    let mut c = setup();
+    utxo_session(&mut c, 1_000_000_000);
+    for (chain, outs, want) in [
+        ("bitcoin", vec![(BTC_FRIEND, 700_000_000u64), (BTC_SELF, 149_999_582)], ["b653c279d489205a266eeb6b874d7f54b4b6e9ab083aa06e29e54a8afd67eec0", "0255fbfcd20169ab418eb0c7a8ac7a91fb578b62004938a347d8f8e8ac77fc2a"]),
+        ("litecoin", vec![(BTC_SELF, 700_000_000), (BTC_SELF, 149_999_582)], ["8ed8d4d4f9c4be203275804cb46a12bfbb78226fe28035e0401f97b69f481115", "fd4ad1476ca1cd9adccf06a2b5f6902bb32773141123950ad17409623b645e86"]),
+        ("bitcoin-cash", vec![(P2PKH_SELF, 700_000_000), (P2PKH_SELF, 149_999_626)], ["f5439a5e51b666e4354f1b62272b9d16e50fa67f6fbe67d5152ed37de06ca8ae", "fd774a2b242a06e9222bcd1ba546475634eb30dfa3dc62ee1fa9c076988014fa"]),
+        ("zcash", vec![(P2PKH_SELF, 700_000_000), (P2PKH_SELF, 149_990_000)], ["d94586719b3fdf4a278657190ffec949bd76d1546529d9d462992639539f4e52", "97ac0fd59bc4416181ec6af4e039ce5f2b2c56bae56c91a0441f5188951e4c31"]),
+    ] {
+        let p = plan_for(&c, pay(chain, &outs)).unwrap();
+        let rules::Kind::Utxo { path, hashes } = p.kind else { panic!("{chain}") };
+        assert_eq!(path, chain);
+        assert_eq!(hashes.iter().map(hex::encode).collect::<Vec<_>>(), want, "{chain}");
+    }
+}
+
+#[test]
+fn utxo_spend_counts_payment_and_fee() {
+    let mut c = setup();
+    utxo_session(&mut c, 1_000_000_000);
+    // 8.5 in, 7 to the friend, 1.49999582 back: 7.00000418 leaves, fee included.
+    let p = plan_for(&c, pay("bitcoin", &[(BTC_FRIEND, 700_000_000), (BTC_SELF, 149_999_582)])).unwrap();
+    assert_eq!(p.spends, vec![("utxo:bitcoin".to_string(), 700_000_418)]);
+    // A huge fee is a spend too: 8.5 in, 0.1 to the friend, nothing back.
+    let p = plan_for(&c, pay("bitcoin", &[(BTC_FRIEND, 10_000_000)])).unwrap();
+    assert_eq!(p.spends, vec![("utxo:bitcoin".to_string(), 850_000_000)]);
+}
+
+#[test]
+fn utxo_attacks_are_refused() {
+    let mut c = setup();
+    utxo_session(&mut c, 800_000_000);
+    let stranger = "0014000000000000000000000000000000000000dead";
+    assert_eq!(plan_for(&c, pay("bitcoin", &[(stranger, 1_000)])).err(), Some("recipient not allowed"));
+    // Over the cap through the fee alone: 8.5 coins leave, cap is 8.
+    assert_eq!(plan_for(&c, pay("bitcoin", &[(BTC_FRIEND, 10_000_000)])).err(), Some("over the daily cap"));
+    // More out than in.
+    assert_eq!(plan_for(&c, pay("bitcoin", &[(BTC_FRIEND, 900_000_000)])).err(), Some("outputs exceed inputs"));
+    // A chain the grant doesn't list, and Dogecoin at all.
+    let mut g = grant();
+    g.utxo = vec![UtxoGrant { chain: "dogecoin".into(), self_script: P2PKH_SELF.into(), recipients: vec![] }];
+    assert!(rules::validate_grant(&g, "k", NOW, &wallet(), &ext(), &signer()).is_err());
+    let mut a = pay("bitcoin", &[(BTC_FRIEND, 1_000)]);
+    a["chain"] = "dogecoin".into();
+    assert_eq!(plan_for(&c, a).err(), Some("payments on this chain not allowed"));
+    // Too many inputs, a repeated input, a non-standard script.
+    let mut a = pay("bitcoin", &[(BTC_FRIEND, 1_000)]);
+    a["inputs"].as_array_mut().unwrap().push(serde_json::json!({ "txid": "cc".repeat(32), "vout": 0, "value": 1 }));
+    assert!(plan_for(&c, a).is_err());
+    let mut a = pay("bitcoin", &[(BTC_FRIEND, 1_000)]);
+    a["inputs"][1] = a["inputs"][0].clone();
+    assert_eq!(plan_for(&c, a).err(), Some("an input is listed twice"));
+    assert!(plan_for(&c, pay("bitcoin", &[("6a0568656c6c6f", 1_000)])).is_err(), "OP_RETURN");
+    // Zcash without its branch ID.
+    let mut a = pay("zcash", &[(P2PKH_SELF, 1_000)]);
+    a["branch_id"] = 0.into();
+    assert!(plan_for(&c, a).is_err());
+    // A grant whose own script has another chain's shape.
+    let mut g = grant();
+    g.utxo = vec![UtxoGrant { chain: "bitcoin".into(), self_script: P2PKH_SELF.into(), recipients: vec![] }];
+    assert!(rules::validate_grant(&g, "k", NOW, &wallet(), &ext(), &signer()).is_err());
+}
+
+#[test]
+fn utxo_payment_executes_with_one_signature_per_input() {
+    let mut c = setup();
+    utxo_session(&mut c, 1_000_000_000);
+    exec(&mut c, 1, pay("bitcoin", &[(BTC_FRIEND, 700_000_000), (BTC_SELF, 149_999_582)]));
+    assert_eq!(c.spent_today(wallet(), "agent-1".into(), "utxo:bitcoin".into()), U128(700_000_418));
+    // The next one goes over: 7.00000418 + 7.00000418 > 10.
+    assert_eq!(plan_for(&c, pay("bitcoin", &[(BTC_FRIEND, 700_000_000), (BTC_SELF, 149_999_582)])).err(), Some("over the daily cap"));
 }

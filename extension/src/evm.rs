@@ -9,6 +9,50 @@ pub const SEL_TRANSFER: [u8; 4] = [0xa9, 0x05, 0x9c, 0xbb];
 /// `approve(address,uint256)`, computed with `cast sig`.
 pub const SEL_APPROVE: [u8; 4] = [0x09, 0x5e, 0xa7, 0xb3];
 
+/// Venue calls whose layout the extension knows, so it can check where the
+/// result goes. Selectors computed with keccak256 of the signatures.
+/// Aave V3 Pool `supply(address,uint256,address,uint16)`: onBehalfOf.
+pub const SEL_AAVE_SUPPLY: [u8; 4] = [0x61, 0x7b, 0xa0, 0x37];
+/// Aave V3 Pool `withdraw(address,uint256,address)`: to.
+pub const SEL_AAVE_WITHDRAW: [u8; 4] = [0x69, 0x32, 0x8d, 0xec];
+/// Aave V3 Pool `repay(address,uint256,uint256,address)`: onBehalfOf.
+pub const SEL_AAVE_REPAY: [u8; 4] = [0x57, 0x3a, 0xde, 0x81];
+/// Uniswap V3 SwapRouter02 `exactInputSingle((address,address,uint24,
+/// address,uint256,uint256,uint160))`: recipient.
+pub const SEL_UNI_EXACT_INPUT_SINGLE: [u8; 4] = [0x04, 0xe4, 0x5a, 0xaf];
+
+/// For a call whose layout is known, the address its result goes to (who
+/// gets the deposit, the withdrawn tokens or the swap's output), which must
+/// be the account's own. `None` for any other call. The data must have
+/// exactly the expected length, so nothing extra can ride along.
+pub fn beneficiary(data: &[u8]) -> Result<Option<[u8; 20]>, &'static str> {
+    if data.len() < 4 {
+        return Ok(None);
+    }
+    let sel: [u8; 4] = data[..4].try_into().unwrap();
+    let (words, at) = match sel {
+        SEL_AAVE_SUPPLY => (4, 2),
+        SEL_AAVE_WITHDRAW => (3, 2),
+        SEL_AAVE_REPAY => (4, 3),
+        SEL_UNI_EXACT_INPUT_SINGLE => (7, 3),
+        _ => return Ok(None),
+    };
+    if data.len() != 4 + 32 * words {
+        return Err("venue call data has the wrong length");
+    }
+    // Every address word in these layouts must be clean.
+    let addr_words: &[usize] = match sel {
+        SEL_AAVE_SUPPLY => &[0, 2],
+        SEL_AAVE_WITHDRAW => &[0, 2],
+        SEL_AAVE_REPAY => &[0, 3],
+        _ => &[0, 1, 3],
+    };
+    for w in addr_words {
+        word_address(&data[4 + 32 * w..4 + 32 * (w + 1)])?;
+    }
+    Ok(Some(word_address(&data[4 + 32 * at..4 + 32 * (at + 1)])?))
+}
+
 /// An unsigned EIP-1559 (type 2) transaction with an empty access list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Eip1559 {

@@ -222,7 +222,10 @@ async fn publish_wallet(path: &str) -> Result<()> {
 async fn deploy_extension(path: &str) -> Result<()> {
     let wasm = fs::read(path)?;
     let deployer = Key::load("deployer")?;
-    let ext = Key::create("extension")?;
+    // A new extension is prepared under `extension-next` and only becomes
+    // `extension` once its contract is live, so a failed deploy never
+    // leaves the current one replaced by an empty account.
+    let ext = Key::create("extension-next")?;
     let near = deployer.near()?;
     let out = near.transfer(ext.account_id.as_str(), NearToken::from_near(4)).wait_until::<Final>().await?;
     if !out.is_success() {
@@ -241,6 +244,12 @@ async fn deploy_extension(path: &str) -> Result<()> {
     if !out.is_success() {
         bail!("deploy failed: {:?}", out.failure_message());
     }
+    let dir = keys_dir()?;
+    if dir.join("extension.json").exists() {
+        let old = Key::load("extension")?;
+        fs::rename(dir.join("extension.json"), dir.join(format!("extension-{}.json", &old.account_id[..8])))?;
+    }
+    fs::rename(dir.join("extension-next.json"), dir.join("extension.json"))?;
     println!("extension {} deployed, tx {}", ext.account_id, out.transaction_hash());
     Ok(())
 }
@@ -419,6 +428,23 @@ async fn demo(grant_to: Option<String>, approve: Option<u64>, upgrade: bool, can
         // MARVII_GRANT_KEY_ID names the session (default aave-agent; the
         // TEE agent uses tee-agent).
         let key_id = std::env::var("MARVII_GRANT_KEY_ID").unwrap_or_else(|_| "aave-agent".into());
+        let evm_self = {
+            let mpc = wallet.mpc_signer::<Secp256k1>(0).await?;
+            let k = Secp256k1UncompressedPublicKey::from(mpc.derive_public_key("evm")).to_string();
+            marvii_near_core::evm_address(&k).map_err(|e| anyhow!(e))?.to_lowercase()
+        };
+        // Payments: Bitcoin testnet4 and Zcash testnet, to one address each,
+        // with change back to the account. Scripts from core.
+        let mut utxo = vec![];
+        for (chain, to) in [("bitcoin", "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"), ("zcash", "tmYjAZFpvdDXTaJrq2WikAntitBNJJo9VSo")] {
+            let k: String = near.view(signer().as_str(), "derived_public_key").args(json!({ "path": chain, "predecessor": wallet_id, "domain_id": 0 })).await?;
+            let own = marvii_near_core::chain_address(chain, &k).map_err(|e| anyhow!(e))?;
+            utxo.push(json!({
+                "chain": chain,
+                "self_script": marvii_near_core::utxo_script(chain, &own).map_err(|e| anyhow!(e))?,
+                "recipients": [marvii_near_core::utxo_script(chain, to).map_err(|e| anyhow!(e))?],
+            }));
+        }
         let grant = json!({
             "key_id": key_id,
             "grant": {
@@ -427,15 +453,26 @@ async fn demo(grant_to: Option<String>, approve: Option<u64>, upgrade: bool, can
                 "expires_at_ms": now_ms + 7 * 86_400_000,
                 "inactivity_ms": 3 * 86_400_000u64,
                 "near_venues": [],
-                // supply(address,uint256,address,uint16) = 0x617ba037 (cast sig)
-                "evm_venues": [{ "chain_id": CHAIN_ID, "to": pool, "selector": "0x617ba037" }],
+                // Aave V3: supply 0x617ba037, withdraw 0x69328dec, repay
+                // 0x573ade81. Uniswap V3 SwapRouter02 on Base Sepolia
+                // (factory() and WETH9() checked on-chain):
+                // exactInputSingle 0x04e45aaf. Selectors: keccak256 of the
+                // signatures.
+                "evm_venues": [
+                    { "chain_id": CHAIN_ID, "to": pool, "selector": "0x617ba037" },
+                    { "chain_id": CHAIN_ID, "to": pool, "selector": "0x69328dec" },
+                    { "chain_id": CHAIN_ID, "to": pool, "selector": "0x573ade81" },
+                    { "chain_id": CHAIN_ID, "to": "0x94cc0aac535ccdb3c01d6787d6413c739ae12bc4", "selector": "0x04e45aaf" }
+                ],
+                "evm_self": evm_self,
                 "near_recipients": [],
                 "evm_recipients": [],
                 // Hyperliquid testnet: ETH perps (asset 4, from the testnet
                 // `meta`), at most 5x, up to 100 USD of orders a day.
-                "caps": [{ "asset": format!("evm:{CHAIN_ID}:{usdc}"), "daily": "50000000" }, { "asset": "hyperliquid:usd", "daily": "100000000" }],
+                "caps": [{ "asset": format!("evm:{CHAIN_ID}:{usdc}"), "daily": "50000000" }, { "asset": "hyperliquid:usd", "daily": "100000000" }, { "asset": "utxo:bitcoin", "daily": "100000" }, { "asset": "utxo:zcash", "daily": "2000000" }],
                 "queue_new_targets": true,
-                "hl_markets": [{ "asset": 4, "max_leverage": 5 }]
+                "hl_markets": [{ "asset": 4, "max_leverage": 5 }],
+                "utxo": utxo
             }
         });
         let req = NearPromise::new(ext.account_id.parse::<defuse_wallet::AccountId>()?).function_call(

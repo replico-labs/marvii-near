@@ -34,7 +34,7 @@ page.on('pageerror', (e) => console.log('page error:', e.message));
 await page.route(`${RELAYER}/config`, (route) => route.fulfill({ json: { ...cfg, extension: OLD } }));
 await page.goto(PAGE);
 await page.click('#create');
-await page.waitForSelector('text=Balances', { timeout: 240_000 });
+await page.waitForSelector('.tiles3', { timeout: 240_000 });
 const wallet = await page.evaluate(() => JSON.parse(localStorage.getItem('marvii-near:passkey')).wallet);
 console.log('created', wallet, 'with', (await extensions(wallet)).map((e) => e.slice(0, 8)));
 
@@ -57,7 +57,7 @@ for (let i = 0; i < 30; i++) {
 console.log('now', after.map((e) => e.slice(0, 8)));
 const ok = after.includes(cfg.extension) && !after.includes(OLD);
 await page.reload();
-await page.waitForSelector('text=Balances', { timeout: 60_000 });
+await page.waitForSelector('.tiles3', { timeout: 60_000 });
 await page.waitForTimeout(5000);
 const still = await page.$eval('#move-card', (e) => !e.hidden);
 console.log('update card after the move:', still ? 'still shown' : 'gone');

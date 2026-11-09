@@ -6,6 +6,10 @@
 //   node agent.mjs approve <usdc>               approve the Aave pool for <usdc> USDC
 //   node agent.mjs supply <usdc>                supply <usdc> USDC to Aave
 //   node agent.mjs transfer <usdc> <0x address> try to send USDC away (must be refused)
+//   node agent.mjs uniswap <usdc>                swap USDC for WETH on Uniswap V3 (Base Sepolia)
+//   node agent.mjs withdraw <usdc>               withdraw USDC from Aave
+//   node agent.mjs pay <bitcoin|litecoin|bitcoin-cash|zcash> <amount> <address>
+//                                               pay on a payment-only chain
 //   node agent.mjs hl-leverage <n>              set ETH leverage on Hyperliquid testnet
 //   node agent.mjs hl-order <buy|sell> <size> <price> [Gtc|Ioc|Alo]
 //                                               place an ETH order on Hyperliquid testnet
@@ -33,10 +37,18 @@ const POOL = '0x8bab6d1b75f19e9ed9fce8b9bd338844ff79ae27';
 const USDC = '0xba50cd2a20f6da35d788639e581bca8d0b5d4d5f';
 // Refusals the delay queue can handle (extension v3, rules.rs).
 const NEW_TARGET = ['recipient not allowed', 'token recipient not allowed', 'not an allowed venue', 'spender is not a venue'];
-const N = 0xffffffffffffffffffffffffffffffffbaaedce6af48a03bbfd25e8cd0364141n; // secp256k1 order
+const N = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n; // secp256k1 order
 
 const evm = createPublicClient({ chain: baseSepolia, transport: http(process.env.EVM_RPC ?? 'https://sepolia.base.org') });
+// Uniswap V3 on Base Sepolia: SwapRouter02 and QuoterV2, both checked
+// on-chain (factory() is the Uniswap V3 factory, WETH9() is Base's WETH).
+const ROUTER = '0x94cc0aac535ccdb3c01d6787d6413c739ae12bc4';
+const QUOTER = '0xc5290058841028f1614f3a6f0f5816cad0df5e27';
+const WETH = '0x4200000000000000000000000000000000000006';
 const abi = parseAbi([
+  'function exactInputSingle((address tokenIn, address tokenOut, uint24 fee, address recipient, uint256 amountIn, uint256 amountOutMinimum, uint160 sqrtPriceLimitX96) params) payable returns (uint256)',
+  'function quoteExactInputSingle((address tokenIn, address tokenOut, uint256 amountIn, uint24 fee, uint160 sqrtPriceLimitX96) params) returns (uint256 amountOut, uint160, uint32, uint256)',
+  'function withdraw(address asset, uint256 amount, address to) returns (uint256)',
   'function approve(address spender, uint256 amount) returns (bool)',
   'function transfer(address to, uint256 amount) returns (bool)',
   'function supply(address asset, uint256 amount, address onBehalfOf, uint16 referralCode)',
@@ -213,6 +225,63 @@ async function hl(action) {
   return res.status === 'ok';
 }
 
+// ---- Payment-only chains (Bitcoin, Litecoin, Bitcoin Cash, Zcash) ----
+// The agent builds the payment with the wallet's own core (the same code
+// the page uses), sends the extension its inputs and outputs, and gets one
+// signature per input. The extension builds the signing hashes itself.
+async function loadCore() {
+  const core = await import('../web/src/core/core.js');
+  await core.default({ module_or_path: fs.readFileSync(new URL('../web/src/core/core_bg.wasm', import.meta.url)) });
+  return core;
+}
+const UTXO_BROADCAST = { bitcoin: '/utxo/bitcoin/tx', litecoin: '/utxo/litecoin/tx', 'bitcoin-cash': '/chain/bitcoin-cash/tx', zcash: '/chain/zcash/tx' };
+const UTXO_COINS = { bitcoin: '/utxo/bitcoin/address/{}/utxo', litecoin: '/utxo/litecoin/address/{}/utxo', 'bitcoin-cash': '/chain/bitcoin-cash/utxos/{}', zcash: '/chain/zcash/utxos/{}' };
+
+async function pay(chain, amount, to) {
+  const core = await loadCore();
+  const cfg = await relayer('/config');
+  const k = await view(cfg.rpc, cfg.signer, 'derived_public_key', { path: chain, predecessor: WALLET, domain_id: 0 });
+  const from = core.chain_address(chain, k);
+  const units = BigInt(Math.round(Number(amount) * 1e8)).toString();
+  const coins = (await relayer(UTXO_COINS[chain].replace('{}', encodeURIComponent(from)))).map((u) => ({ txid: u.txid, vout: u.vout, value: u.value }));
+  let plan, branch_id = 0, expiry_height = 0;
+  if (chain === 'bitcoin' || chain === 'litecoin') {
+    plan = JSON.parse(core.bitcoin_plan(from, to, units, JSON.stringify(coins), 2));
+  } else {
+    if (chain === 'zcash') {
+      const info = await relayer('/chain/zcash/info');
+      [branch_id, expiry_height] = [info.branch_id, info.height + 40];
+    }
+    plan = JSON.parse(core.legacy_plan(chain, from, to, units, JSON.stringify(coins), 2, branch_id, expiry_height));
+  }
+  if (plan.inputs.length > 2) throw new Error('agents spend at most 2 coins per payment');
+  const action = {
+    type: 'utxo_pay', chain, branch_id, expiry_height,
+    inputs: plan.inputs.map((i) => ({ txid: i.txid, vout: i.vout, value: i.value })),
+    outputs: plan.outputs.map((o) => ({ script: core.utxo_script(chain, o.address), value: o.value })),
+  };
+  console.log(`  ${plan.inputs.length} coin(s) in; out: ${plan.outputs.map((o) => `${o.value} to ${o.address === from ? 'change' : o.address}`).join(', ')}; fee ${plan.fee}`);
+  const s = await view(cfg.rpc, cfg.extension, 'get_session', { wallet: WALLET, key_id: 'aave-agent' });
+  const msg = JSON.stringify({ domain: 'marvii-session-v1', extension: cfg.extension, wallet: WALLET, key_id: 'aave-agent', nonce: s.nonce + 1, deadline_ms: Date.now() + 300_000, action });
+  const out = await relayer('/agent/execute', { msg, signature: crypto.sign(null, crypto.createHash('sha256').update(msg).digest(), agentKey()).toString('hex') });
+  console.log(`  NEAR tx ${out.tx_hash ?? '-'}`);
+  if (!out.ok || !out.mpc_signatures?.length) {
+    console.log(`  REFUSED by the extension: ${out.reason ?? out.error ?? 'no signature'}`);
+    return false;
+  }
+  // core matches each signature to its input and checks it's the account's key.
+  const signed = JSON.parse(chain === 'bitcoin' || chain === 'litecoin' ? core.bitcoin_signed_tx(JSON.stringify(plan), JSON.stringify(out.mpc_signatures)) : core.legacy_signed_tx(JSON.stringify(plan), JSON.stringify(out.mpc_signatures)));
+  const r = await fetch(RELAYER + UTXO_BROADCAST[chain], { method: 'POST', body: signed.raw }).then((r) => r.json());
+  console.log(`  broadcast: ${r.txid ?? r.error}`);
+  return !!r.txid;
+}
+
+async function view(rpc, account_id, method_name, args) {
+  const r = await fetch(rpc, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'query', params: { request_type: 'call_function', finality: 'final', account_id, method_name, args_base64: Buffer.from(JSON.stringify(args)).toString('base64') } }) }).then((r) => r.json());
+  if (r.error || r.result?.error) throw new Error(JSON.stringify(r.error ?? r.result.error));
+  return JSON.parse(Buffer.from(r.result.result).toString());
+}
+
 const usdc = (x) => BigInt(Math.round(Number(x) * 1e6));
 const [cmd, a1, a2] = process.argv.slice(2);
 if (cmd === 'keygen') {
@@ -228,6 +297,30 @@ if (cmd === 'keygen') {
 } else if (cmd === 'transfer') {
   console.log(`transfer ${a1} USDC to ${a2}`);
   await send(USDC, encodeFunctionData({ abi, functionName: 'transfer', args: [a2, usdc(a1)] }));
+} else if (cmd === 'uniswap') {
+  const from = await walletAddress(await relayer('/config'));
+  const amountIn = usdc(a1);
+  // The quote, then 2% slippage: the swap reverts if it would give less.
+  const { result } = await evm.simulateContract({ address: QUOTER, abi, functionName: 'quoteExactInputSingle', args: [{ tokenIn: USDC, tokenOut: WETH, amountIn, fee: 3000, sqrtPriceLimitX96: 0n }] });
+  const minOut = (result[0] * 98n) / 100n;
+  console.log(`approve the Uniswap router for ${a1} USDC`);
+  if (await send(USDC, encodeFunctionData({ abi, functionName: 'approve', args: [ROUTER, amountIn] }))) {
+    console.log(`swap ${a1} USDC for at least ${Number(minOut) / 1e18} WETH, to ${from}`);
+    await send(ROUTER, encodeFunctionData({ abi, functionName: 'exactInputSingle', args: [{ tokenIn: USDC, tokenOut: WETH, fee: 3000, recipient: from, amountIn, amountOutMinimum: minOut, sqrtPriceLimitX96: 0n }] }));
+  }
+} else if (cmd === 'uniswap-to') {
+  // An attack: the swap's output to someone else. The extension refuses it.
+  const amountIn = usdc(a1);
+  console.log(`swap ${a1} USDC with the output to ${a2}`);
+  await send(ROUTER, encodeFunctionData({ abi, functionName: 'exactInputSingle', args: [{ tokenIn: USDC, tokenOut: WETH, fee: 3000, recipient: a2, amountIn, amountOutMinimum: 1n, sqrtPriceLimitX96: 0n }] }));
+} else if (cmd === 'withdraw') {
+  const from = await walletAddress(await relayer('/config'));
+  console.log(`withdraw ${a1} USDC from Aave to ${from}`);
+  await send(POOL, encodeFunctionData({ abi, functionName: 'withdraw', args: [USDC, usdc(a1), from] }));
+} else if (cmd === 'pay') {
+  const [chain, amount, to] = process.argv.slice(3);
+  console.log(`pay ${amount} on ${chain} to ${to}`);
+  await pay(chain, amount, to);
 } else if (cmd === 'hl-leverage') {
   console.log(`set ETH leverage to ${a1}x (cross) on Hyperliquid testnet`);
   await hl({ type: 'hl_leverage', asset: HL_ETH, is_cross: true, leverage: Number(a1), nonce: Date.now() });
@@ -239,5 +332,5 @@ if (cmd === 'keygen') {
   console.log(`cancel ETH order ${a1} on Hyperliquid testnet`);
   await hl({ type: 'hl_cancel', asset: HL_ETH, oid: Number(a1), nonce: Date.now() });
 } else {
-  console.log('usage: agent.mjs keygen | approve <usdc> | supply <usdc> | transfer <usdc> <0x address> | hl-leverage <n> | hl-order <buy|sell> <size> <price> [tif] | hl-cancel <oid>');
+  console.log('usage: agent.mjs keygen | approve <usdc> | supply <usdc> | transfer <usdc> <0x address> | uniswap <usdc> | uniswap-to <usdc> <0x address> | withdraw <usdc> | hl-leverage <n> | hl-order <buy|sell> <size> <price> [tif] | hl-cancel <oid>');
 }
