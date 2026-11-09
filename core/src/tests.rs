@@ -188,7 +188,7 @@ fn mpc_sign(tx: &str, high_s: bool) -> String {
     use k256::ecdsa::SigningKey;
     let key = SigningKey::from_slice(&[0x11; 32]).unwrap();
     let hash: [u8; 32] = hex::decode(serde_json::from_str::<serde_json::Value>(&describe_evm_tx(tx).unwrap()).unwrap()["hash"].as_str().unwrap()).unwrap().try_into().unwrap();
-    let (sig, recid) = key.sign_prehash_recoverable(&hash).unwrap();
+    let (sig, recid) = key.sign_prehash_recoverable(&hash);
     let (r, mut s) = (sig.r().to_bytes().to_vec(), sig.s().to_bytes().to_vec());
     let mut y = recid.is_y_odd() as u8;
     if high_s {
@@ -322,7 +322,7 @@ fn btc_mpc_sigs(plan: &str) -> String {
     let key = SigningKey::from_slice(&[0x11; 32]).unwrap();
     let p: BtcPlan = serde_json::from_str(plan).unwrap();
     let sigs: Vec<_> = p.sighashes.iter().rev().map(|h| {
-        let (sig, recid) = key.sign_prehash_recoverable(&hex::decode(h).unwrap()).unwrap();
+        let (sig, recid) = key.sign_prehash_recoverable(&hex::decode(h).unwrap());
         serde_json::json!({ "big_r": { "affine_point": format!("{:02x}{}", 2 + recid.is_y_odd() as u8, hex::encode(sig.r().to_bytes())) }, "s": { "scalar": hex::encode(sig.s().to_bytes()) }, "recovery_id": recid.to_byte() })
     }).collect();
     serde_json::to_string(&sigs).unwrap()
@@ -358,7 +358,7 @@ fn bitcoin_signatures_from_another_key_are_refused() {
     let p: BtcPlan = serde_json::from_str(&plan).unwrap();
     let other = k256::ecdsa::SigningKey::from_slice(&[0x12; 32]).unwrap();
     let sigs: Vec<_> = p.sighashes.iter().map(|h| {
-        let (sig, recid) = other.sign_prehash_recoverable(&hex::decode(h).unwrap()).unwrap();
+        let (sig, recid) = other.sign_prehash_recoverable(&hex::decode(h).unwrap());
         serde_json::json!({ "big_r": { "affine_point": format!("{:02x}{}", 2 + recid.is_y_odd() as u8, hex::encode(sig.r().to_bytes())) }, "s": { "scalar": hex::encode(sig.s().to_bytes()) }, "recovery_id": recid.to_byte() })
     }).collect();
     assert!(bitcoin_signed_tx(&plan, &serde_json::to_string(&sigs).unwrap()).is_err());
@@ -381,7 +381,7 @@ fn tron_raw_and_signature_match_tronweb() {
     let d: serde_json::Value = serde_json::from_str(&describe_tron_raw(TRON_RAW).unwrap()).unwrap();
     assert_eq!((d["from"].as_str().unwrap(), d["to"].as_str().unwrap(), d["sun"].as_str().unwrap()), (TRON_FROM, TRON_TO, "1234567"));
     let key = k256::ecdsa::SigningKey::from_slice(&[0x11; 32]).unwrap();
-    let (sig, recid) = key.sign_prehash_recoverable(&hex::decode(TRON_TXID).unwrap()).unwrap();
+    let (sig, recid) = key.sign_prehash_recoverable(&hex::decode(TRON_TXID).unwrap());
     let resp = serde_json::json!({ "big_r": { "affine_point": format!("{:02x}{}", 2 + recid.is_y_odd() as u8, hex::encode(sig.r().to_bytes())) }, "s": { "scalar": hex::encode(sig.s().to_bytes()) }, "recovery_id": recid.to_byte() }).to_string();
     let out: serde_json::Value = serde_json::from_str(&tron_signed_tx(TRON_RAW, &resp, TRON_FROM).unwrap()).unwrap();
     assert_eq!(out["signature"], TRON_SIG);
@@ -423,7 +423,7 @@ const XRP_VECTORS: [(f64, &str, &str, &str); 2] = [
 
 fn xrp_mpc_sign(hash_hex: &str, key: [u8; 32], high_s: bool) -> String {
     let key = k256::ecdsa::SigningKey::from_slice(&key).unwrap();
-    let (sig, recid) = key.sign_prehash_recoverable(&hex::decode(hash_hex).unwrap()).unwrap();
+    let (sig, recid) = key.sign_prehash_recoverable(&hex::decode(hash_hex).unwrap());
     let mut y = recid.is_y_odd() as u8;
     let mut s = sig.s().to_bytes();
     if high_s {

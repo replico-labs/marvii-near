@@ -395,13 +395,14 @@ pub fn evm_signed_tx(tx_json: &str, mpc_signature_json: &str) -> Result<String, 
     let mut rs = big_r[1..].to_vec();
     rs.extend(&s);
     let mut signature = Signature::from_slice(&rs).map_err(err)?;
-    if let Some(low) = signature.normalize_s() {
+    let low = signature.normalize_s();
+    if low != signature {
         signature = low;
         recid ^= 1;
     }
     let key = VerifyingKey::recover_from_prehash(&hash, &signature, RecoveryId::from_byte(recid).ok_or("recovery id")?)
         .map_err(|_| "signature does not recover".to_string())?;
-    let point = key.to_encoded_point(false);
+    let point = key.to_sec1_point(false);
     let from = format!("0x{}", hex::encode(&Keccak256::digest(&point.as_bytes()[1..])[12..]));
 
     // Unsigned list items, then y-parity, r, s.
@@ -939,9 +940,9 @@ pub fn bitcoin_signed_tx(plan_json: &str, mpc_signatures_json: &str) -> Result<S
         for (i, h) in p.sighashes.iter().enumerate() {
             let hash = hex32(h)?;
             let Ok(key) = VerifyingKey::recover_from_prehash(&hash, &signature, RecoveryId::from_byte(recid).unwrap()) else { continue };
-            let pubkey = key.to_encoded_point(true).as_bytes().to_vec();
+            let pubkey = key.to_sec1_point(true).as_bytes().to_vec();
             if hash160(&pubkey)[..] == program[2..] && witnesses[i].is_none() {
-                let low = signature.normalize_s().unwrap_or(signature);
+                let low = signature.normalize_s();
                 let mut der = low.to_der().as_bytes().to_vec();
                 der.push(1); // SIGHASH_ALL
                 witnesses[i] = Some((der, pubkey));
@@ -1122,12 +1123,13 @@ pub fn tron_signed_tx(raw_hex: &str, mpc_signature_json: &str, from: &str) -> Re
         return Err("bad signature shape".into());
     }
     let mut signature = Signature::from_slice(&[&big_r[1..], &s[..]].concat()).map_err(err)?;
-    if let Some(low) = signature.normalize_s() {
+    let low = signature.normalize_s();
+    if low != signature {
         signature = low;
         recid ^= 1;
     }
     let key = VerifyingKey::recover_from_prehash(&txid, &signature, RecoveryId::from_byte(recid).unwrap()).map_err(|_| "signature does not recover".to_string())?;
-    let point = key.to_encoded_point(false);
+    let point = key.to_sec1_point(false);
     let addr = bs58::encode([&[0x41u8][..], &Keccak256::digest(&point.as_bytes()[1..])[12..]].concat()).with_check().into_string();
     if addr != from {
         return Err("signature is not from this account".into());
@@ -1319,9 +1321,7 @@ pub fn xrp_signed_tx(tx_hex: &str, mpc_signature_json: &str, from: &str) -> Resu
         return Err("bad signature shape".into());
     }
     let mut signature = Signature::from_slice(&[&big_r[1..], &s[..]].concat()).map_err(err)?;
-    if let Some(low) = signature.normalize_s() {
-        signature = low;
-    }
+    signature = signature.normalize_s();
     // The SigningPubKey sits at a fixed place in the layout describe accepted.
     let at = tx.windows(2).position(|w| w == [0x73, 33]).ok_or("no signing key")? + 2;
     let key = VerifyingKey::from_sec1_bytes(&tx[at..at + 33]).map_err(err)?;

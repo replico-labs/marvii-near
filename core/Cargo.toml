@@ -22,7 +22,7 @@ blake2 = "0.10"
 ed25519-dalek = { version = "2", default-features = false }
 base64 = "0.22"
 sha3 = "0.10"
-k256 = { version = "0.13", default-features = false, features = ["ecdsa", "arithmetic"] }
+k256 = { version = "0.14.0", default-features = false, features = ["ecdsa", "arithmetic"] }
 # Only for the shared EVM source file (near/extension/src/evm.rs); its
 # env::keccak256 path is never called here: the hash uses sha3 below.
 near-sdk = { version = "5.30.0", features = ["non-contract-usage"] }

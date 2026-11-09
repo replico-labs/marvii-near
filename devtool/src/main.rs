@@ -584,5 +584,5 @@ fn recover(resp: &Value, hash: &[u8]) -> Result<String> {
     rs.extend(hex::decode(s)?);
     let sig = Signature::from_slice(&rs)?;
     let vk = VerifyingKey::recover_from_prehash(hash, &sig, RecoveryId::from_byte(rid).ok_or_else(|| anyhow!("rid"))?)?;
-    Ok(hex::encode(vk.to_encoded_point(false).as_bytes()))
+    Ok(hex::encode(vk.to_sec1_point(false).as_bytes()))
 }
