@@ -1,4 +1,5 @@
 import qrcode from 'qrcode-generator';
+import { ICONS } from './icons';
 import '@fontsource-variable/geist';
 import '@fontsource-variable/geist-mono';
 import './style.css';
@@ -479,7 +480,8 @@ function depositSheet(id: string) {
 }
 
 function chainRow(id: string, name: string) {
-  return `<li><details id="${id}"><summary class="row between"><b>${esc(name)}</b><span class="muted bal">…</span></summary><div class="assets"></div></details></li>`;
+  const icon = ICONS[id] ? `<span class="coin" aria-hidden="true">${ICONS[id]}</span>` : '';
+  return `<li><details id="${id}"><summary class="row between"><span class="chain-name">${icon}<b>${esc(name)}</b></span><span class="muted bal">…</span></summary><div class="assets"></div></details></li>`;
 }
 
 /** Fills a chain row: the native balance on the row, and in its dropdown the
@@ -836,7 +838,8 @@ async function dashboard() {
                 const b = await tokenBalance(c.rpc, t.token, addr, t.decimals).catch(() => null);
                 if (!b || Number(b) <= 0) return '';
                 held.push({ symbol: t.symbol, token: t.token, decimals: t.decimals, balance: b });
-                return `<div class="row between"><span>${esc(t.symbol)}</span><span>${esc(b)}</span></div>`;
+                const icon = t.symbol.endsWith('USDC') ? `<span class="coin small" aria-hidden="true">${ICONS.USDC}</span>` : '';
+                return `<div class="row between"><span class="chain-name">${icon}${esc(t.symbol)}</span><span>${esc(b)}</span></div>`;
               }),
             );
             holdings[c.id] = held;

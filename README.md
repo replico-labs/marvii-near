@@ -137,6 +137,8 @@ To host the relayer, see `relayer/Dockerfile`. Build it from this directory: `do
 - [near-sdk](https://github.com/near/near-sdk-rs)
 - [near-kit](https://crates.io/crates/near-kit)
 - NEAR Chain Signatures (`v1.signer-prod.testnet`)
+- [web3icons](https://github.com/0xa3k5/web3icons) (MIT): chain and token logos, copied into `web/src/icons.ts` by `web/scripts/gen-icons.mjs`
+- [qrcode-generator](https://github.com/kazuhikoarase/qrcode-generator) (MIT): Deposit QR codes
 - [viem](https://viem.sh): EVM transaction serialization in the demo agent
 - Aave V3 Base Sepolia addresses from [bgd-labs/aave-address-book](https://github.com/bgd-labs/aave-address-book)
 
