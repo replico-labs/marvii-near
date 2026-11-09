@@ -144,6 +144,56 @@ Requirements: Rust 1.97 with `wasm32-unknown-unknown`, Node 22, and a funded NEA
 
 To host the relayer, see `relayer/Dockerfile`. Build it from this directory: `docker build -f relayer/Dockerfile .`.
 
+## Connect your own agent
+
+Any program that can sign with ed25519 can be a Marvii agent. It never holds the account's keys: it signs requests with its own session key, and the extension on NEAR checks each one against the rules the owner granted. `agent/agent.mjs` is a complete working example.
+
+1. **Make the agent's key.** Any ed25519 key pair. The agent keeps the private half; the owner needs only the public half (64 hex characters). With the example agent: `node agent.mjs keygen`.
+2. **Have the owner grant it.** On https://near.marvii.xyz, open **Apps & agents**, then **Add**:
+   - paste the public key and choose a key ID (for example `my-agent`)
+   - pick what it may do: venues (Aave V3, Uniswap V3 or any contract and function), recipients, Hyperliquid markets and leverage, payments on Bitcoin-style chains, daily caps, expiry
+   - approve the Confirm screen with the passkey. The grant attaches a small storage deposit (0.01 NEAR) from the account.
+3. **Build a request.** The agent signs this exact JSON text (the field order doesn't matter to the extension, but the signature covers the exact bytes sent):
+   ```json
+   {
+     "domain": "marvii-session-v1",
+     "extension": "<extension account, from GET /config>",
+     "wallet": "<the owner's account, 0s…>",
+     "key_id": "my-agent",
+     "nonce": 8,
+     "deadline_ms": 1762700300000,
+     "action": { "type": "hl_leverage", "asset": 4, "is_cross": true, "leverage": 3, "nonce": 1762700000000 }
+   }
+   ```
+   - `nonce` is the session's current nonce plus one. Read it with the extension's view `get_session({ wallet, key_id })`.
+   - `deadline_ms` is at most 10 minutes ahead of now.
+   - `signature` is ed25519 over SHA-256 of the message text, as 128 hex characters.
+4. **Send it** to the relayer, which pays the gas:
+   ```
+   POST https://relayer.marvii.xyz/agent/execute
+   { "msg": "<the JSON text above>", "signature": "<hex>" }
+   ```
+   The answer has `ok`, `tx_hash` (the NEAR transaction), `reason` when refused, and the Chain Signatures result in `mpc_signature` (`mpc_signatures`, one per input, for a payment).
+5. **Finish on the other chain.** The agent attaches the signature and broadcasts. For an EVM transaction the answer also carries `evm_signing_hash`; for Hyperliquid, the extension's view `hl_signing_hash({ action })` gives the digest. Check that the signature recovers to the account's own address before sending, as `agent.mjs` does.
+
+| `action.type` | Fields |
+|---|---|
+| `evm_tx` | `tx`: `chain_id`, `nonce`, `max_priority_fee_per_gas`, `max_fee_per_gas`, `gas_limit`, `to`, `value`, `data` (0x hex). Fee and value amounts are decimal strings. |
+| `near_call` | `receiver_id`, `method`, `args` (JSON text), `deposit` (yoctoNEAR, decimal string) |
+| `hl_order` | `asset`, `is_buy`, `price`, `size`, `reduce_only`, `tif` (`Gtc`, `Ioc` or `Alo`), `nonce` (now, in milliseconds) |
+| `hl_cancel` | `asset`, `oid`, `nonce` |
+| `hl_leverage` | `asset`, `is_cross`, `leverage`, `nonce` |
+| `utxo_pay` | `chain` (`bitcoin`, `litecoin`, `bitcoin-cash`, `zcash`), `inputs` (`txid`, `vout`, `value`), `outputs` (`script` hex, `value`); Zcash also `branch_id` and `expiry_height`. At most 2 inputs and 3 outputs. |
+
+**Outside the rules.**
+- Over the daily cap, an EVM request comes back with a `pending_id`. The owner approves it with one passkey tap on the page; the agent polls `GET /pending/<id>` for the signature.
+- A new recipient or contract: send the same request to `POST /agent/propose` instead (if the grant allows proposals). It waits in a queue the owner can cancel; after the delay, `POST /queued/<id>/execute` with `{ "wallet": "<account>" }` runs it, and the rules are checked again.
+- The owner can revoke the key at any time; the next request is refused.
+
+**Keeping the key in a TEE.** `agent/outlayer/` holds the agent's key inside OutLayer's Intel TDX enclave instead of on the agent's machine. Build the module (`cargo build --release --target wasm32-wasip2`), publish it and read its key with devtool's `outlayer-upload` and `outlayer-run`, grant that key on the page, then trade with `agent/outlayer/agent.mjs`. The run on testnet is in [TESTNET.md](TESTNET.md).
+
+**Limits on the hosted relayer.** It checks the signature and nonce before paying gas, and relays at most 50 transactions per account per day. For more, run your own relayer (above).
+
 ## Security model
 
 - The passkey is the only owner. The extension acts only within a grant the passkey signed, and it can't grant itself anything.
