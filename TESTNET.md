@@ -1,4 +1,31 @@
+# Marvii on NEAR: testnet record
 
+Everything below ran on NEAR testnet and each chain's testnet (8 to 13 November 2026), or, for protocols that exist only on mainnet, on a local fork of mainnet (Surfpool for Solana, Anvil for Polygon). The sections after the table have the transaction hashes, explorer links and build notes.
+
+| Step | Result |
+|---|---|
+| The passkey grants an agent: `supply` on Aave V3, up to 50 USDC a day, 7 days | granted on NEAR |
+| The agent approves 20 USDC, then supplies 20 USDC to Aave | both signed through Chain Signatures and broadcast on Base Sepolia |
+| The agent asks for 40 more USDC | refused (over the daily cap), then approved by the passkey and broadcast |
+| The agent pays 5 USDC to an unknown address directly | refused (recipient not allowed) |
+| It proposes the same payment instead | queued for 10 minutes, then run and broadcast |
+| A second proposal | cancelled by the passkey; it can never run |
+| The passkey revokes the agent | its next request is refused |
+| The owner sends from the dashboard: 1 USDC on Base, 0.01 SOL on Solana, 10,000 sats on Bitcoin, 0.002 LTC on Litecoin, 5 TRX on TRON, 5 XRP on XRP, 5 ADA on Cardano, 0.01 ZEC on Zcash | each approved with the passkey, signed, broadcast |
+| The passkey grants an agent ETH perps on Hyperliquid testnet: at most 5x, up to 100 USD of orders a day | granted on NEAR (extension v4) |
+| The owner moves 40 USDC from spot to perps on Hyperliquid | one passkey tap; the page builds the digest, Chain Signatures signs it |
+| The agent sets 3x leverage, places a resting order, cancels it, then buys 0.01 ETH | all accepted by Hyperliquid testnet; the buy filled at 2124.77, the account holds 0.01 ETH long at 3x |
+| The agent asks for 10x leverage, then a 120 USD order | refused (above the grant's leverage; over the daily cap) |
+| A TEE agent (key derived inside the enclave) is granted its own session | its order is signed; 20x leverage refused |
+| An account created on extension v3 | moved to v4 with one passkey tap; same address |
+| The agent swaps 5 USDC for WETH on Uniswap V3, then withdraws 10 USDC from Aave | both broadcast on Base Sepolia; the output and the withdrawal go to the account |
+| It tries the same swap with the output to another address | refused on NEAR: "venue call sends the result to someone else" |
+| The agent pays 2,000 sats on Bitcoin and 0.001 ZEC on Zcash to listed recipients | signed one signature per input, broadcast |
+| It pays an unlisted Bitcoin address, then 0.001 BTC over its daily cap | both refused on NEAR |
+| The agent stakes TRX for sTRX on JustLend (Nile), TON for tsTON on Tonstakers, NEAR for NearX (Stader), and pays on Cardano (preprod) | each checked by the extension and broadcast on that chain's testnet |
+| A NEAR Intents top-up: the agent pays 1Click's signed quote from one chain to the account's own address on another | the extension checks 1Click's signature, the price and the destination |
+| On mainnet forks: a Jupiter swap and a Phoenix spot swap (Surfpool), a Polymarket order settled on Polygon's exchange (Anvil) | checked, signed, executed on the fork; output to someone else refused |
+| Phoenix perps, the way protean-bot's desk runs them: the account deposits, opens an isolated subaccount and delegates it to its own trading key; an agent whose key is in OutLayer's TEE trades it | orders checked (market, size, limit price) and signed; withdrawing, unlisted markets and oversize orders refused |
 
 ## Sending on Solana and Bitcoin (owner)
 
