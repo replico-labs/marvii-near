@@ -130,6 +130,13 @@ pre { white-space: pre-wrap; word-break: break-all; background: var(--mv-paper);
 .tile { display: grid; gap: 6px; justify-items: start; padding: 18px 16px; border-radius: 18px; background: var(--mv-surface); border: 1px solid var(--mv-line); color: var(--mv-ink); text-decoration: none; transition: transform .12s ease, border-color .12s ease, box-shadow .12s ease; }
 .tile:hover, .tile:focus-visible { transform: translateY(-2px); border-color: color-mix(in srgb, var(--mv-iris) 45%, var(--mv-line)); box-shadow: 0 6px 18px rgb(0 0 0 / 0.06); outline: none; }
 .tile b { font-size: 16px; }
+button.tile { font: inherit; text-align: left; cursor: pointer; width: 100%; }
+.tile .caret { font-size: 12px; color: var(--mv-ink2); margin-left: 2px; }
+.tile-wrap { position: relative; display: grid; }
+.tile-menu { position: absolute; z-index: 20; top: calc(100% + 6px); left: 0; right: 0; display: grid; padding: 6px; border-radius: 14px; background: var(--mv-surface); border: 1px solid var(--mv-line); box-shadow: 0 10px 28px rgb(0 0 0 / 0.12); }
+.tile-menu[hidden] { display: none; }
+.tile-menu a { display: grid; gap: 2px; padding: 10px 12px; border-radius: 10px; color: var(--mv-ink); text-decoration: none; }
+.tile-menu a:hover, .tile-menu a:focus-visible { background: color-mix(in srgb, var(--mv-iris) 10%, transparent); outline: none; }
 .tile-ic { width: 40px; height: 40px; border-radius: 12px; display: grid; place-items: center; background: color-mix(in srgb, var(--mv-iris) 12%, transparent); color: var(--mv-iris); }
 .tile-ic svg { width: 22px; height: 22px; }
 @media (max-width: 480px) { .tiles3 { grid-template-columns: 1fr; } .tile { grid-template-columns: auto 1fr; align-items: center; column-gap: 12px; } .tile .tile-ic { grid-row: span 2; } }

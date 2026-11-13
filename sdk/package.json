@@ -1,5 +1,5 @@
 {
-  "name": "@marvii/agent-sdk",
+  "name": "@replico-labs/marvii-sdk",
   "version": "0.1.0",
   "description": "Give an AI agent a Marvii wallet: a session key, a passkey-approved permission link, and actions the Marvii extension checks on NEAR before Chain Signatures sign them.",
   "type": "module",

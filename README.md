@@ -22,7 +22,7 @@ Testnet only. The contracts are unaudited.
 
 ## What happened on testnet
 
-All of the following ran on NEAR testnet and each chain's testnet (8–9 November 2026). Transaction hashes, explorer links and build notes are in [TESTNET.md](TESTNET.md).
+All of the following ran on NEAR testnet and each chain's testnet (8–13 November 2026), or, for protocols that exist only on mainnet, on a local fork of mainnet. Transaction hashes, explorer links and build notes are in [TESTNET.md](TESTNET.md).
 
 | Step | Result |
 |---|---|
@@ -44,6 +44,10 @@ All of the following ran on NEAR testnet and each chain's testnet (8–9 Novembe
 | It tries the same swap with the output to another address | refused on NEAR: "venue call sends the result to someone else" |
 | The agent pays 2,000 sats on Bitcoin and 0.001 ZEC on Zcash to listed recipients | signed one signature per input, broadcast |
 | It pays an unlisted Bitcoin address, then 0.001 BTC over its daily cap | both refused on NEAR |
+| The agent stakes TRX for sTRX on JustLend (Nile), TON for tsTON on Tonstakers, NEAR for NearX (Stader), and pays on Cardano (preprod) | each checked by the extension and broadcast on that chain's testnet |
+| A NEAR Intents top-up: the agent pays 1Click's signed quote from one chain to the account's own address on another | the extension checks 1Click's signature, the price and the destination |
+| On mainnet forks: a Jupiter swap and a Phoenix spot swap (Surfpool), a Polymarket order settled on Polygon's exchange (Anvil) | checked, signed, executed on the fork; output to someone else refused |
+| Phoenix perps, the way protean-bot's desk runs them: the account deposits, opens an isolated subaccount and delegates it to its own trading key; an agent whose key is in OutLayer's TEE trades it | orders checked (market, size, limit price) and signed; withdrawing, unlisted markets and oversize orders refused |
 
 ## How it works
 
@@ -79,13 +83,13 @@ All of the following ran on NEAR testnet and each chain's testnet (8–9 Novembe
   - create with a passkey
   - Home: the account, then Assets, Swap, and Apps & agents
   - Assets: a tile per chain. Each chain's page has Send and Receive (address and QR code), what it holds, and its recent history from the chain's explorer. Send works on every chain: NEAR, nine EVM chains, Bitcoin, Solana, TRON, XRP, Cardano, Litecoin, Dogecoin, Bitcoin Cash and Zcash
-  - Swap: a live NEAR Intents quote (1Click, `dry: true`), and Top up another chain: a real quote paying your own address, deposited with the passkey (mainnet funds)
+  - Swap: a menu with two pages. Swap: a live NEAR Intents quote (1Click, `dry: true`). Top up another chain: a real quote paying your own address, deposited with the passkey (mainnet funds)
   - Hyperliquid: the account's spot and perps USDC, and Move to perps with the passkey
-  - agents and apps, with Hyperliquid markets in the grant
+  - Apps & agents: a dropdown of protocols by chain; each protocol's page lists the agents that can use it, what they may do there and their daily limits, with Revoke. Access comes from permission links (pasted here or opened directly); a form to add a key by hand stays under "Building an agent?" for testing
   - Confirm, which decodes exactly what the passkey signs
   - approvals, the queue, and a one-tap move to a newer extension
 - **`agent/`** is a demo agent. It holds only a session key. Before broadcasting, it checks the signature recovers to the account's address for its own transaction. It supplies to Aave on Base Sepolia and trades on Hyperliquid testnet.
-  - **`agent/outlayer/`** holds the agent's key in OutLayer's TEE. A Rust module (wasm32-wasip2, 156 KB) declares one ed25519 key bound to its own build (`bind: "wasm"`). OutLayer derives the key inside the enclave and signs only through host calls, so the module never sees it. The module builds the agent's message itself, for Hyperliquid actions only, with the deadline taken from the NEAR block's time; it never signs bytes it is handed. Each run is a NEAR transaction to `outlayer.testnet`, and `testnet-api.outlayer.ai/attestations/by-tx/<tx>` returns its TDX quote. `agent.mjs` holds no key: it asks the module to sign, then sends to the relayer and Hyperliquid.
+  - **`agent/outlayer/`** holds the agent's key in OutLayer's TEE. A Rust module (wasm32-wasip2, 171 KB) declares one ed25519 key bound to its own build (`bind: "wasm"`). OutLayer derives the key inside the enclave and signs only through host calls, so the module never sees it. The module builds the agent's message itself, for the action types the extension knows (Hyperliquid, EVM, Solana and Phoenix perps orders, the other chains, Seaport, Polymarket, Intents top-ups), with the deadline taken from the NEAR block's time; it never signs bytes it is handed. Each run is a NEAR transaction to `outlayer.testnet`, and `testnet-api.outlayer.ai/attestations/by-tx/<tx>` returns its TDX quote. `agent.mjs` holds no key: it asks the module to sign, then sends to the relayer and Hyperliquid.
 - **`names/`** and **`forwarder/`** give each account a name, e.g. `alice.marvii.testnet`. NEAR wallet apps and exchanges don't yet accept `0s…` accounts (NEP-616) as recipients; a name works everywhere.
   - `names/` is the registry, deployed at `marvii.testnet`. The account calls `register("alice")` itself, so only its passkey can claim a name for it, and the page puts this in the same tap that activates the account. One name per account; a name is never reassigned.
   - The registry creates `alice.marvii.testnet` with no keys, running `forwarder/` (shared global code, published once by hash), with the account as its only target. NEAR sent to the name is forwarded by the relayer within about 20 seconds (anyone may call `forward`); tokens sent with `ft_transfer_call` are forwarded at once, and with a plain `ft_transfer` by `forward_ft`.
@@ -97,7 +101,8 @@ All of the following ran on NEAR testnet and each chain's testnet (8–9 Novembe
 | | |
 |---|---|
 | Wallet code (`defuse-wallet-webauthn-p256`, near/intents `32cd1f9`), immutable global contract | `909f39dd861604db7f75eafad948b6cf288ffc81db1fb59177030f227721c98e` |
-| Marvii extension v5 (venue rules, Uniswap, payments) | `d591504aa95d1d7164f11dfac2016363dd18788458040c7fc3ee32cd4344e0ec` (v3 and v4 still accepted; the page offers the move) |
+| Marvii extension v6 (13 November 2026) | `0e59c2a2862583fd03eb8a6ad722a67d54189ce241f4f3b46c4884e26ee4f5a0` (v3 to v5 still accepted; the page offers the move) |
+| OutLayer TEE module (agent keys) | `551085926472e0a1236afa1c7461e63c87413496c63cf77645890e886433775b` on `outlayer.testnet` |
 | Chain Signatures | `v1.signer-prod.testnet` |
 | Names registry; forwarder code hash | `marvii.testnet`; `9428c9b6ea5401af2ecd8487170c5ceb409daa81133b8b62d70f59105d7f795e` |
 | Demo account | `0s3465557e026f471c0e84898f799c8032f356c77a`, EVM `0x48f0deef2c7e15ea9b4398a6875b43b5ab6ea81e` |

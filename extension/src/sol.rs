@@ -59,6 +59,22 @@ pub const KAMINO_OBLIGATION_RENT: u128 = (3344 + 128) * 6960;
 /// Tensor's marketplace (TCMP), the same ID on mainnet and devnet
 /// (@tensor-foundation/marketplace 1.0.0, as protean-bot pins it).
 pub const TENSOR: &str = "TCMPhJdwDryooaGtiocG1u3xcYbRpiJzb283XfCZsDp";
+/// Jupiter v6 (mainnet; on a Surfpool fork for tests). Discriminators are
+/// Anchor's sha256("global:<name>")[..8] for the names in Jupiter's IDL
+/// (jup-ag/jupiter-cpi idl.json), and match its API's instructions.
+pub const JUPITER: &str = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
+const J_ROUTE: [u8; 8] = [0xe5, 0x17, 0xcb, 0x97, 0x7a, 0xe3, 0xad, 0x2a];
+const J_SHARED_ROUTE: [u8; 8] = [0xc1, 0x20, 0x9b, 0x33, 0x41, 0xd6, 0x9c, 0x81];
+/// Phoenix v1 (mainnet; on a Surfpool fork for tests): Ellipsis-Labs/phoenix-v1.
+pub const PHOENIX: &str = "PhoeNiXZ8ByJGLkxNfZRnkUfjvmuYqLR89jjFHGqdXY";
+/// Phoenix markets with their lot sizes (fixed when a market is made), from
+/// each market's header on mainnet (13 November 2026): market, base mint,
+/// base lot size, quote mint, quote lot size.
+const PHOENIX_MARKETS: [(&str, &str, u64, &str, u64); 1] = [
+    ("4DoNfFBfF7UokCC2FQzriy7yHK6DY6NVdYpuekQ5pRgg", WSOL, 1_000_000, "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", 1),
+];
+/// The most slippage an agent's Jupiter swap may allow.
+pub const JUP_MAX_SLIPPAGE_BPS: u16 = 300;
 /// That client's discriminators.
 const T_LIST_LEGACY: [u8; 8] = [6, 110, 255, 18, 16, 36, 8, 30];
 const T_BUY_LEGACY: [u8; 8] = [68, 127, 43, 8, 212, 31, 249, 114];
@@ -142,11 +158,13 @@ pub struct Own {
     pub atas: Vec<([u8; 32], [u8; 32], [u8; 32])>,
     /// The account's own Kamino obligations.
     pub obligations: Vec<[u8; 32]>,
+    /// The account's own Phoenix perps trader accounts, with their subaccount.
+    pub traders: Vec<([u8; 32], u8)>,
 }
 
 impl Own {
     /// The mint of the account's own token account at `addr`, if it is one.
-    fn mine(&self, addr: &[u8; 32]) -> Option<[u8; 32]> {
+    pub fn mine(&self, addr: &[u8; 32]) -> Option<[u8; 32]> {
         self.atas.iter().find(|(a, o, _)| a == addr && o == &self.me).map(|(_, _, m)| *m)
     }
     fn owner_of(&self, addr: &[u8; 32]) -> Option<([u8; 32], [u8; 32])> {
@@ -219,7 +237,8 @@ fn check_ix(g: &SolGrant, own: &Own, ix: &Ix, queued: bool, cu: &mut (Option<u64
         if to == own.me {
             return Err("transfer to itself");
         }
-        if !queued && !g.recipients.contains(&fmt(&to)) {
+        // Fees for the account's own Phoenix trading keys.
+        if !queued && !g.recipients.contains(&fmt(&to)) && !g.perps.iter().any(|x| x.trader_key == fmt(&to)) {
             return Err("recipient not allowed");
         }
         return Ok(vec![("sol".into(), lamports)]);
@@ -507,6 +526,111 @@ fn check_ix(g: &SolGrant, own: &Own, ix: &Ix, queued: bool, cu: &mut (Option<u64
             }
             _ => Err("not a Kamino instruction the extension knows"),
         }
+    } else if p == JUPITER {
+        let disc: [u8; 8] = d.get(..8).and_then(|b| b.try_into().ok()).ok_or("instruction data too short")?;
+        if !queued && !g.venues.iter().any(|v| v.program == JUPITER && v.scope == JUPITER) {
+            return Err("not an allowed venue");
+        }
+        // The route plan varies in length; the fixed arguments end the data:
+        // in_amount u64, quoted_out_amount u64, slippage_bps u16, platform_fee_bps u8.
+        if d.len() < 8 + 4 + 19 {
+            return Err("instruction data too short");
+        }
+        let t = d.len() - 19;
+        let in_amount = u64_at(d, t)? as u128;
+        let slippage = u16::from_le_bytes([d[t + 16], d[t + 17]]);
+        if d[t + 18] != 0 {
+            return Err("no platform fee");
+        }
+        if slippage > JUP_MAX_SLIPPAGE_BPS {
+            return Err("slippage over 3%");
+        }
+        // An optional account left out is Jupiter's own program ID.
+        let none = |i: usize| -> Result<bool, &'static str> { Ok(key(i)? == ix.program) };
+        match disc {
+            // route: token program, user (signer), user source, user
+            // destination, destination (optional), destination mint,
+            // platform fee account (optional), event authority, program;
+            // then the route's accounts.
+            J_ROUTE => {
+                if a.len() < 9 {
+                    return Err("wrong number of accounts");
+                }
+                signer_me(1)?;
+                let src = own.mine(&key(2)?).ok_or("the source must be the account's own token account")?;
+                let mint = key(5)?;
+                if own.mine(&key(3)?) != Some(mint) || !(none(4)? || own.mine(&key(4)?) == Some(mint)) {
+                    return Err("venue call sends the result to someone else");
+                }
+                if !none(6)? {
+                    return Err("no platform fee");
+                }
+                Ok(vec![(asset(&src), in_amount)])
+            }
+            // shared_accounts_route: token program, program authority, user
+            // (signer), source, program source, program destination,
+            // destination, source mint, destination mint, platform fee
+            // account (optional), token-2022, event authority, program.
+            J_SHARED_ROUTE => {
+                if a.len() < 13 {
+                    return Err("wrong number of accounts");
+                }
+                signer_me(2)?;
+                let src = key(7)?;
+                if own.mine(&key(3)?) != Some(src) {
+                    return Err("the source must be the account's own token account");
+                }
+                if own.mine(&key(6)?) != Some(key(8)?) {
+                    return Err("venue call sends the result to someone else");
+                }
+                if !none(9)? {
+                    return Err("no platform fee");
+                }
+                Ok(vec![(asset(&src), in_amount)])
+            }
+            _ => Err("only Jupiter's route and shared-accounts route"),
+        }
+    } else if p == crate::perps::PROGRAM || p == crate::perps::EMBER {
+        if !queued && g.perps.is_empty() {
+            return Err("not an allowed venue");
+        }
+        crate::perps::check_authority(&g.perps, own, ix)
+    } else if p == PHOENIX {
+        // Swap (0) with an ImmediateOrCancel packet (2): phoenix program,
+        // log authority, market, trader (signer), base account, quote
+        // account, base vault, quote vault, token program.
+        if d.first() != Some(&0) || d.get(1) != Some(&2) {
+            return Err("only Phoenix swaps (immediate or cancel)");
+        }
+        n(9)?;
+        if key(0)? != ix.program || fmt(&key(8)?) != TOKEN {
+            return Err("unexpected program");
+        }
+        let market = key(2)?;
+        venue_ok(g, PHOENIX, &market, queued)?;
+        let &(_, base, base_lot, quote, quote_lot) = PHOENIX_MARKETS.iter().find(|m| m.0 == fmt(&market)).ok_or("unknown Phoenix market")?;
+        signer_me(3)?;
+        // Both sides settle into the account's own token accounts.
+        if own.mine(&key(4)?).map(|m| fmt(&m)) != Some(base.to_string()) || own.mine(&key(5)?).map(|m| fmt(&m)) != Some(quote.to_string()) {
+            return Err("venue call sends the result to someone else");
+        }
+        let side = *d.get(2).ok_or("instruction data too short")?;
+        // price_in_ticks: Option<u64>.
+        let at = match d.get(3) {
+            Some(0) => 4,
+            Some(1) => 12,
+            _ => return Err("unexpected Phoenix order"),
+        };
+        let (base_lots, quote_lots) = (u64_at(d, at)? as u128, u64_at(d, at + 8)? as u128);
+        // Phoenix takes exactly one budget; the extension asks for the one
+        // that bounds what leaves the account: quote lots to buy, base lots
+        // to sell.
+        match side {
+            0 if base_lots == 0 && quote_lots > 0 => Ok(vec![(if quote == WSOL { "sol".into() } else { format!("spl:{quote}") }, quote_lots * quote_lot as u128)]),
+            1 if quote_lots == 0 && base_lots > 0 => Ok(vec![(if base == WSOL { "sol".into() } else { format!("spl:{base}") }, base_lots * base_lot as u128)]),
+            0 | 1 => Err("buy in quote lots, sell in base lots"),
+            _ => Err("unexpected Phoenix order"),
+        }
     } else if p == TENSOR {
         let disc: [u8; 8] = d.get(..8).and_then(|b| b.try_into().ok()).ok_or("instruction data too short")?;
         let me_or_none = |i: usize| -> Result<(), &'static str> {
@@ -637,7 +761,14 @@ pub fn parse(ixs: &[SolIx]) -> Result<Vec<Ix>, &'static str> {
 pub fn check(g: &SolGrant, own: &Own, ixs: &[Ix], blockhash: &[u8; 32], queued: bool) -> Result<(Vec<u8>, Vec<(String, u128)>), &'static str> {
     let mut spends: Vec<(String, u128)> = vec![];
     let mut cu = (None, 0u64);
-    for ix in ixs {
+    for (i, ix) in ixs.iter().enumerate() {
+        // Phoenix's withdraw flow approves Ember's state to pull the
+        // collateral it unwraps: allowed only when a later instruction of
+        // the same transaction unwraps exactly that amount, so no allowance
+        // is left behind.
+        if crate::perps::ember_approve(own, ix, &ixs[i + 1..])? {
+            continue;
+        }
         for (asset, amount) in check_ix(g, own, ix, queued, &mut cu)? {
             match spends.iter_mut().find(|(a, _)| *a == asset) {
                 Some((_, v)) => *v = v.checked_add(amount).ok_or("overflow")?,

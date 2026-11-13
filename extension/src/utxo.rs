@@ -16,7 +16,7 @@
 
 use near_sdk::env;
 
-pub const CHAINS: [&str; 5] = ["bitcoin", "litecoin", "bitcoin-cash", "zcash", "dogecoin"];
+pub const CHAINS: [&str; 6] = ["bitcoin", "litecoin", "bitcoin-cash", "zcash", "dogecoin", "cardano"];
 /// The largest previous transaction accepted (Dogecoin inputs).
 pub const MAX_PREV_TX: usize = 20_000;
 pub const MAX_INPUTS: usize = 2;
@@ -45,6 +45,8 @@ pub fn self_script_ok(chain: &str, s: &[u8]) -> bool {
     match chain {
         "bitcoin" | "litecoin" => s.len() == 22 && s[0] == 0x00 && s[1] == 0x14,
         "bitcoin-cash" | "zcash" | "dogecoin" => s.len() == 25 && s[..3] == [0x76, 0xa9, 0x14] && s[23..] == [0x88, 0xac],
+        // Cardano: the account's Shelley address bytes.
+        "cardano" => crate::cardano::address_ok(s),
         _ => false,
     }
 }
@@ -52,6 +54,9 @@ pub fn self_script_ok(chain: &str, s: &[u8]) -> bool {
 /// A recipient script of a standard shape: P2PKH, P2SH, or (Bitcoin and
 /// Litecoin only) a SegWit program.
 pub fn recipient_script_ok(chain: &str, s: &[u8]) -> bool {
+    if chain == "cardano" {
+        return crate::cardano::address_ok(s);
+    }
     let p2pkh = s.len() == 25 && s[..3] == [0x76, 0xa9, 0x14] && s[23..] == [0x88, 0xac];
     let p2sh = s.len() == 23 && s[..2] == [0xa9, 0x14] && s[22] == 0x87;
     let segwit = s.len() >= 4 && s.len() <= 42 && (s[0] == 0 || (0x51..=0x60).contains(&s[0])) && s[1] as usize == s.len() - 2;

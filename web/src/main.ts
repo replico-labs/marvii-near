@@ -112,6 +112,9 @@ const TOKENS: Record<string, { symbol: string; decimals: number }> = {
   '84532:0xba50cd2a20f6da35d788639e581bca8d0b5d4d5f': { symbol: 'USDC', decimals: 6 },
   '84532:0x4200000000000000000000000000000000000006': { symbol: 'WETH', decimals: 18 },
   '560048:0x3508a952176b3c15387c97be809eaffb1982176a': { symbol: 'stETH', decimals: 18 },
+  // Polygon's USDC.e (Polymarket's collateral) and Base's USDC (top-ups).
+  '137:0x2791bca1f2de4661ed88a30c99a7a9449aa84174': { symbol: 'USDC.e', decimals: 6 },
+  '8453:0x833589fcd6edb6e08f4c7c32d4f71b54bda02913': { symbol: 'USDC', decimals: 6 },
 };
 /** Hyperliquid testnet perps by asset index (`meta` universe, checked
  *  9 November 2026). */
@@ -120,22 +123,37 @@ const hlName = (a: number) => (HL_MARKETS[a] ? `${HL_MARKETS[a]} perps` : `marke
 /** Cap amounts in plain words where the page knows the asset. */
 /** The payment-only chains agents may pay on (Dogecoin's signatures don't
  *  commit to amounts, so its fees can't be capped: not offered). */
-const PAY_CHAINS: Record<string, string> = { bitcoin: 'BTC', litecoin: 'LTC', 'bitcoin-cash': 'BCH', zcash: 'ZEC' };
-const PAY_NAMES: Record<string, string> = { bitcoin: 'Bitcoin', litecoin: 'Litecoin', 'bitcoin-cash': 'Bitcoin Cash', zcash: 'Zcash' };
+const PAY_CHAINS: Record<string, string> = { bitcoin: 'BTC', litecoin: 'LTC', 'bitcoin-cash': 'BCH', zcash: 'ZEC', dogecoin: 'DOGE', cardano: 'ADA' };
+const PAY_NAMES: Record<string, string> = { bitcoin: 'Bitcoin', litecoin: 'Litecoin', 'bitcoin-cash': 'Bitcoin Cash', zcash: 'Zcash', dogecoin: 'Dogecoin', cardano: 'Cardano' };
+/** Decimals of each payment chain's coin (ADA has 6, the rest 8). */
+const payDecimals = (chain: string) => (chain === 'cardano' ? 6 : 8);
 function capWords(asset: string, daily: string): string {
   if (asset === 'hyperliquid:usd') return `$${esc(fmtUnits(BigInt(daily), 6, 2))} of Hyperliquid orders`;
-  if (asset.startsWith('utxo:') && PAY_CHAINS[asset.slice(5)]) return `${esc(fmtUnits(BigInt(daily), 8, 8))} ${PAY_CHAINS[asset.slice(5)]} (fees included)`;
+  if (asset.startsWith('utxo:') && PAY_CHAINS[asset.slice(5)]) return `${esc(fmtUnits(BigInt(daily), payDecimals(asset.slice(5)), 8))} ${PAY_CHAINS[asset.slice(5)]} (fees included)`;
   const coins: Record<string, [number, string]> = { near: [24, 'NEAR'], sol: [9, 'SOL'], ton: [9, 'GRAM'], xlm: [7, 'XLM'], xrp: [6, 'XRP'], trx: [6, 'TRX'], 'nep141:wrap.testnet': [24, 'wNEAR'], 'nep141:wrap.near': [24, 'wNEAR'] };
   if (coins[asset]) return `${esc(fmtUnits(BigInt(daily), coins[asset][0]))} ${coins[asset][1]}`;
   const evmCoin = asset.match(/^evm:(\d+)$/);
   if (evmCoin) return `${esc(fmtUnits(BigInt(daily), 18))} ${esc(EVM_CHAINS.find((c) => c.id === Number(evmCoin[1]))?.sym ?? 'ETH')} on ${esc(chainName(Number(evmCoin[1])))}`;
+  if (asset.startsWith('phoenix:')) return `${perpSize(asset.slice(8), daily)} traded on Phoenix perps`;
+  if (asset === 'polymarket:sell') return `sell up to ${esc(fmtUnits(BigInt(daily), 6, 2))} Polymarket shares, at any price`;
+  if (asset === 'nft:ton') return `${esc(daily)} NFT transfer${daily === '1' ? '' : 's'} on TON`;
   if (asset.startsWith('nft:')) return `${esc(daily)} NFT listing${daily === '1' ? '' : 's'} on ${esc(asset.slice(4).replace(/^evm:/, 'chain ').replace('solana', 'Solana'))}`;
   if (asset.startsWith('borrow:')) return `borrowing ${esc(daily)} units of ${esc(asset.split(':').slice(2).join(':'))} (${esc(asset.split(':')[1])})`;
+  const known = KNOWN_TOKENS[asset];
+  if (known) return `${esc(fmtUnits(BigInt(daily), known[0]))} ${known[1]}`;
   return `${esc(daily)} of ${esc(asset)}`;
 }
+/** Tokens on non-EVM chains with a known name and decimals (each checked at its mint or master). */
+const KNOWN_TOKENS: Record<string, [number, string]> = {
+  'spl:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v': [6, 'USDC on Solana'],
+  'jetton:kQAiQ2XK7BXePLwemeo-u4wNyjg-wxGeySmaFGEP7R2Mhf4m': [9, 'tsTON'],
+};
 const POOLS: Record<string, string> = {
   '84532:0x8bab6d1b75f19e9ed9fce8b9bd338844ff79ae27': 'Aave V3 pool',
   '84532:0x94cc0aac535ccdb3c01d6787d6413c739ae12bc4': 'Uniswap V3 router',
+  // Polymarket's exchanges on Polygon (getCollateral() is USDC.e): the agent may sign orders there.
+  '137:0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e': 'Polymarket (orders)',
+  '137:0xc5d563a36ae78145c45a50134d48a1215220f80a': 'Polymarket neg-risk (orders)',
   // Lido on Hoodi (docs.lido.fi/deployed-contracts/hoodi, checked on-chain).
   '560048:0x3508a952176b3c15387c97be809eaffb1982176a': 'Lido stETH',
   '560048:0x7e99ee3c66636de415d2d7c880938f2f40f94de4': 'Lido wstETH',
@@ -149,6 +167,12 @@ const FN_NAMES: Record<string, string> = {
   '0x617ba037': 'supply', '0x69328dec': 'withdraw', '0x573ade81': 'repay', '0xa415bcad': 'borrow', '0x04e45aaf': 'swap',
   '0xa1903eab': 'stake', '0xea598cb0': 'wrap', '0xde0e9a3e': 'unwrap', '0xd6681042': 'request withdrawal', '0x19aa6257': 'request withdrawal (wstETH)', '0xf8444436': 'claim withdrawal',
   '0xfb0f3ee1': 'buy', '0x00000000': 'buy', '0xfd9f1e10': 'cancel listings', '0xa22cb465': 'approve NFTs for',
+  '0xa6dfcf86': 'cancel orders, and sign orders', '0xd0e30db0': 'deposit', '0x2e1a7d4d': 'withdraw', '0x0ba7d4a7': 'withdraw exact', '0x4e71d92d': 'claim', '0xd1058e59': 'claim all',
+  '0x1249c58b': 'supply', '0xdb006a75': 'redeem', '0x852a12e3': 'redeem', '0xc5ebeaec': 'borrow', '0x0e752702': 'repay', '0xc2998238': 'use as collateral', '0x7ff36ab5': 'swap',
+};
+/** TRON contracts by name (Nile): JustLend's from its contracts.json, SunSwap's from docs.sun.io. */
+const TRON_NAMES: Record<string, string> = {
+  TZ8du1HkatTWDbS6FLZei4dQfjfpSm9mxp: 'sTRX (JustLend staked TRX)', TKM7w4qFmkXQLEF2MgrQroBYpd5TY7i1pq: 'JustLend jTRX', TJUCStq3WqfKqZLuZje5v7z6Ua6iBry1P6: 'JustLend', TYMjxCXfqLpMWW1QToP6hbcjpion7EE25p: 'SunSwap V2',
 };
 /** Venues the grant form offers by name. Aave V3 from bgd-labs/aave-address-book
  *  (checked on-chain); Uniswap V3 SwapRouter02 on Base Sepolia, whose
@@ -605,14 +629,40 @@ function fillChain(id: string, address: string, native: string, assets: string[]
 
 // ---- Views: Home, Assets (a page per chain), Swap, Apps & agents ----
 
-const VIEW_TITLES: Record<string, string> = { home: 'Marvii', assets: 'Assets', swap: 'Swap', agents: 'Apps & agents' };
+const VIEW_TITLES: Record<string, string> = { home: 'Marvii', assets: 'Assets', swap: 'Swap', topup: 'Top up', agents: 'Apps & agents' };
+/** The Swap tile's menu: Swap, or Top up another chain, each its own page. */
+function swapMenu() {
+  const btn = document.getElementById('swap-tile') as HTMLButtonElement;
+  const menu = document.getElementById('swap-menu')!;
+  const set = (open: boolean) => {
+    menu.hidden = !open;
+    btn.setAttribute('aria-expanded', String(open));
+  };
+  btn.onclick = (ev) => {
+    ev.stopPropagation();
+    set(menu.hidden);
+    if (!menu.hidden) menu.querySelector<HTMLElement>('a')?.focus();
+  };
+  document.addEventListener('click', (ev) => {
+    if (!menu.hidden && !menu.contains(ev.target as Node)) set(false);
+  });
+  document.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape' && !menu.hidden) {
+      set(false);
+      btn.focus();
+    }
+  });
+  window.addEventListener('hashchange', () => set(false));
+}
+
 /** Shows the view the URL's hash names (#/assets, #/chain-84532, …). */
 function route() {
   const want = location.hash.replace(/^#\/?/, '') || 'home';
   const views = Array.from(document.querySelectorAll<HTMLElement>('.view'));
   const v = views.find((x) => x.dataset.view === want) ?? views.find((x) => x.dataset.view === 'home');
   views.forEach((x) => x.classList.toggle('on', x === v));
-  document.title = VIEW_TITLES[v?.dataset.view ?? ''] ? `${VIEW_TITLES[v!.dataset.view!]} · Marvii` : 'Marvii';
+  const proto = PROTOCOLS.find((p) => `p-${p.id}` === v?.dataset.view);
+  document.title = proto ? `${proto.name} · Marvii` : VIEW_TITLES[v?.dataset.view ?? ''] ? `${VIEW_TITLES[v!.dataset.view!]} · Marvii` : 'Marvii';
   if (v?.dataset.view?.startsWith('chain-')) loadHistory(v.dataset.view).catch(() => {});
   window.scrollTo(0, 0);
 }
@@ -1348,7 +1398,13 @@ async function dashboard() {
       </div>
       <nav class="tiles3">
         <a class="tile" href="#/assets"><span class="tile-ic">${ICON_ASSETS}</span><b>Assets</b><span class="small muted">${all.length} chains</span></a>
-        <a class="tile" href="#/swap"><span class="tile-ic">${ICON_SWAP}</span><b>Swap</b><span class="small muted">NEAR Intents</span></a>
+        <div class="tile-wrap">
+          <button type="button" class="tile" id="swap-tile" aria-haspopup="menu" aria-expanded="false" aria-controls="swap-menu"><span class="tile-ic">${ICON_SWAP}</span><b>Swap <span class="caret" aria-hidden="true">▾</span></b><span class="small muted">NEAR Intents</span></button>
+          <div class="tile-menu" id="swap-menu" role="menu" hidden>
+            <a role="menuitem" href="#/swap"><b>Swap</b><span class="small muted">Trade balances inside NEAR Intents</span></a>
+            <a role="menuitem" href="#/topup"><b>Top up another chain</b><span class="small muted">Move your funds to your address on another chain</span></a>
+          </div>
+        </div>
         <a class="tile" href="#/agents"><span class="tile-ic">${ICON_AGENTS}</span><b>Apps &amp; agents</b><span class="small muted" id="agents-note">Limits you set</span></a>
       </nav>
       <a class="card alert" id="pending-alert" href="#/agents" hidden><b>Waiting for you</b><span class="small" id="pending-alert-text"></span></a>
@@ -1374,8 +1430,11 @@ async function dashboard() {
           <div class="row end"><button class="primary">Get quote</button></div>
           <div id="swap-out" class="small"></div>
         </form>
-        <p class="muted small">Live prices from NEAR Intents' solvers, between balances held in NEAR Intents by this account. Quote only: this swaps balances already inside NEAR Intents. To move funds between chains, use Top up below.</p>
+        <p class="muted small">Live prices from NEAR Intents' solvers, between balances held in NEAR Intents by this account. Quote only: this swaps balances already inside NEAR Intents. To move funds between chains, use <a href="#/topup">Top up another chain</a>.</p>
       </section>
+    </section>
+    <section class="view" data-view="topup">
+      <a class="back" href="#/">‹ Home</a>
       <section class="card" id="topup-card">
         <div class="row between"><h2>Top up another chain</h2><span class="pill">NEAR Intents · mainnet</span></div>
         <form id="topup" class="stack">
@@ -1400,7 +1459,12 @@ async function dashboard() {
         <ul id="queued" class="list"></ul>
       </section>
       <section class="card">
-        <div class="row between"><h1>Apps &amp; agents</h1><button id="add" class="primary">Add</button></div>
+        <h1>Apps &amp; agents</h1>
+        <label>By protocol <select id="protocol-pick"><option value="">Choose a protocol…</option></select></label>
+        <p class="muted small">Each protocol's page shows which agents can use it, what they may do there and their daily limits.</p>
+      </section>
+      <section class="card">
+        <h2>All agents</h2>
         <p class="muted small">Each gets a key that NEAR checks on every request: which venues, how much a day, until when. Revoke any of them instantly.</p>
         <ul id="sessions" class="list"><li class="muted">Loading…</li></ul>
       </section>
@@ -1409,8 +1473,11 @@ async function dashboard() {
         <p class="muted small">Apps and agents ask for access with a permission link. Open it here and you'll see exactly what they ask for before your passkey approves anything.</p>
         <form class="row" id="connect-paste"><input name="link" class="mono" placeholder="https://near.marvii.xyz/#/connect?r=…" required><button class="secondary">Open</button></form>
         <details class="small"><summary>Building an agent?</summary>
-          <p>Use <span class="mono">@marvii/agent-sdk</span> (in <span class="mono">near/sdk</span>): make a session key (or keep it in OutLayer's TEE), send the owner a permission link, wait for their approval, then act. Every action is checked by Marvii's extension on NEAR before Chain Signatures sign it.</p>
-          <pre class="mono small">const link = permissionLink({ publicKey, keyId: 'my-agent',
+          <p>Use <span class="mono">@replico-labs/marvii-sdk</span> (in <span class="mono">near/sdk</span>): make a session key inside Marvii's OutLayer module (TEE), send the owner a permission link, wait for their approval, then act. Every action is checked by Marvii's extension on NEAR before Chain Signatures sign it. This page approves only keys made inside that module; it checks the run on NEAR.</p>
+          <p>Testing without the SDK? <button type="button" class="secondary small-btn" id="add">Add a key by hand</button></p>
+          <pre class="mono small">const signer = new OutLayerSigner({ moduleUrl, moduleHash, operator });
+const publicKey = await signer.getPublicKey();
+const link = permissionLink({ publicKey, keyProof: signer.keyProof, keyId: 'my-agent',
   app: { name: 'My agent' },
   grant: { near_venues: [{ receiver_id: 'wrap.testnet', method: 'near_deposit' }],
            caps: [{ asset: 'near', daily: '50000000000000000000000' }] } });
@@ -1419,8 +1486,15 @@ await new MarviiAgent({ wallet, keyId: 'my-agent', signer }).execute(nearCall(�
         </details>
       </section>
     </section>
+    ${protocolViews()}
     <div id="modal"></div>`);
   route();
+  swapMenu();
+  (document.getElementById('protocol-pick') as HTMLSelectElement).onchange = (ev) => {
+    const v = (ev.target as HTMLSelectElement).value;
+    if (v) location.hash = `#/p-${v}`;
+    (ev.target as HTMLSelectElement).value = '';
+  };
   document.getElementById('add')!.onclick = grantForm;
   (document.getElementById('connect-paste') as HTMLFormElement).onsubmit = (ev) => {
     ev.preventDefault();
@@ -1428,9 +1502,9 @@ await new MarviiAgent({ wallet, keyId: 'my-agent', signer }).execute(nearCall(�
     const m = raw.match(/#\/connect\?r=[A-Za-z0-9_-]+$/);
     if (!m) return status('That isn\'t a Marvii permission link.', 'error');
     location.hash = m[0];
-    connectFromLink().catch((e) => status(`That permission link can't be used: ${esc((e as Error).message ?? e)}`, 'error'));
+    connectFromLink().catch((e) => status(`That permission link can't be used: ${(e as Error).message ?? e}`, 'error'));
   };
-  connectFromLink().catch((e) => status(`That permission link can't be used: ${esc((e as Error).message ?? e)}`, 'error'));
+  connectFromLink().catch((e) => status(`That permission link can't be used: ${(e as Error).message ?? e}`, 'error'));
   swapCard();
   topupCard();
   hlCard().catch(() => {});
@@ -1516,7 +1590,7 @@ function explainAction(json: string): string {
   if (a.type === 'evm_tx') return explainEvm(JSON.parse(core.describe_evm_tx(JSON.stringify(a.tx))));
   if (a.type === 'near_call') return `Call ${esc(a.method)} on ${esc(a.receiver_id)} with ${formatNear(a.deposit)} NEAR`;
   if (a.type === 'utxo_pay' && PAY_CHAINS[a.chain]) {
-    const pays = a.outputs.map((o: any) => `${esc(fmtUnits(BigInt(o.value), 8, 8))} ${PAY_CHAINS[a.chain]} to ${copyable(core.utxo_address(a.chain, o.script))}`).join(', ');
+    const pays = a.outputs.map((o: any) => `${esc(fmtUnits(BigInt(o.value), payDecimals(a.chain), 8))} ${PAY_CHAINS[a.chain]} to ${copyable(utxoAddr(a.chain, o.script))}`).join(', ');
     return `Pay on ${esc(PAY_NAMES[a.chain])}: ${pays} (outputs include any change back to you)`;
   }
   return `<span class="error">Unrecognised action</span>`;
@@ -1606,10 +1680,21 @@ async function loadPending() {
   });
 }
 
+/** A daily cap in words ("50 USDC a day on Base"). */
+function capText(c: { asset: string; daily: string }): string {
+  const [kind, chain, token] = c.asset.split(':');
+  if (kind === 'evm' && token) return `${amount(Number(chain), token, c.daily)} a day on ${esc(chainName(Number(chain)))}`;
+  return `${capWords(c.asset, c.daily)} a day`;
+}
+
 async function loadSessions() {
   const ul = document.getElementById('sessions')!;
   // Read from the extension's index: what the chain says, not this browser.
   const rows = await view<[string, Session][]>(cfg.extension, 'list_sessions', { wallet }).catch(() => [] as [string, Session][]);
+  renderProtocols(rows);
+  document.querySelectorAll<HTMLButtonElement>('[data-protocol] [data-revoke]').forEach((b) => {
+    b.onclick = () => confirm(core.call_message(cfg.chain_id, wallet, nonce(), createdAt(), cfg.extension, 'revoke_session', JSON.stringify({ key_id: b.dataset.revoke! }), '0', 20n));
+  });
   if (!rows.length) {
     ul.innerHTML = '<li class="muted">No agents yet.</li>';
     return;
@@ -1622,11 +1707,7 @@ async function loadSessions() {
     .map(([k, s]) => {
       const expired = now >= s.grant.expires_at_ms || now >= s.last_used_ms + s.grant.inactivity_ms;
       const state = s.revoked ? '<span class="pill bad">revoked</span>' : expired ? '<span class="pill bad">expired</span>' : '<span class="pill ok">active</span>';
-      const caps = s.grant.caps.map((c) => {
-        const [kind, chain, token] = c.asset.split(':');
-        if (kind === 'evm' && token) return `${amount(Number(chain), token, c.daily)} a day on ${esc(chainName(Number(chain)))}`;
-        return `${capWords(c.asset, c.daily)} a day`;
-      });
+      const caps = s.grant.caps.map(capText);
       const venues = [
         ...s.grant.evm_venues.map((v) => `${esc(fnName(v.selector))} on ${named(v.chain_id, v.to)}, ${esc(chainName(v.chain_id))}`),
         ...s.grant.near_venues.map((v) => `${esc(v.receiver_id)}.${esc(v.method)}`),
@@ -1673,6 +1754,11 @@ function grantForm() {
       <label>Name <input name="label" required value="Trading agent" maxlength="64"></label>
       <label>Key ID <input name="key_id" required value="agent-1" maxlength="64" pattern="[A-Za-z0-9_.\\-]+"></label>
       <label>Agent public key (ed25519, 64 hex characters) <input name="public_key" required pattern="[0-9a-fA-F]{64}" class="mono"></label>
+      <p class="small muted">The key must live in Marvii's OutLayer module (TEE). Give the NEAR transaction of the OutLayer run that made it (<span class="mono">signer.keyProof</span> in the SDK); this page checks it on NEAR.</p>
+      <div class="grid2">
+        <label>Key's OutLayer run (tx hash) <input name="proof_tx" required class="mono" pattern="[1-9A-HJ-NP-Za-km-z]{43,44}"></label>
+        <label>Run by (NEAR account) <input name="proof_sender" required class="mono"></label>
+      </div>
       <div class="grid2">
         <label>Lasts (days) <input name="days" type="number" min="1" max="90" value="7"></label>
         <label>Stops if unused for (days) <input name="idle" type="number" min="1" max="90" value="3"></label>
@@ -1716,10 +1802,18 @@ function grantForm() {
   view<number>(cfg.extension, 'queue_delay_ms', {})
     .then((ms) => (document.getElementById('delay')!.textContent = ms >= 3_600_000 ? `${ms / 3_600_000} hours` : `${ms / 60_000} minutes`))
     .catch(() => {});
-  (document.getElementById('grant') as HTMLFormElement).onsubmit = (ev) => {
+  (document.getElementById('grant') as HTMLFormElement).onsubmit = async (ev) => {
     ev.preventDefault();
     const f = new FormData(ev.target as HTMLFormElement);
     const g = (k: string) => String(f.get(k) ?? '').trim();
+    try {
+      status('Checking where the agent key lives…');
+      await checkTeeKey(g('public_key').toLowerCase(), { tx_hash: g('proof_tx'), sender: g('proof_sender') });
+      status('');
+    } catch (e) {
+      status(String((e as Error).message ?? e), 'error');
+      return;
+    }
     const chain = Number(g('chain_id'));
     const now = Date.now();
     const grant = {
@@ -1765,7 +1859,35 @@ function grantForm() {
 /** An output script as its address, or the script itself where this page
  *  can't encode the chain's addresses (Dogecoin, which the grant form
  *  doesn't offer). */
+/** Bech32 (BIP-173) of raw bytes, for Cardano's addr_test… addresses. */
+function bech32(hrp: string, data: Uint8Array): string {
+  const CH = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l';
+  const words: number[] = [];
+  let acc = 0, bits = 0;
+  for (const b of data) {
+    acc = (acc << 8) | b;
+    bits += 8;
+    while (bits >= 5) words.push((acc >> (bits -= 5)) & 31);
+  }
+  if (bits) words.push((acc << (5 - bits)) & 31);
+  const polymod = (v: number[]) => {
+    const G = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3];
+    let chk = 1;
+    for (const x of v) {
+      const top = chk >> 25;
+      chk = ((chk & 0x1ffffff) << 5) ^ x;
+      for (let i = 0; i < 5; i++) if ((top >> i) & 1) chk ^= G[i];
+    }
+    return chk;
+  };
+  const hv = [...hrp].map((c) => c.charCodeAt(0) >> 5).concat([0], [...hrp].map((c) => c.charCodeAt(0) & 31));
+  const pm = polymod([...hv, ...words, 0, 0, 0, 0, 0, 0]) ^ 1;
+  const cs = [0, 1, 2, 3, 4, 5].map((i) => (pm >> (5 * (5 - i))) & 31);
+  return `${hrp}1${[...words, ...cs].map((w) => CH[w]).join('')}`;
+}
+
 function utxoAddr(chain: string, script: string): string {
+  if (chain === 'cardano' && /^[0-9a-f]+$/i.test(script)) return bech32('addr_test', Uint8Array.from(script.match(/../g)!.map((h) => parseInt(h, 16))));
   try {
     return core.utxo_address(chain, script);
   } catch {
@@ -1774,10 +1896,105 @@ function utxoAddr(chain: string, script: string): string {
 }
 
 /** The non-EVM parts of a grant, briefly, for the agents list. */
+// ---- Apps & agents by protocol: each protocol's page lists the agents that
+// can use it and what they may do there. Access comes from permission links;
+// these pages are for seeing and revoking. ----
+
+type Protocol = { id: string; name: string; chain: string; about: string; access: (g: any) => string[]; caps?: (asset: string, g: any) => boolean };
+/** The chains a protocol's EVM venues are on, matched by name prefix. */
+const evmChainsOf = (g: any, prefix: string) => new Set((g.evm_venues ?? []).filter((v: any) => (POOLS[`${v.chain_id}:${v.to}`] ?? '').startsWith(prefix)).map((v: any) => String(v.chain_id)));
+/** Caps on the coin and tokens of the chains where the protocol's EVM venues are, and borrowing there. */
+const evmCaps = (prefix: string) => (a: string, g: any) => {
+  const [kind, chain] = a.split(':');
+  const chains = evmChainsOf(g, prefix);
+  return (kind === 'evm' && chains.has(chain)) || (a.startsWith('borrow:evm:') && chains.has(a.split(':')[2]));
+};
+const capsByPrefix = (...prefixes: string[]) => (a: string) => prefixes.some((p) => (p.endsWith(':') ? a.startsWith(p) : a === p));
+const evmAt = (g: any, prefix: string) =>
+  (g.evm_venues ?? []).filter((v: any) => (POOLS[`${v.chain_id}:${v.to}`] ?? '').startsWith(prefix)).map((v: any) => `${esc(fnName(v.selector))} on ${named(v.chain_id, v.to)}, ${esc(chainName(v.chain_id))}`);
+const solAt = (g: any, ...programs: string[]) =>
+  (g.sol?.venues ?? []).filter((v: any) => programs.includes(v.program)).map((v: any) => `${esc(SOL_PROGRAMS[v.program] ?? short(v.program))}${v.scope === v.program ? '' : ` (${esc(short(v.scope))})`}`);
+const nearAt = (g: any, test: (v: any) => boolean) => (g.near_venues ?? []).filter(test).map((v: any) => `${esc(v.method)} on ${esc(v.receiver_id)}`);
+const tronAt = (g: any, prefix: string) =>
+  (g.tron?.venues ?? []).filter((v: any) => (TRON_NAMES[v.contract] ?? '').startsWith(prefix)).map((v: any) => `${esc(fnName(v.selector))} on ${esc(TRON_NAMES[v.contract])}`);
+const PROTOCOLS: Protocol[] = [
+  { id: 'aave', name: 'Aave V3', chain: 'EVM', about: 'Lending. Supply, withdraw, repay and borrow; what comes back always goes to your account.', access: (g) => evmAt(g, 'Aave'), caps: evmCaps('Aave') },
+  { id: 'uniswap', name: 'Uniswap V3', chain: 'EVM', about: 'Token swaps; the output always goes to your account.', access: (g) => evmAt(g, 'Uniswap'), caps: evmCaps('Uniswap') },
+  { id: 'lido', name: 'Lido', chain: 'EVM', about: 'Stake ETH for stETH, wrap and unwrap wstETH, and withdraw back to ETH through the withdrawal queue.', access: (g) => evmAt(g, 'Lido'), caps: evmCaps('Lido') },
+  { id: 'seaport', name: 'Seaport (OpenSea)', chain: 'EVM', about: 'List your NFTs for sale, never below the price floor you set, paid to you.', access: (g) => [...evmAt(g, 'Seaport'), ...(g.evm_nft_floor && g.evm_nft_floor !== '0' ? [`listings from ${esc(fmtUnits(BigInt(g.evm_nft_floor), 18))} in the chain's coin`] : [])], caps: (a, g) => a.startsWith('nft:evm:') || evmCaps('Seaport')(a, g) },
+  { id: 'polymarket', name: 'Polymarket', chain: 'EVM', about: 'Prediction-market orders on Polygon, signed by your account: buys paid in USDC.e, sells within a daily limit.', access: (g) => evmAt(g, 'Polymarket'), caps: (a, g) => a === 'polymarket:sell' || evmCaps('Polymarket')(a, g) },
+  { id: 'hyperliquid', name: 'Hyperliquid', chain: 'Hyperliquid', about: 'Perps orders, cancels and leverage, on the markets and up to the leverage you allow.', access: (g) => (g.hl_markets ?? []).map((m: any) => `${esc(hlName(m.asset))} perps up to ${esc(m.max_leverage)}x`), caps: capsByPrefix('hyperliquid:') },
+  { id: 'ref', name: 'Ref Finance', chain: 'NEAR', about: 'Token swaps on NEAR, only through the pools you allow.', access: (g) => nearAt(g, (v) => /ref-finance/.test(v.receiver_id) || String(v.method).startsWith('pool:')), caps: capsByPrefix('near', 'nep141:') },
+  { id: 'rhea', name: 'Rhea Lending', chain: 'NEAR', about: 'Lending on NEAR (formerly Burrow). Borrowing counts against its own limit.', access: (g) => nearAt(g, (v) => /burrow/.test(v.receiver_id)), caps: capsByPrefix('near', 'nep141:', 'borrow:near:') },
+  { id: 'nearx', name: 'Stader NearX', chain: 'NEAR', about: 'Liquid staking: stake NEAR for NearX, unstake and withdraw.', access: (g) => nearAt(g, (v) => /nearx/.test(v.receiver_id)), caps: capsByPrefix('near', 'nep141:') },
+  { id: 'jupiter', name: 'Jupiter', chain: 'Solana', about: 'Token swaps across Solana; output to your account, no extra fee, slippage at most 3%.', access: (g) => solAt(g, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4'), caps: capsByPrefix('sol', 'spl:') },
+  { id: 'phoenix-perps', name: 'Phoenix perps', chain: 'Solana', about: 'Perpetual futures. Each agent trades its own isolated subaccount through a trading key of your account that can trade but never withdraw.', access: (g) => (g.sol?.perps?.length ? [perpsWords(g.sol.perps)] : []), caps: capsByPrefix('phoenix:', 'sol', 'spl:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v') },
+  { id: 'phoenix', name: 'Phoenix spot', chain: 'Solana', about: 'Order-book swaps; both sides settle in your own token accounts.', access: (g) => solAt(g, 'PhoeNiXZ8ByJGLkxNfZRnkUfjvmuYqLR89jjFHGqdXY'), caps: capsByPrefix('sol', 'spl:') },
+  { id: 'jito', name: 'Jito', chain: 'Solana', about: 'Liquid staking: SOL for JitoSOL.', access: (g) => solAt(g, 'SPoo1Ku8WFXoNDMHPsrGSTSG1Y47rzgn41SLUNakuHy', 'DPoo15wWDqpPJJtS2MUZ49aRxqz5ZaaJCJP4z8bLuib'), caps: capsByPrefix('sol', 'spl:') },
+  { id: 'kamino', name: 'Kamino', chain: 'Solana', about: 'Lending on Solana. Borrowing counts against its own limit.', access: (g) => solAt(g, 'KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD'), caps: capsByPrefix('sol', 'spl:', 'borrow:solana:') },
+  { id: 'tensor', name: 'Tensor', chain: 'Solana', about: 'NFT listings and buys, never below the price floor you set.', access: (g) => [...solAt(g, 'TCMPhJdwDryooaGtiocG1u3xcYbRpiJzb283XfCZsDp'), ...(g.sol?.nft_floor && g.sol.nft_floor !== '0' ? [`listings from ${esc(fmtUnits(BigInt(g.sol.nft_floor), 9))} SOL`] : [])], caps: capsByPrefix('sol', 'nft:solana') },
+  { id: 'justlend', name: 'JustLend', chain: 'TRON', about: 'Lending on TRON, and liquid staking for sTRX.', access: (g) => [...tronAt(g, 'JustLend'), ...tronAt(g, 'sTRX')], caps: capsByPrefix('trx', 'trc20:', 'borrow:tron:') },
+  { id: 'sunswap', name: 'SunSwap', chain: 'TRON', about: 'Token swaps on TRON; output to your account.', access: (g) => tronAt(g, 'SunSwap'), caps: capsByPrefix('trx', 'trc20:') },
+  { id: 'tonstakers', name: 'Tonstakers', chain: 'TON', about: 'Liquid staking: TON for tsTON, and unstaking back to your account.', access: (g) => (g.ton?.lst ?? []).map((l: any) => `pool ${esc(short(l.pool))}`), caps: capsByPrefix('ton', 'jetton:') },
+  { id: 'evaa', name: 'EVAA', chain: 'TON', about: 'Lending on TON. Every withdrawal counts against the borrowing limit.', access: (g) => (g.ton?.evaa ?? []).map((m: string) => `master ${esc(short(m))}`), caps: capsByPrefix('ton', 'jetton:', 'borrow:ton:') },
+  { id: 'xrpl-dex', name: 'XRP Ledger DEX and AMM', chain: 'XRP Ledger', about: "The ledger's own order book and AMM pools.", access: (g) => [g.xrpl?.dex && 'order book offers', g.xrpl?.amm && 'AMM deposits and withdrawals'].filter(Boolean) as string[], caps: capsByPrefix('xrp', 'xrpl:') },
+  { id: 'stellar-dex', name: 'Stellar DEX and AMM', chain: 'Stellar', about: "Stellar's own order book, path payments and liquidity pools.", access: (g) => [g.stellar?.dex && 'order book offers and path payments', g.stellar?.amm && 'liquidity pools'].filter(Boolean) as string[], caps: capsByPrefix('xlm', 'stellar:') },
+  { id: 'blend', name: 'Blend', chain: 'Stellar', about: 'Lending on Stellar.', access: (g) => (g.stellar?.blend ?? []).map((p: string) => `pool ${esc(short(p))}`), caps: capsByPrefix('xlm', 'stellar:', 'soroban:', 'borrow:stellar:') },
+  { id: 'nfts', name: 'NFT transfers', chain: 'Other chains', about: 'Sending your NFTs to addresses you list (TON, TRON, XRP Ledger).', access: (g) => [g.ton?.nft && 'TON NFTs', g.tron?.nfts?.length && `TRON NFTs (${g.tron.nfts.length} collections)`, g.xrpl?.nft && 'XRP Ledger NFTs'].filter(Boolean) as string[], caps: capsByPrefix('nft:') },
+  { id: 'payments', name: 'Payments', chain: 'Other chains', about: 'Paying the recipients you list, on Bitcoin, Litecoin, Dogecoin, Bitcoin Cash, Zcash and Cardano. Change always comes back to you.', access: (g) => (g.utxo ?? []).map((u: any) => `${esc(PAY_NAMES[u.chain] ?? u.chain)} to ${u.recipients.map((r: string) => esc(short(utxoAddr(u.chain, r)))).join(', ') || 'no one'}`), caps: capsByPrefix('utxo:') },
+];
+const PROTOCOL_CHAINS = [...new Set(PROTOCOLS.map((p) => p.chain))];
+
+/** A page per protocol, filled in by renderProtocols. */
+function protocolViews(): string {
+  return PROTOCOLS.map((p) => `
+    <section class="view" data-view="p-${p.id}">
+      <a class="back" href="#/agents">‹ Apps &amp; agents</a>
+      <section class="card">
+        <div class="row between"><h1>${esc(p.name)}</h1><span class="pill">${esc(p.chain)}</span></div>
+        <p class="muted small">${esc(p.about)}</p>
+        <h2>Agents that can use it</h2>
+        <ul class="list" data-protocol="${p.id}"><li class="muted">Loading…</li></ul>
+        <p class="muted small">Apps and agents ask for access with a permission link; you see exactly what they ask for before your passkey approves. Revoking stops an agent everywhere, not only here.</p>
+      </section>
+    </section>`).join('');
+}
+
+/** Fills the protocol dropdown and each protocol's page from the sessions. */
+function renderProtocols(rows: [string, Session][]) {
+  const now = Date.now();
+  const live = rows.filter(([, s]) => !s.revoked && now < s.grant.expires_at_ms && now < s.last_used_ms + s.grant.inactivity_ms);
+  const users = (p: Protocol) => live.filter(([, s]) => p.access(s.grant).length);
+  const sel = document.getElementById('protocol-pick') as HTMLSelectElement | null;
+  if (sel) {
+    sel.innerHTML = '<option value="">Choose a protocol…</option>' + PROTOCOL_CHAINS.map((c) => `<optgroup label="${esc(c)}">${PROTOCOLS.filter((p) => p.chain === c).map((p) => {
+      const n = users(p).length;
+      return `<option value="${p.id}">${esc(p.name)}${n ? ` · ${n} agent${n === 1 ? '' : 's'}` : ''}</option>`;
+    }).join('')}</optgroup>`).join('');
+  }
+  for (const p of PROTOCOLS) {
+    const ul = document.querySelector<HTMLElement>(`[data-protocol="${p.id}"]`);
+    if (!ul) continue;
+    const us = users(p);
+    ul.innerHTML = us.length
+      ? us.map(([k, s]) => `<li class="session">
+          <div class="row between"><b>${esc(s.grant.label)}</b><span class="pill ok">active</span></div>
+          <div class="small muted">key ${esc(k)} · until ${esc(new Date(s.grant.expires_at_ms).toLocaleString())}</div>
+          <div class="small">May: ${fold(p.access(s.grant))}</div>
+          <div class="small">Its daily limits here: ${(() => {
+            const mine = s.grant.caps.filter((c) => p.caps?.(c.asset, s.grant) ?? true);
+            return mine.length ? fold(mine.map(capText), 4) : 'none that apply';
+          })()}</div>
+          <button class="danger small-btn" data-revoke="${esc(k)}">Revoke</button>
+        </li>`).join('')
+      : `<li class="muted">No agent can use ${esc(p.name)}.</li>`;
+  }
+}
+
 function grantChains(g: any): string[] {
   const out: string[] = [];
-  if (g.sol) out.push(`Solana: ${(g.sol.venues ?? []).map((v: any) => esc(SOL_PROGRAMS[v.program] ?? short(v.program))).join(', ') || 'payments'}${g.sol.nft_floor && g.sol.nft_floor !== '0' ? `, Tensor listings from ${esc(fmtUnits(BigInt(g.sol.nft_floor), 9))} SOL` : ''}`);
-  if (g.ton) out.push(`TON: ${[g.ton.recipients?.length && 'payments', g.ton.jettons?.length && 'jettons', g.ton.evaa?.length && 'EVAA lending'].filter(Boolean).join(', ') || 'nothing'}`);
+  if (g.sol) out.push(`Solana: ${(g.sol.venues ?? []).map((v: any) => esc(SOL_PROGRAMS[v.program] ?? short(v.program))).join(', ') || 'payments'}${g.sol.nft_floor && g.sol.nft_floor !== '0' ? `, Tensor listings from ${esc(fmtUnits(BigInt(g.sol.nft_floor), 9))} SOL` : ''}${g.sol.perps?.length ? ', Phoenix perps' : ''}`);
+  if (g.ton) out.push(`TON: ${[g.ton.recipients?.length && 'payments', g.ton.jettons?.length && 'jettons', g.ton.evaa?.length && 'EVAA lending', g.ton.lst?.length && 'Tonstakers staking', g.ton.nft && 'NFTs'].filter(Boolean).join(', ') || 'nothing'}`);
   if (g.tron) out.push(`TRON: ${(g.tron.venues ?? []).length} contract calls${g.tron.nfts?.length ? ', NFTs' : ''}`);
   if (g.xrpl) out.push(`XRP Ledger: ${[g.xrpl.dex && 'order book', g.xrpl.amm && 'AMM', g.xrpl.nft && 'NFTs'].filter(Boolean).join(', ') || 'payments'}`);
   if (g.stellar) out.push(`Stellar: ${[g.stellar.dex && 'order book', g.stellar.amm && 'AMM', g.stellar.blend?.length && 'Blend lending'].filter(Boolean).join(', ') || 'payments'}`);
@@ -1791,7 +2008,28 @@ const SOL_PROGRAMS: Record<string, string> = {
   DPoo15wWDqpPJJtS2MUZ49aRxqz5ZaaJCJP4z8bLuib: 'Jito staking (devnet)',
   KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD: 'Kamino lending',
   TCMPhJdwDryooaGtiocG1u3xcYbRpiJzb283XfCZsDp: 'Tensor NFT marketplace',
+  JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4: 'Jupiter swaps (mainnet)',
+  PhoeNiXZ8ByJGLkxNfZRnkUfjvmuYqLR89jjFHGqdXY: 'Phoenix order book (mainnet)',
+  EtrnLzgbS7nMMy5fbD42kXiUzGg8XQzJ972Xtk1cjWih: 'Phoenix perps (mainnet)',
 };
+
+/** Phoenix perps markets (perp asset map on mainnet): name and base-lot decimals. */
+const PERP_MARKETS: Record<string, [string, number]> = {
+  '71Si24E4uc3oCaPbPZTozC1ptSNNqygjjebxSmErSsC2': ['SOL', 2],
+  AXFz1MuzMUBHi5UKJuK3FDCQ73o3rSzubGU2mPr4LLU7: ['BTC', 4],
+  '9u7aqptdRFbsnnoHtjK13E5JkeM14EW5fAKTRPidVF88': ['ETH', 3],
+};
+/** A size on a Phoenix perps market in base units (lots / 10^decimals). */
+function perpSize(market: string, lots: string): string {
+  const m = PERP_MARKETS[market];
+  return m ? `${esc(fmtUnits(BigInt(lots), m[1], m[1]))} ${m[0]}` : `${esc(lots)} lots on Phoenix market ${esc(short(market))}`;
+}
+/** Plain words for the grant's Phoenix perps desks. */
+function perpsWords(desks: any[]): string {
+  return desks
+    .map((d: any) => `trade <b>Phoenix perps</b> on its own isolated subaccount ${esc(String(d.sub))}, through a trading key of your account's (${copyable(d.trader_key)}) that Phoenix lets trade it and never withdraw: ${d.markets.map((m: any) => `${PERP_MARKETS[m.market]?.[0] ?? short(m.market)}-PERP up to ${perpSize(m.market, m.max_base_lots)} an order`).join(', ')}, limit orders that fill at once or not at all. It may move your USDC into Phoenix and back, only between your own accounts`)
+    .join('; ');
+}
 
 // ---- Permission links (near/sdk permissionLink): #/connect?r=<request> ----
 
@@ -1815,6 +2053,43 @@ function base58Bytes(s: string): Uint8Array {
  * Confirm screen, which explains every part of it (or refuses to approve a
  * part it can't explain). The app's name is its own claim, shown as such.
  */
+/** Marvii's published OutLayer modules (sha256 of the WASM build) that may
+ *  hold agent keys, and OutLayer's contract, per network. */
+const TEE_MODULES = ['551085926472e0a1236afa1c7461e63c87413496c63cf77645890e886433775b', '02954a8c512a5445eba70802579d7e6d09752c9d0ecc4d66b5cb237685927860', 'd6de908f4e974eaa1205a2523d05ccd31ac6a448694dac5313ebd30eab1d8543'];
+const OUTLAYER: Record<string, string> = { testnet: 'outlayer.testnet' };
+
+/**
+ * Agents may hold their keys only inside Marvii's OutLayer module. The link
+ * names the NEAR transaction of the OutLayer run that made the key; on NEAR
+ * that run must be a call to OutLayer's contract running one of our modules
+ * on `{"operation":"public_key"}`, and its result must be this key. (OutLayer
+ * derives a different key per module and operator, so the run, not a list of
+ * keys, is the proof.)
+ */
+async function checkTeeKey(publicKey: string, proof: { tx_hash?: string; sender?: string } | undefined) {
+  const no = (why: string) => new Error(`this agent's key isn't held in Marvii's TEE module (${why}). Agents must keep their keys in OutLayer with OutLayerSigner`);
+  const outlayer = OUTLAYER[cfg.chain_id];
+  if (!outlayer) throw new Error('no TEE module is published for this network yet');
+  if (!proof?.tx_hash || !proof.sender) throw no('the link has no key proof');
+  if (!/^[1-9A-HJ-NP-Za-km-z]{43,44}$/.test(proof.tx_hash) || !/^[a-z0-9_.-]{2,64}$/.test(proof.sender)) throw no('bad key proof');
+  const r = await fetch(cfg.rpc, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tx', params: { tx_hash: proof.tx_hash, sender_account_id: proof.sender, wait_until: 'FINAL' } }),
+    signal: AbortSignal.timeout(20000),
+  }).then((r) => r.json());
+  const t = r.result?.transaction;
+  if (!t) throw no('its OutLayer run was not found on NEAR');
+  const fc = t.actions?.[0]?.FunctionCall;
+  if (t.receiver_id !== outlayer || t.actions.length !== 1 || fc?.method_name !== 'request_execution') throw no('that transaction is not an OutLayer run');
+  const args = JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(fc.args), (c) => c.charCodeAt(0))));
+  if (!TEE_MODULES.includes(args.source?.WasmUrl?.hash) || args.source?.WasmUrl?.build_target !== 'wasm32-wasip2') throw no('it ran a different module');
+  if (args.input_data !== '{"operation":"public_key"}') throw no('that run did not make a key');
+  const v = r.result.status?.SuccessValue;
+  const out = v ? JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(v), (c) => c.charCodeAt(0)))) : null;
+  if (out?.public_key !== publicKey) throw no('that run made a different key');
+}
+
 async function connectFromLink() {
   const m = location.hash.match(/^#\/connect\?r=([A-Za-z0-9_-]+)$/);
   if (!m) return;
@@ -1827,6 +2102,8 @@ async function connectFromLink() {
   if (!/^[a-z0-9_.-]{1,64}$/.test(req.key_id ?? '')) throw new Error('bad key name');
   const name = String(req.app?.name ?? '').slice(0, 64);
   if (!name) throw new Error('the app has no name');
+  status('Checking where the agent key lives…');
+  await checkTeeKey(req.public_key, req.key_proof);
   const days = Number(req.days ?? 7), idle = Number(req.idle_days ?? 3);
   if (!(days >= 1 && days <= 90 && idle >= 1 && idle <= 90)) throw new Error('lasting 1 to 90 days');
   if (typeof req.grant !== 'object' || req.grant === null) throw new Error('no permissions asked for');
@@ -1857,6 +2134,12 @@ async function connectFromLink() {
     const v = await until(async () => val() || null, 30000);
     if (!v) throw new Error(`your ${ph.slice(1, -1).replace('_self', '').replace('_pk', '')} address didn't load; try again`);
     text = text.split(ph).join(v);
+  }
+  // Phoenix perps: the account's trading key for isolated subaccount n
+  // (Chain Signatures, path phoenix-n), which the extension signs orders with.
+  for (const m of new Set(text.match(/\{phoenix_trader_\d{1,2}\}/g) ?? [])) {
+    const k = await view<string>(cfg.signer, 'derived_public_key', { path: `phoenix-${m.slice(16, -1)}`, predecessor: wallet, domain_id: 1 });
+    text = text.split(m).join(core.chain_address('solana', k));
   }
   if (/\{[a-z_]+\}/.test(text)) throw new Error(`unknown placeholder ${text.match(/\{[a-z_]+\}/)![0]}`);
   const now = Date.now();
@@ -1925,10 +2208,10 @@ function explain(receiver: string, a: Described['external'][0]['actions'][0], ct
     if (g.evm_nft_floor && g.evm_nft_floor !== '0') sections.push(`<li>May list your NFTs on Seaport (OpenSea's contract) for no less than <b>${esc(fmtUnits(BigInt(g.evm_nft_floor), 18))}</b> in the chain's coin, to you</li>`);
     if (g.sol) {
       const venues = (g.sol.venues ?? []).map((v: any) => `${esc(SOL_PROGRAMS[v.program] ?? short(v.program))}${v.scope === v.program ? '' : ` (${esc(short(v.scope))})`}`);
-      sections.push(`<li>On <b>Solana</b> (${copyable(g.sol.self_address)}): may use ${venues.length ? venues.join(', ') : 'no protocols'}; may pay ${list(g.sol.recipients, 'no one directly')}${g.sol.nft_floor && g.sol.nft_floor !== '0' ? `; may list NFTs on Tensor for no less than <b>${esc(fmtUnits(BigInt(g.sol.nft_floor), 9))} SOL</b>` : ''}. What protocols return comes back to that address.</li>`);
+      sections.push(`<li>On <b>Solana</b> (${copyable(g.sol.self_address)}): may use ${venues.length ? venues.join(', ') : 'no protocols'}; may pay ${list(g.sol.recipients, 'no one directly')}${g.sol.nft_floor && g.sol.nft_floor !== '0' ? `; may list NFTs on Tensor for no less than <b>${esc(fmtUnits(BigInt(g.sol.nft_floor), 9))} SOL</b>` : ''}${g.sol.perps?.length ? `; may ${perpsWords(g.sol.perps)}` : ''}. What protocols return comes back to that address.</li>`);
     }
-    if (g.ton) sections.push(`<li>On <b>TON</b> (${copyable(g.ton.self_address)}): may pay ${list(g.ton.recipients, 'no one directly')}${g.ton.jettons?.length ? `; tokens ${g.ton.jettons.map((j: any) => copyable(j.master)).join(', ')}` : ''}${g.ton.evaa?.length ? `; may lend and borrow on EVAA (${g.ton.evaa.map((x: string) => copyable(x)).join(', ')})` : ''}</li>`);
-    if (g.tron) sections.push(`<li>On <b>TRON</b> (${copyable(g.tron.self_address)}): may call ${(g.tron.venues ?? []).map((v: any) => `${esc(fnName(v.selector))} on ${copyable(v.contract)}`).join('; ') || 'nothing'}; may pay ${list(g.tron.recipients, 'no one directly')}${g.tron.nfts?.length ? `; may trade NFTs of ${list(g.tron.nfts, '')}` : ''}</li>`);
+    if (g.ton) sections.push(`<li>On <b>TON</b> (${copyable(g.ton.self_address)}): may pay ${list(g.ton.recipients, 'no one directly')}${g.ton.jettons?.length ? `; tokens ${g.ton.jettons.map((j: any) => copyable(j.master)).join(', ')}` : ''}${g.ton.evaa?.length ? `; may lend and borrow on EVAA (${g.ton.evaa.map((x: string) => copyable(x)).join(', ')})` : ''}${g.ton.nft ? '; may move your NFTs to the addresses listed' : ''}${g.ton.lst?.length ? `; may stake and unstake with Tonstakers (${g.ton.lst.map((l: any) => copyable(l.pool)).join(', ')}): tsTON and TON come back only to this address` : ''}</li>`);
+    if (g.tron) sections.push(`<li>On <b>TRON</b> (${copyable(g.tron.self_address)}): may call ${(g.tron.venues ?? []).map((v: any) => `${esc(fnName(v.selector))} on ${TRON_NAMES[v.contract] ? `<b>${esc(TRON_NAMES[v.contract])}</b>` : copyable(v.contract)}`).join('; ') || 'nothing'}; may pay ${list(g.tron.recipients, 'no one directly')}${g.tron.nfts?.length ? `; may trade NFTs of ${list(g.tron.nfts, '')}` : ''}</li>`);
     if (g.xrpl) sections.push(`<li>On the <b>XRP Ledger</b> (${copyable(g.xrpl.self_address)}): ${[g.xrpl.dex && 'trade on its order book', g.xrpl.amm && 'use its AMM pools', g.xrpl.nft && 'trade NFTs'].filter(Boolean).join(', ') || 'payments only'}; assets ${list(g.xrpl.assets, 'XRP only')}; may pay ${list(g.xrpl.recipients, 'no one directly')}</li>`);
     if (g.stellar) sections.push(`<li>On <b>Stellar</b> (${copyable(g.stellar.self_address)}): ${[g.stellar.dex && 'trade on its order book', g.stellar.amm && 'use its AMM pools', g.stellar.blend?.length && `lend and borrow on Blend (${g.stellar.blend.map((x: string) => copyable(x)).join(', ')})`].filter(Boolean).join(', ') || 'payments only'}; assets ${list(g.stellar.assets, 'XLM only')}; may pay ${list(g.stellar.recipients, 'no one directly')}</li>`);
     const venues = [
@@ -2085,7 +2368,7 @@ function confirm(msgJson: string, ctx: SignCtx & { pendingId?: number; app?: { n
   m.innerHTML = `
     <div class="backdrop"><div class="card sheet">
       <h2>Confirm</h2>
-      ${ctx.app ? `<p class="notice small">A request from <b>${esc(ctx.app.name)}</b>${ctx.app.url ? ` (${esc(ctx.app.url)})` : ''}. That name is the app's own claim: approve only if you started this.</p>` : ''}
+      ${ctx.app ? `<p class="notice small">A request from <b>${esc(ctx.app.name)}</b>${ctx.app.url ? ` (${esc(ctx.app.url)})` : ''}. That name is the app's own claim: approve only if you started this.</p><p class="small">The agent's key lives inside Marvii's OutLayer module (TEE): checked on NEAR, it was made there, so not even the app's operator can read it.</p>` : ''}
       <p class="small muted">Your account will:</p>
       <ul class="list">${[...ops, ...calls].join('') || '<li>Nothing</li>'}</ul>
       <p class="small muted">Valid until ${esc(new Date(d.deadline).toLocaleString())}. Decoded on this page from the exact message your passkey signs.</p>

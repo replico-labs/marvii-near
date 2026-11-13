@@ -23,6 +23,8 @@ export declare class OutLayerSigner implements Signer {
     networkId?: string; rpc?: string; outlayer?: string;
   });
   getPublicKey(): Promise<string>;
+  /** After getPublicKey(): the NEAR transaction of the OutLayer run that made the key. */
+  keyProof?: { tx_hash: string; sender: string };
   signAction(m: ActionToSign): Promise<{ msg: string; signature: string }>;
 }
 
@@ -45,6 +47,8 @@ export interface GrantRequest {
 export declare function permissionLink(r: {
   publicKey: string; keyId: string; app: { name: string; url?: string }; grant: GrantRequest;
   days?: number; idleDays?: number; returnUrl?: string; page?: string;
+  /** `signer.keyProof` from an OutLayerSigner: the page approves only keys made in Marvii's published module. */
+  keyProof?: { tx_hash: string; sender: string };
 }): string;
 
 /** Waits until a wallet has granted `publicKey`; the relayer checks it on-chain. */
@@ -73,7 +77,8 @@ export declare class MarviiAgent {
 
 export declare function nearCall(receiverId: string, method: string, args?: object, deposit?: string | bigint): Action;
 export declare function evmTx(tx: object): Action;
-export declare function solTx(o: { recentBlockhash: string; instructions: object[]; atas?: object[]; obligations?: object[] }): Action;
+export declare function solTx(o: { recentBlockhash: string; instructions: object[]; atas?: object[]; obligations?: object[]; traders?: { sub: number; bump: number }[] }): Action;
+export declare function phoenixOrder(o: { sub: number; bump: number; recentBlockhash: string; instructions: object[] }): Action;
 export declare function tonTx(tx: object): Action;
 export declare function tronTx(tx: object): Action;
 export declare function stellarTx(tx: object): Action;
@@ -93,6 +98,7 @@ export interface TopUpQuote {
   deadline: string;
   time_estimate_s: number;
 }
+export declare function polymarketOrder(order: { exchange: string; salt: string; maker: string; signer: string; taker: string; token_id: string; maker_amount: string; taker_amount: string; expiration: number; nonce: string; fee_rate_bps: string; side: 0 | 1; signature_type: 0 }): Action;
 export declare function intentsDeposit(q: { quote: string; signature: string }, action: Action): Action;
 export declare function hlOrder(o: object): Action;
 export declare function hlCancel(o: object): Action;

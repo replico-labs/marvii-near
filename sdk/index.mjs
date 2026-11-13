@@ -81,6 +81,9 @@ export class OutLayerSigner {
       const out = await this.run({ operation: 'public_key' });
       if (!out?.public_key) throw new Error(`OutLayer: ${out?.error ?? 'no public key'}`);
       this.publicKey = out.public_key;
+      // The NEAR transaction of that run: the wallet page reads it to check
+      // the key came from Marvii's published module (see permissionLink).
+      if (out.__run) this.keyProof = out.__run;
     }
     return this.publicKey;
   }
@@ -106,7 +109,9 @@ export class OutLayerSigner {
     });
     const v = r.status?.SuccessValue;
     if (v === undefined) throw new Error(`OutLayer run failed: ${JSON.stringify(r.status)}`);
-    return JSON.parse(Buffer.from(v, 'base64').toString());
+    const out = JSON.parse(Buffer.from(v, 'base64').toString());
+    if (input.operation === 'public_key') out.__run = { tx_hash: r.transaction.hash, sender: accountId };
+    return out;
   }
 }
 
@@ -114,22 +119,28 @@ export class OutLayerSigner {
 
 /**
  * The link the owner opens to approve the agent. The page fills in the
- * wallet's own addresses (`{evm_self}`, `{sol_self}`, `{ton_self}`, …),
+ * wallet's own addresses (`{evm_self}`, `{sol_self}`, `{ton_self}`, …, and
+ * `{phoenix_trader_<n>}` for its Phoenix perps trading key of subaccount n),
  * shows every permission in plain words, and signs the grant with the
  * owner's passkey. Nothing in the link can grant more than the page shows.
  *
  * @param {{ publicKey: string, keyId: string, app: { name: string, url?: string },
- *           grant: object, days?: number, idleDays?: number, returnUrl?: string, page?: string }} r
+ *           grant: object, days?: number, idleDays?: number, returnUrl?: string, page?: string,
+ *           keyProof?: { tx_hash: string, sender: string } }} r
+ *   `keyProof`: `signer.keyProof` from an OutLayerSigner. The wallet page
+ *   approves only keys made inside Marvii's published OutLayer module, and
+ *   checks this run on NEAR to tell.
  *   `grant`: the extension's Grant fields (venues, recipients, caps, chain
  *   sections), without public_key, label or expiry: the link sets those.
  * @returns {string}
  */
-export function permissionLink({ publicKey, keyId, app, grant, days = 7, idleDays = 3, returnUrl, page = DEFAULTS.page }) {
+export function permissionLink({ publicKey, keyId, app, grant, days = 7, idleDays = 3, returnUrl, page = DEFAULTS.page, keyProof }) {
   if (!/^[0-9a-f]{64}$/.test(publicKey)) throw new Error('publicKey: 32 bytes of lowercase hex');
   if (!/^[a-z0-9_.-]{1,64}$/.test(keyId)) throw new Error('keyId: up to 64 of a-z 0-9 _ . -');
   if (!app?.name) throw new Error('app.name is required');
   for (const k of ['public_key', 'label', 'expires_at_ms', 'inactivity_ms']) if (k in grant) throw new Error(`grant.${k} is set by the link`);
-  const request = { v: 1, app: { name: app.name, url: app.url }, key_id: keyId, public_key: publicKey, days, idle_days: idleDays, grant, return_url: returnUrl };
+  if (keyProof && !(/^[1-9A-HJ-NP-Za-km-z]{43,44}$/.test(keyProof.tx_hash) && keyProof.sender)) throw new Error('keyProof: { tx_hash, sender } from OutLayerSigner');
+  const request = { v: 1, app: { name: app.name, url: app.url }, key_id: keyId, public_key: publicKey, days, idle_days: idleDays, grant, return_url: returnUrl, key_proof: keyProof };
   return `${page.replace(/\/$/, '')}/#/connect?r=${Buffer.from(JSON.stringify(request)).toString('base64url')}`;
 }
 
@@ -256,12 +267,16 @@ export const nearCall = (receiverId, method, args = {}, deposit = '0') => ({ typ
 /** An EIP-1559 transaction for the wallet's EVM address (all fields as the chain needs them). */
 export const evmTx = (tx) => ({ type: 'evm_tx', tx: { value: '0', data: '0x', ...tx, value: String(tx.value ?? '0') } });
 /** Solana instructions (see near/agent/solana.mjs); the extension compiles the message. */
-export const solTx = ({ recentBlockhash, instructions, atas = [], obligations = [] }) => ({ type: 'sol_tx', recent_blockhash: recentBlockhash, instructions, atas, obligations });
+export const solTx = ({ recentBlockhash, instructions, atas = [], obligations = [], traders = [] }) => ({ type: 'sol_tx', recent_blockhash: recentBlockhash, instructions, atas, obligations, traders });
+/** Phoenix perps orders signed by the account's trading key for isolated subaccount `sub` (`bump`: its trader account's PDA bump). */
+export const phoenixOrder = ({ sub, bump, recentBlockhash, instructions }) => ({ type: 'phoenix_order', sub, bump, recent_blockhash: recentBlockhash, instructions });
 /** Typed transactions the extension builds itself. */
 export const tonTx = (tx) => ({ type: 'ton_tx', tx });
 export const tronTx = (tx) => ({ type: 'tron_tx', tx });
 export const stellarTx = (tx) => ({ type: 'stellar_tx', tx });
 export const xrplTx = (tx) => ({ type: 'xrpl_tx', tx });
+/** A Polymarket order (Polygon) for the wallet's EVM key to sign (EIP-712); the account is maker and signer. */
+export const polymarketOrder = (order) => ({ type: 'polymarket_order', order });
 /** A Seaport listing for the wallet's EVM key to sign (EIP-712). */
 export const seaportOrder = (order) => ({ type: 'seaport_order', order });
 /** Hyperliquid (testnet) order, cancel and leverage. */

@@ -46,6 +46,23 @@ console.log('EVM address (every EVM chain)', await page.getAttribute('#chain-845
 await page.evaluate(() => (location.hash = '#/agents'));
 await page.click('#add');
 await page.fill('input[name=public_key]', agentPk);
+// The page approves only keys made in Marvii's OutLayer module, checking the
+// run's NEAR transaction. This test signs as the agent with a key it holds,
+// so it stands in for OutLayer: it answers that one lookup with a run of the
+// published module that returned its key. Every other call is real.
+const FAKE_RUN = '1111111111111111111111111111111111111111111';
+await page.route('**/*', async (route) => {
+  const body = route.request().postData() ?? '';
+  if (!body.includes(FAKE_RUN)) return route.continue();
+  const b64 = (x) => Buffer.from(typeof x === 'string' ? x : JSON.stringify(x)).toString('base64');
+  const args = { source: { WasmUrl: { url: 'https://test.fastfs.io/x.wasm', hash: 'd6de908f4e974eaa1205a2523d05ccd31ac6a448694dac5313ebd30eab1d8543', build_target: 'wasm32-wasip2' } }, input_data: '{"operation":"public_key"}' };
+  return route.fulfill({ json: { jsonrpc: '2.0', id: 1, result: {
+    transaction: { receiver_id: 'outlayer.testnet', actions: [{ FunctionCall: { method_name: 'request_execution', args: b64(args) } }] },
+    status: { SuccessValue: b64({ public_key: agentPk }) },
+  } } });
+});
+await page.fill('input[name=proof_tx]', FAKE_RUN);
+await page.fill('input[name=proof_sender]', 'e2e-stand-in.testnet');
 await page.fill('input[name=to]', POOL);
 await page.fill('input[name=selector]', '0x617ba037');
 await page.fill('input[name=token]', USDC);

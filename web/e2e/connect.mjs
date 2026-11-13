@@ -33,9 +33,11 @@ await page.reload();
 // The owner opens the link: the page fills in the account's addresses and
 // shows the grant on the Confirm screen; the passkey approves it.
 await page.goto(link);
-await page.waitForSelector('.sheet >> text=Give', { timeout: 120_000 }).catch(async (e) => {
-  console.log('page says:', (await page.textContent('#status').catch(() => '?'))?.replace(/\s+/g, ' '));
-  throw e;
+await page.waitForSelector('.sheet >> text=Give', { timeout: Number(process.env.CONFIRM_TIMEOUT_MS ?? 120_000) }).catch(async (e) => {
+  const said = await page.$$eval('.status', (els) => els.map((x) => x.textContent.trim()).filter(Boolean)).catch(() => []);
+  console.log('page says:', said.join(' | ').replace(/\s+/g, ' ') || '?');
+  if (process.env.SHOT) await page.screenshot({ path: process.env.SHOT, fullPage: true });
+  process.exit(1);
 });
 console.log('Confirm shows:', (await page.textContent('.sheet')).replace(/\s+/g, ' ').trim().slice(0, 600));
 if (await page.$eval('#yes', (b) => b.disabled)) throw new Error('approval is blocked');

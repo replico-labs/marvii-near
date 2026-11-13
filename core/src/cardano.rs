@@ -52,6 +52,12 @@ fn address_bytes(a: &str) -> Result<Vec<u8>, String> {
     Ok(b)
 }
 
+/// An addr_test1… address's raw bytes, hex (what the extension's Cardano
+/// payment grants list).
+pub fn cardano_address_hex(a: &str) -> Result<String, String> {
+    Ok(hex::encode(address_bytes(a)?))
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 struct AdaInput {
     tx_hash: String,

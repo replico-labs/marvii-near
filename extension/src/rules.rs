@@ -77,6 +77,10 @@ pub struct SolGrant {
     /// so it can't sell one cheaply to an accomplice. Zero: no listing.
     #[serde(default)]
     pub nft_floor: U128,
+    /// Phoenix perps: the isolated subaccounts the agent trades, each with
+    /// the account's own trading key (perps.rs). Empty: no Phoenix perps.
+    #[serde(default)]
+    pub perps: Vec<crate::perps::PerpsDesk>,
 }
 
 /// What the agent may do on the XRP Ledger. Caps use `xrp` (drops, fees
@@ -166,6 +170,21 @@ pub struct TonGrant {
     /// EVAA lending masters it may supply to and withdraw (borrow) from.
     #[serde(default)]
     pub evaa: Vec<String>,
+    /// Tonstakers liquid-staking pools it may stake in, each with its tsTON
+    /// jetton master (whose wallet for the account is in `jettons`).
+    #[serde(default)]
+    pub lst: Vec<TonLst>,
+    /// Whether it may move the account's NFTs (TEP-62) to listed recipients;
+    /// each counts 1 against `nft:ton`.
+    #[serde(default)]
+    pub nft: bool,
+}
+
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TonLst {
+    pub pool: String,
+    pub jetton: String,
 }
 
 /// The cap asset for Hyperliquid orders: their value, price × size, in
@@ -322,6 +341,8 @@ pub enum Action {
     /// signed, and its signature) and the transfer to the quote's deposit
     /// address (intents.rs).
     IntentsDeposit { quote: String, signature: String, action: Box<Action> },
+    /// A Polymarket order for the account's EVM key to sign (EIP-712).
+    PolymarketOrder { order: crate::polymarket::PmOrder },
     SolTx {
         recent_blockhash: String,
         instructions: Vec<SolIx>,
@@ -330,7 +351,14 @@ pub enum Action {
         /// The account's Kamino obligations the transaction uses.
         #[serde(default)]
         obligations: Vec<SolObligation>,
+        /// The account's Phoenix perps trader accounts the transaction uses.
+        #[serde(default)]
+        traders: Vec<SolTrader>,
     },
+    /// Phoenix perps orders, signed by the account's trading key for an
+    /// isolated subaccount (perps.rs); `bump` derives that subaccount's
+    /// trader account.
+    PhoenixOrder { sub: u8, bump: u8, recent_blockhash: String, instructions: Vec<SolIx> },
 }
 
 #[near(serializers = [json])]
@@ -371,6 +399,15 @@ pub struct SolAta {
 #[derive(Clone, Debug)]
 pub struct SolObligation {
     pub market: String,
+    pub bump: u8,
+}
+
+/// One of the account's Phoenix trader accounts: subaccount (0, cross
+/// margin, or an isolated one) and the PDA's bump.
+#[near(serializers = [json])]
+#[derive(Clone, Debug)]
+pub struct SolTrader {
+    pub sub: u8,
     pub bump: u8,
 }
 
@@ -502,7 +539,7 @@ pub fn validate_grant(
     }
     for (i, u) in g.utxo.iter().enumerate() {
         if !utxo::CHAINS.contains(&u.chain.as_str()) {
-            return Err("agents can pay only on Bitcoin, Litecoin, Bitcoin Cash, Zcash and Dogecoin");
+            return Err("agents can pay only on Bitcoin, Litecoin, Bitcoin Cash, Zcash, Dogecoin and Cardano");
         }
         if g.utxo[..i].iter().any(|x| x.chain == u.chain) {
             return Err("a chain is listed twice");
@@ -525,7 +562,7 @@ pub fn validate_grant(
     if let Some(sg) = &g.sol {
         sol::b58(&sg.self_address)?;
         for v in &sg.venues {
-            if !(sol::STAKE_POOL_PROGRAMS.contains(&v.program.as_str()) || v.program == sol::KAMINO || v.program == sol::TENSOR) {
+            if !(sol::STAKE_POOL_PROGRAMS.contains(&v.program.as_str()) || v.program == sol::KAMINO || v.program == sol::TENSOR || v.program == sol::JUPITER || v.program == sol::PHOENIX) {
                 return Err("no decoder for that Solana program");
             }
             sol::b58(&v.scope)?;
@@ -533,7 +570,18 @@ pub fn validate_grant(
         for r in &sg.recipients {
             sol::b58(r)?;
         }
-        sol_items = sg.venues.len() + sg.recipients.len();
+        for d in &sg.perps {
+            if !crate::perps::sub_ok(d.sub) || d.markets.is_empty() || d.markets.len() > 8 || sg.perps.iter().filter(|x| x.sub == d.sub).count() > 1 {
+                return Err("a Phoenix desk names subaccount 1 to 31 once, with 1 to 8 markets");
+            }
+            if sol::b58(&d.trader_key)? == sol::b58(&sg.self_address)? {
+                return Err("the trading key can't be the account's own key");
+            }
+            for m in &d.markets {
+                sol::b58(&m.market)?;
+            }
+        }
+        sol_items = sg.venues.len() + sg.recipients.len() + sg.perps.iter().map(|d| d.markets.len()).sum::<usize>();
     }
     let mut xrpl_items = 0;
     if let Some(x) = &g.xrpl {
@@ -612,7 +660,7 @@ pub fn validate_grant(
     }
     for c in &g.caps {
         // Solana mints are base58, which is case-sensitive.
-        if !c.asset.starts_with("spl:") && !c.asset.starts_with("xrpl:") && !c.asset.starts_with("stellar:") && !c.asset.starts_with("trc20:") && !c.asset.starts_with("borrow:tron:") && !c.asset.starts_with("jetton:") && !c.asset.starts_with("soroban:") && !c.asset.starts_with("borrow:stellar:") && !c.asset.starts_with("borrow:solana:") && c.asset != c.asset.to_lowercase() {
+        if !c.asset.starts_with("spl:") && !c.asset.starts_with("xrpl:") && !c.asset.starts_with("stellar:") && !c.asset.starts_with("trc20:") && !c.asset.starts_with("borrow:tron:") && !c.asset.starts_with("jetton:") && !c.asset.starts_with("soroban:") && !c.asset.starts_with("borrow:stellar:") && !c.asset.starts_with("borrow:solana:") && !c.asset.starts_with("phoenix:") && c.asset != c.asset.to_lowercase() {
             return Err("cap assets must be lowercase");
         }
     }
@@ -778,6 +826,52 @@ pub fn check(
             if chain == "zcash" && (*branch_id == 0 || *expiry_height == 0) {
                 return Err("Zcash needs a branch ID and expiry height");
             }
+            if chain == "cardano" {
+                // `expiry_height` is the TTL slot; the fee is what inputs
+                // leave over outputs, written into the body (cardano.rs).
+                if *expiry_height == 0 {
+                    return Err("Cardano needs a TTL slot");
+                }
+                let own = hex::decode(&u.self_script).unwrap();
+                let mut ins: Vec<crate::cardano::Input> = vec![];
+                let mut total_in: u64 = 0;
+                for i in inputs {
+                    let tx_hash: [u8; 32] = hex::decode(&i.txid).ok().and_then(|v| v.try_into().ok()).ok_or("txid must be 32 bytes hex")?;
+                    if ins.iter().any(|x| x.tx_hash == tx_hash && x.index == i.vout) {
+                        return Err("an input is listed twice");
+                    }
+                    total_in = total_in.checked_add(i.value).ok_or("overflow")?;
+                    ins.push(crate::cardano::Input { tx_hash, index: i.vout });
+                }
+                let (mut total_out, mut change, mut outs): (u64, u64, Vec<(Vec<u8>, u64)>) = (0, 0, vec![]);
+                for o in outputs {
+                    let a = hex::decode(&o.script).map_err(|_| "addresses must be hex")?;
+                    if o.value == 0 {
+                        return Err("an output pays nothing");
+                    }
+                    if a == own {
+                        change = change.checked_add(o.value).ok_or("overflow")?;
+                    } else {
+                        if !crate::cardano::address_ok(&a) {
+                            return Err("an output isn't a Cardano testnet payment address");
+                        }
+                        if !queued && !u.recipients.contains(&o.script.to_lowercase()) {
+                            return Err("recipient not allowed");
+                        }
+                    }
+                    total_out = total_out.checked_add(o.value).ok_or("overflow")?;
+                    outs.push((a, o.value));
+                }
+                let fee = total_in.checked_sub(total_out).ok_or("outputs exceed inputs")?;
+                if fee == 0 || fee > crate::cardano::MAX_FEE {
+                    return Err("fee must be above 0 and at most 2 ADA");
+                }
+                let body = crate::cardano::body(&ins, &outs, fee, *expiry_height as u64);
+                let spends = vec![("utxo:cardano".to_string(), (total_in - change) as u128)];
+                let plan = Plan { kind: Kind::Eddsa { path: "cardano".into(), message: crate::cardano::body_hash(&body).to_vec() }, spends };
+                within_caps(s, g, &plan, now)?;
+                return Ok(plan);
+            }
             let own = hex::decode(&u.self_script).unwrap();
             let mut ins = vec![];
             let mut total_in: u64 = 0;
@@ -836,6 +930,13 @@ pub fn check(
             let (_, id, spends) = tron::check(t, tx, queued)?;
             Plan { kind: Kind::Evm { path: "tron".into(), hash: id }, spends }
         }
+        Action::PolymarketOrder { order } => {
+            if queued {
+                return Err("orders can't be queued");
+            }
+            let (hash, spends) = crate::polymarket::check(g, order, now / 1000)?;
+            Plan { kind: Kind::Evm { path: EVM_PATH.to_string(), hash }, spends }
+        }
         Action::SeaportOrder { order } => {
             let (hash, spends) = crate::seaport::check(g, order, queued)?;
             Plan { kind: Kind::Evm { path: EVM_PATH.to_string(), hash }, spends }
@@ -850,10 +951,15 @@ pub fn check(
             let (_, hash, spends) = stellar::check(x, tx, queued, stellar::TESTNET)?;
             Plan { kind: Kind::Eddsa { path: "stellar".into(), message: hash.to_vec() }, spends }
         }
-        Action::SolTx { recent_blockhash, instructions, atas, obligations } => {
+        Action::SolTx { recent_blockhash, instructions, atas, obligations, traders } => {
             let sg = g.sol.as_ref().ok_or("Solana not allowed")?;
-            let (message, spends) = sol_message(sg, recent_blockhash, instructions, atas, obligations, queued)?;
+            let (message, spends) = sol_message(sg, recent_blockhash, instructions, atas, obligations, traders, queued)?;
             Plan { kind: Kind::Eddsa { path: "solana".into(), message }, spends }
+        }
+        Action::PhoenixOrder { sub, bump, recent_blockhash, instructions } => {
+            let sg = g.sol.as_ref().ok_or("Solana not allowed")?;
+            let (message, spends) = phoenix_order_message(sg, *sub, *bump, recent_blockhash, instructions)?;
+            Plan { kind: Kind::Eddsa { path: format!("phoenix-{sub}"), message }, spends }
         }
         Action::IntentsDeposit { quote, signature, action: inner } => {
             if queued {
@@ -901,6 +1007,12 @@ pub fn check(
             Plan { kind: Kind::Evm { path: EVM_PATH.to_string(), hash: hl::signing_hash(&action_bytes, nonce) }, spends }
         }
     };
+    within_caps(s, g, &plan, now)?;
+    Ok(plan)
+}
+
+/// Every spend fits under its cap for today.
+fn within_caps(s: &Session, g: &Grant, plan: &Plan, now: u64) -> Result<(), &'static str> {
     for (asset, amount) in &plan.spends {
         let cap = cap_for(g, asset).ok_or("no cap for this asset")?;
         let total = s.spent_on(asset, now).checked_add(*amount).ok_or("overflow")?;
@@ -908,7 +1020,7 @@ pub fn check(
             return Err("over the daily cap");
         }
     }
-    Ok(plan)
+    Ok(())
 }
 
 /// A Hyperliquid action's encoding and spend, if the grant allows it.
@@ -1083,12 +1195,19 @@ fn ft_call_msg_ok(g: &Grant, to: &AccountId, msg: &str, queued: bool) -> Result<
 }
 
 /// Checks a Solana transaction against the grant and compiles its message.
-pub fn sol_message(sg: &SolGrant, blockhash: &str, ixs: &[SolIx], atas: &[SolAta], obligations: &[SolObligation], queued: bool) -> Result<(Vec<u8>, Vec<(String, u128)>), &'static str> {
+#[allow(clippy::too_many_arguments)]
+pub fn sol_message(sg: &SolGrant, blockhash: &str, ixs: &[SolIx], atas: &[SolAta], obligations: &[SolObligation], traders: &[SolTrader], queued: bool) -> Result<(Vec<u8>, Vec<(String, u128)>), &'static str> {
     let me = sol::b58(&sg.self_address)?;
-    if atas.len() > 12 || obligations.len() > 4 {
+    if atas.len() > 12 || obligations.len() > 4 || traders.len() > 4 {
         return Err("too many token accounts");
     }
-    let mut own = sol::Own { me, atas: vec![], obligations: vec![] };
+    let mut own = sol::Own { me, atas: vec![], obligations: vec![], traders: vec![] };
+    for t in traders {
+        if t.sub != 0 && !sg.perps.iter().any(|d| d.sub == t.sub) {
+            return Err("a subaccount the grant doesn't list");
+        }
+        own.traders.push((crate::perps::trader_account(&me, t.sub, t.bump), t.sub));
+    }
     for o in obligations {
         own.obligations.push(sol::kamino_obligation(&me, &sol::b58(&o.market)?, o.bump));
     }
@@ -1101,6 +1220,21 @@ pub fn sol_message(sg: &SolGrant, blockhash: &str, ixs: &[SolIx], atas: &[SolAta
     }
     let ixs = sol::parse(ixs)?;
     sol::check(sg, &own, &ixs, &sol::b58(blockhash)?, queued)
+}
+
+/// Checks the trading key's orders for subaccount `sub` and compiles the
+/// message it signs (the trading key pays the fee).
+pub fn phoenix_order_message(sg: &SolGrant, sub: u8, bump: u8, blockhash: &str, ixs: &[SolIx]) -> Result<(Vec<u8>, Vec<(String, u128)>), &'static str> {
+    let desk = sg.perps.iter().find(|d| d.sub == sub).ok_or("a subaccount the grant doesn't list")?;
+    let key = sol::b58(&desk.trader_key)?;
+    let trader = crate::perps::trader_account(&sol::b58(&sg.self_address)?, sub, bump);
+    let ixs = sol::parse(ixs)?;
+    let spends = crate::perps::check_order(desk, &key, &trader, &ixs)?;
+    let msg = sol::compile(&key, &ixs, &sol::b58(blockhash)?)?;
+    if msg.len() > sol::MAX_MESSAGE {
+        return Err("transaction too large");
+    }
+    Ok((msg, spends))
 }
 
 /// A word's value, or u128::MAX if it doesn't fit.

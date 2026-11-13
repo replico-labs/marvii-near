@@ -30,6 +30,9 @@ pub mod ton;
 pub mod ton_cell;
 pub mod seaport;
 pub mod intents;
+pub mod cardano;
+pub mod polymarket;
+pub mod perps;
 pub mod rules;
 
 use defuse_wallet::{
@@ -311,8 +314,13 @@ impl Extension {
     /// The Solana message a transaction compiles to, hex, so the agent can
     /// attach the returned signature. Checks nothing about any session.
     pub fn sol_message(&self, self_address: String, action: Action) -> String {
-        let Action::SolTx { recent_blockhash, instructions, atas, .. } = action else { env::panic_str("not a Solana transaction") };
-        let sg = rules::SolGrant { self_address, venues: vec![], recipients: vec![], nft_floor: near_sdk::json_types::U128(0) };
+        let (recent_blockhash, instructions, atas) = match action {
+            Action::SolTx { recent_blockhash, instructions, atas, .. } => (recent_blockhash, instructions, atas),
+            // self_address: the trading key, which pays and signs.
+            Action::PhoenixOrder { recent_blockhash, instructions, .. } => (recent_blockhash, instructions, vec![]),
+            _ => env::panic_str("not a Solana transaction"),
+        };
+        let sg = rules::SolGrant { self_address, venues: vec![], recipients: vec![], nft_floor: near_sdk::json_types::U128(0), perps: vec![] };
         let me = sol::b58(&sg.self_address).unwrap_or_else(|e| env::panic_str(e));
         let ixs = sol::parse(&instructions).unwrap_or_else(|e| env::panic_str(e));
         let _ = atas;

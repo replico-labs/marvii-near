@@ -56,7 +56,7 @@ pub enum HlAction {
 
 /// The extension's action types (`rules::Action`); any other is refused.
 const ACTION_TYPES: [&str; 11] = ["near_call", "evm_tx", "hl_order", "hl_cancel", "hl_leverage", "utxo_pay", "xrpl_tx", "stellar_tx", "tron_tx", "ton_tx", "sol_tx"];
-const MORE_TYPES: [&str; 2] = ["seaport_order", "intents_deposit"];
+const MORE_TYPES: [&str; 4] = ["seaport_order", "intents_deposit", "polymarket_order", "phoenix_order"];
 /// The largest action accepted (a Solana transaction with 12 instructions fits).
 const MAX_ACTION_BYTES: usize = 16 * 1024;
 

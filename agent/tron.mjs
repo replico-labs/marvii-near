@@ -12,11 +12,16 @@
 //   node tron.mjs repay <trx>                JustLend: repay
 //   node tron.mjs redeem <trx>               JustLend: take TRX back out
 //   node tron.mjs nft-send <contract> <id> <to>  move one of the account's NFTs
+//   node tron.mjs strx-stake <trx>           JustLend sTRX: stake TRX for sTRX (liquid staking)
+//   node tron.mjs strx-unstake <strx>        burn sTRX; its TRX unfreezes (about 14 days)
+//   node tron.mjs strx-claim                 claim every unfrozen withdrawal
+//   node tron.mjs strx-balance               the account's sTRX and what it is worth in TRX
 //
 // Addresses: SunSwap V2 Router and Factory from docs.sun.io (Contract
 // Addresses, NILE), the router's factory() matching; JustLend's Nile
 // Unitroller from docs.justlend.org/developers/contracts.json, its markets
-// from getAllMarkets() on Nile.
+// from getAllMarkets() on Nile; sTRX (STRXProxy) from the same file
+// (networks.nile.strx.staked_trx), its functions from its ABI on Nile.
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -33,6 +38,7 @@ const TOKEN = 'TQJ1pgmGCMdcgCg4XXFs4x6GUGft214hAU'; // a Nile test "USDT" with a
 const JTRX = 'TKM7w4qFmkXQLEF2MgrQroBYpd5TY7i1pq';
 const COMPTROLLER = 'TJUCStq3WqfKqZLuZje5v7z6Ua6iBry1P6';
 const N = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n;
+const STRX = 'TZ8du1HkatTWDbS6FLZei4dQfjfpSm9mxp';
 const FEE_LIMIT = '50000000'; // 50 TRX of energy at most per call
 
 function agentKey() {
@@ -149,6 +155,21 @@ if (cmd === 'address') {
 } else if (cmd === 'redeem') {
   console.log(`JustLend: take ${a1} TRX back out`);
   await run(trigger(JTRX, '852a12e3' + word(BigInt(sun(a1)).toString(16))), from); // redeemUnderlying(uint256)
+} else if (cmd === 'strx-stake') {
+  console.log(`sTRX: stake ${a1} TRX`);
+  await run(trigger(STRX, 'd0e30db0', sun(a1)), from); // deposit() payable: sTRX to the caller
+} else if (cmd === 'strx-unstake') {
+  const amount = BigInt(Math.round(Number(a1) * 1e6)) * 10n ** 12n; // sTRX has 18 decimals
+  console.log(`sTRX: unstake ${a1} sTRX (TRX unfreezes for the account)`);
+  await run(trigger(STRX, '2e1a7d4d' + word(amount.toString(16))), from); // withdraw(uint256 tokenAmount)
+} else if (cmd === 'strx-claim') {
+  console.log('sTRX: claim unfrozen TRX');
+  await run(trigger(STRX, 'd1058e59'), from); // claimAll()
+} else if (cmd === 'strx-balance') {
+  const q = async (sel) => BigInt('0x' + ((await api('/wallet/triggerconstantcontract', { owner_address: from, contract_address: STRX, function_selector: sel, parameter: addrWord(from), visible: true })).constant_result?.[0] || '0'));
+  const bal = await q('balanceOf(address)');
+  const trx = await q('viewBalanceOfUnderlying(address)');
+  console.log(`${from}: ${Number(bal) / 1e18} sTRX, worth ${Number(trx) / 1e6} TRX`);
 } else if (cmd === 'nft-send') {
   console.log(`send NFT ${a2} of ${a1} to ${a3}`);
   await run(trigger(a1, '42842e0e' + addrWord(from) + addrWord(a3) + word(BigInt(a2).toString(16))), from); // safeTransferFrom

@@ -14,6 +14,15 @@
 //!   account; withdraw pays only the account. A withdraw past what was
 //!   supplied is a borrow, and the extension can't tell which, so every
 //!   withdraw counts against `borrow:ton:<asset id>`. Repaying is supplying.
+//! - `nft_transfer`: a TEP-62 transfer of one of the account's NFTs (the
+//!   item only obeys its owner) to a listed recipient, excess TON back to
+//!   the account; counts 1 against `nft:ton`.
+//! - `lst_stake` / `lst_unstake`: Tonstakers liquid staking (layouts from
+//!   tonstakers-sdk 0.0.20: buildStakePayload, buildUnstakePayload). Stake
+//!   sends TON to a pool the grant lists; the pool mints tsTON to the sender,
+//!   the account. Unstake burns tsTON from the account's own wallet for that
+//!   pool's jetton (the pairing is on the grant), with the account as the
+//!   response destination, so the TON comes back to it.
 
 use near_sdk::{json_types::{U128, U64}, near};
 
@@ -28,6 +37,14 @@ const OP_EVAA_SUPPLY_WITHDRAW: u128 = 0x4;
 /// SUPPLY_WITHDRAW_MASTER_WITHOUT_PRICES: the same body with no price cell
 /// (a withdrawal the master can settle without prices: no debt).
 const OP_EVAA_SUPPLY_WITHDRAW_NO_PRICES: u128 = 0x401;
+/// Tonstakers: the pool's deposit op and TEP-74 burn (PAYLOAD_STAKE,
+/// PAYLOAD_UNSTAKE in tonstakers-sdk).
+const OP_LST_STAKE: u128 = 0x47d54391;
+const OP_JETTON_BURN: u128 = 0x595f07bc;
+/// TEP-62 NFT transfer.
+const OP_NFT_TRANSFER: u128 = 0x5fcc3d14;
+/// An unstake carries more for the pool's gas (the SDK sends 1.05 TON).
+pub const MAX_UNSTAKE_GAS: u64 = 2_000_000_000;
 /// TON attached to a contract call for its gas, at most (counted).
 pub const MAX_GAS: u64 = 1_000_000_000;
 
@@ -45,6 +62,14 @@ pub enum TonMsg {
     /// (hex); `prices` the oracle-signed price cell (BOC hex), which the
     /// master checks, or empty for a withdrawal without prices.
     EvaaWithdraw { master: String, asset_id: String, amount: U64, prices: String, ton: U64 },
+    /// Stake `amount` nanotons in a Tonstakers pool; `ton` is its fee (the
+    /// SDK sends 1 TON, the rest comes back).
+    LstStake { pool: String, amount: U128, ton: U64 },
+    /// Unstake `amount` tsTON: by the next round's end, or now from the
+    /// pool's liquidity (`fill_or_kill`: all of it now, or nothing).
+    LstUnstake { pool: String, amount: U128, ton: U64, #[serde(default)] wait_till_round_end: bool, #[serde(default)] fill_or_kill: bool },
+    /// Move an NFT (its item contract) to a listed recipient.
+    NftTransfer { item: String, to: String, ton: U64, #[serde(default)] forward_ton: U64 },
 }
 
 #[near(serializers = [json])]
@@ -176,6 +201,55 @@ pub fn check(g: &TonGrant, tx: &TonTx, queued: bool) -> Result<(Cell, [u8; 32], 
                 let body = evaa_withdraw(query, &id, amount.0, &me, prices)?;
                 ton_cell::internal_message(&pool, ton, true, Some(body))?
             }
+            TonMsg::NftTransfer { item, to, ton, forward_ton } => {
+                if !g.nft {
+                    return Err("this grant doesn't allow moving NFTs");
+                }
+                let item = address(item)?;
+                let to = address(to)?;
+                if to == me {
+                    return Err("transfer to itself");
+                }
+                if !queued && !listed(&to) {
+                    return Err("recipient not allowed");
+                }
+                let ton = gas(ton.0)?;
+                if forward_ton.0 as u128 >= ton {
+                    return Err("the forward amount must be less than the gas sent");
+                }
+                spends.push(("nft:ton".into(), 1));
+                spends.push(("ton".into(), ton));
+                ton_cell::internal_message(&item, ton, true, Some(nft_transfer_body(query, &to, &me, forward_ton.0)?))?
+            }
+            TonMsg::LstStake { pool, amount, ton } => {
+                let p = address(pool)?;
+                if !g.lst.iter().any(|l| address(&l.pool).ok() == Some(p)) {
+                    return Err("not an allowed staking pool");
+                }
+                if amount.0 == 0 {
+                    return Err("amount must be more than zero");
+                }
+                let ton = gas(ton.0)?;
+                let value = amount.0.checked_add(ton).ok_or("overflow")?;
+                spends.push(("ton".into(), value));
+                let body = lst_stake_body(query)?;
+                ton_cell::internal_message(&p, value, true, Some(body))?
+            }
+            TonMsg::LstUnstake { pool, amount, ton, wait_till_round_end, fill_or_kill } => {
+                let p = address(pool)?;
+                let l = g.lst.iter().find(|l| address(&l.pool).ok() == Some(p)).ok_or("not an allowed staking pool")?;
+                let (master, wallet) = jetton_wallet(&l.jetton)?;
+                if amount.0 == 0 {
+                    return Err("amount must be more than zero");
+                }
+                if ton.0 == 0 || ton.0 > MAX_UNSTAKE_GAS {
+                    return Err("gas must be 1 nanoton to 2 TON");
+                }
+                spends.push((format!("jetton:{}", key(&master)), amount.0));
+                spends.push(("ton".into(), ton.0 as u128));
+                let body = lst_unstake_body(query, amount.0, &me, *wait_till_round_end, *fill_or_kill)?;
+                ton_cell::internal_message(&wallet, ton.0 as u128, true, Some(body))?
+            }
         };
         msgs.push(msg);
     }
@@ -238,4 +312,23 @@ pub(crate) fn evaa_withdraw(query: u128, asset: &[u8; 32], amount: u64, me: &Add
     let withdraw = Cell::new().uint(amount as u128, 64).bytes(asset).addr(Some(me)).done()?;
     let general = Cell::new().uint(0, 2).maybe_ref(prices).uint(0, 64).push_ref(Cell::new()).uint(0, 16).uint(0, 2).uint(0, 2).done()?;
     Cell::new().uint(op, 32).uint(query, 64).push_ref(supply).push_ref(withdraw).push_ref(general).done()
+}
+
+/// Tonstakers stake (buildStakePayload): op, query id, partner code (0).
+pub(crate) fn lst_stake_body(query: u128) -> Result<Cell, &'static str> {
+    Cell::new().uint(OP_LST_STAKE, 32).uint(query, 64).uint(0, 64).done()
+}
+
+/// Tonstakers unstake (buildUnstakePayload): a TEP-74 burn of `amount`
+/// tsTON, the account as response destination, and the two flags in a
+/// reference.
+pub(crate) fn lst_unstake_body(query: u128, amount: u128, me: &Addr, wait_till_round_end: bool, fill_or_kill: bool) -> Result<Cell, &'static str> {
+    let flags = Cell::new().bit(wait_till_round_end).bit(fill_or_kill).done()?;
+    Cell::new().uint(OP_JETTON_BURN, 32).uint(query, 64).coins(amount).addr(Some(me)).maybe_ref(Some(flags)).done()
+}
+
+/// TEP-62 transfer: op, query id, new owner, response destination (the
+/// account), no custom payload, forward TON, an empty forward payload.
+pub(crate) fn nft_transfer_body(query: u128, to: &Addr, me: &Addr, forward_ton: u64) -> Result<Cell, &'static str> {
+    Cell::new().uint(OP_NFT_TRANSFER, 32).uint(query, 64).addr(Some(to)).addr(Some(me)).bit(false).coins(forward_ton as u128).bit(false).done()
 }

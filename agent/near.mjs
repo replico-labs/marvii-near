@@ -11,6 +11,9 @@
 //   node near.mjs linear-stake <near>            stake with LiNEAR
 //   node near.mjs rnear-stake <near>             stake with Rhea for rNEAR (rnear-sdk's testnet contract)
 //   node near.mjs rnear-unstake <near>           delayed unstake of that much NEAR's worth (withdraw_all after ~4 epochs)
+//   node near.mjs nearx-stake <near>             stake with Stader for NearX
+//   node near.mjs nearx-unstake <near>           delayed unstake of that much NEAR's worth (withdraw after ~4 epochs)
+//   node near.mjs nearx-withdraw                 withdraw what has finished unstaking
 //   node near.mjs lend-collateral <wnear>        Rhea Lending: put wNEAR in as collateral
 //   node near.mjs lend-borrow <amount> [usdc|wnear]  borrow (default wNEAR); it comes to the wallet
 //   node near.mjs lend-repay <amount> [usdc|wnear]   repay from the wallet
@@ -42,6 +45,7 @@ const USDT = 'usdt.itachicara.testnet';
 const METAPOOL = 'meta-v2.pool.testnet';
 const RNEAR = 'lst.ref-dev.testnet'; // rhea-finance/rnear-sdk TESTNET_CONFIG
 const LINEAR = 'linear-protocol.testnet';
+const NEARX = 'v2-nearx.staderlabs.testnet'; // Stader NearX v2 (get_nearx_price, ft_metadata "NearX")
 const YOCTO = 10n ** 24n;
 const LENDING = 'contract.1689937928.burrow.testnet';
 const LUSDC = 'usdc.fakes.testnet'; // 6 decimals, 12 extra in the lending contract
@@ -75,7 +79,8 @@ async function call(receiver_id, method, args, deposit = '0') {
     // The extension refuses with its own short reasons; a contract's panic
     // or a balance error means the call itself failed downstream.
     const r = out.reason ?? out.error ?? '';
-    const downstream = !out.reason || /panicked|balance|gas/i.test(r);
+    const ours = /not an allowed venue|not allowed|over the daily cap|no cap for|session|token recipient|msg|takes no|venue|grant/i.test(r);
+    const downstream = !out.reason || !ours;
     console.log(`  ${downstream ? 'failed' : 'REFUSED by the extension'}: ${r}  (NEAR tx ${out.tx_hash ?? '-'})`);
     return false;
   }
@@ -93,7 +98,7 @@ const [cmd, a1, a2] = process.argv.slice(2);
 if (cmd === 'balances') {
   const acct = await fetch(cfg.rpc, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'query', params: { request_type: 'view_account', finality: 'final', account_id: WALLET } }) }).then((r) => r.json());
   console.log(`${WALLET}: ${fmt(acct.result.amount)} NEAR`);
-  for (const [t, name, d] of [[WNEAR, 'wNEAR', 24], [USDT, 'USDT', (await view(USDT, 'ft_metadata')).decimals], [METAPOOL, 'stNEAR', 24], [LINEAR, 'LiNEAR', 24], [RNEAR, 'rNEAR', 24]]) {
+  for (const [t, name, d] of [[WNEAR, 'wNEAR', 24], [USDT, 'USDT', (await view(USDT, 'ft_metadata')).decimals], [METAPOOL, 'stNEAR', 24], [LINEAR, 'LiNEAR', 24], [RNEAR, 'rNEAR', 24], [NEARX, 'NearX', 24]]) {
     console.log(`  ${name}: ${fmt(await view(t, 'ft_balance_of', { account_id: WALLET }), d)}`);
   }
 } else if (cmd === 'wrap') {
@@ -127,6 +132,16 @@ if (cmd === 'balances') {
   // unstake takes the NEAR value (rnear-sdk converts rNEAR to it first).
   console.log(`Rhea: unstake ${a1} NEAR worth of rNEAR (delayed)`);
   await call(RNEAR, 'unstake', { amount: units(a1) });
+} else if (cmd === 'nearx-stake') {
+  if (!(await register(NEARX))) process.exit(1);
+  console.log(`Stader: stake ${a1} NEAR for NearX`);
+  await call(NEARX, 'deposit_and_stake', {}, units(a1));
+} else if (cmd === 'nearx-unstake') {
+  console.log(`Stader: unstake ${a1} NEAR worth of NearX (delayed)`);
+  await call(NEARX, 'unstake', { amount: units(a1) });
+} else if (cmd === 'nearx-withdraw') {
+  console.log('Stader: withdraw unstaked NEAR');
+  await call(NEARX, 'withdraw_all', {});
 } else if (cmd === 'linear-stake') {
   console.log(`LiNEAR: stake ${a1} NEAR`);
   await call(LINEAR, 'deposit_and_stake', {}, units(a1));

@@ -10,7 +10,14 @@
 //   node ton.mjs supply <ton>                 EVAA: supply TON
 //   node ton.mjs supply-jusdc <amount>        EVAA: supply (or repay) jUSDC
 //   node ton.mjs withdraw <asset> <amount>    EVAA: withdraw what was supplied (asset ton|jusdc; no prices needed without debt)
+//   node ton.mjs lst-stake <ton>              Tonstakers: stake TON for tsTON (1 TON fee attached, the rest comes back)
+//   node ton.mjs lst-unstake <tston> [now]    burn tsTON; TON comes back at the round's end, or now from the pool's liquidity
+//   node ton.mjs lst-balance                  the account's tsTON
+//   node ton.mjs nft-send <item> <address>    move one of the account's NFTs to a listed address
 //
+// Tonstakers' testnet pool from tonstakers-sdk 0.0.20
+// (STAKING_CONTRACT_ADDRESS_TESTNET); its tsTON master is the jetton master
+// the pool administers (toncenter jetton/masters?admin_address=<pool>).
 // Addresses: EVAA's testnet masters and jUSDC from @evaafi/sdk 1.0.3
 // (constants/general/testnet, constants/assets/testnet); getUpgradeConfig
 // on-chain reports code version 0, the version the SDK targets.
@@ -29,6 +36,8 @@ const TC = process.env.TON_API ?? 'https://testnet.toncenter.com/api/v2';
 // everyone's since June).
 const EVAA = 'kQBNhBq8D5F1Red9JX64M32PpFrIPRvLvioAgauCDOpfMipw';
 const JUSDC = 'kQDaY5yUatYnHei73HBqRX_Ox9LK2XnR7XuCY9MFC2INbfYI';
+const TS_POOL = 'kQANFsYyYn-GSZ4oajUJmboDURZU-udMHf9JxzO4vYM_hFP3';
+const TSTON = 'kQAiQ2XK7BXePLwemeo-u4wNyjg-wxGeySmaFGEP7R2Mhf4m';
 // EVAA asset ids: sha256 of the asset's name (@evaafi/sdk ASSET_ID).
 const ASSET = { ton: crypto.createHash('sha256').update('TON').digest('hex'), jusdc: crypto.createHash('sha256').update('jUSDC').digest('hex') };
 
@@ -126,6 +135,21 @@ if (cmd === 'address') {
   const asset = a1 === 'ton' ? 'ton' : 'jusdc';
   console.log(`EVAA: withdraw ${a2} ${asset}`);
   await run([{ kind: 'evaa_withdraw', master: EVAA, asset_id: ASSET[asset], amount: asset === 'ton' ? nano(a2) : micro(a2), prices: '', ton: nano(0.48) }]);
+} else if (cmd === 'lst-stake') {
+  console.log(`Tonstakers: stake ${a1} TON for tsTON`);
+  await run([{ kind: 'lst_stake', pool: TS_POOL, amount: nano(a1), ton: nano(1) }]);
+} else if (cmd === 'lst-unstake') {
+  const now = a2 === 'now';
+  console.log(`Tonstakers: unstake ${a1} tsTON${now ? ' now (fill or kill)' : ''}`);
+  await run([{ kind: 'lst_unstake', pool: TS_POOL, amount: nano(a1), ton: nano(1.05), wait_till_round_end: false, fill_or_kill: now }]);
+} else if (cmd === 'nft-send') {
+  console.log(`send NFT ${a1} to ${a2}`);
+  await run([{ kind: 'nft_transfer', item: a1, to: a2, ton: nano(0.05), forward_ton: '1' }]);
+} else if (cmd === 'lst-balance') {
+  const jw = await getAddr(TSTON, 'get_wallet_address', me);
+  const d = await tc(`/runGetMethod`, { address: jw, method: 'get_wallet_data', stack: [] }).catch(() => null);
+  const bal = d?.result?.stack?.[0]?.[1];
+  console.log(`tsTON wallet ${jw}: ${bal ? Number(BigInt(bal)) / 1e9 : 0} tsTON`);
 } else {
   console.log('usage: see the top of ton.mjs');
 }

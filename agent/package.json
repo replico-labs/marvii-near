@@ -5,6 +5,8 @@
   "type": "module",
   "description": "A demo agent: holds a session key, asks the Marvii extension for EVM transactions, and broadcasts them once Chain Signatures has signed",
   "dependencies": {
+    "@ellipsis-labs/phoenix-sdk": "^2.0.3",
+    "@ellipsis-labs/rise": "^0.6.2",
     "@evaafi/sdk": "^1.0.3",
     "@kamino-finance/klend-sdk": "^13.0.3",
     "@solana/spl-stake-pool": "^1.1.8",

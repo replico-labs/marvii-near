@@ -2,6 +2,10 @@
 // then acts within it. Here it may wrap up to 0.05 NEAR a day into wNEAR
 // on NEAR testnet, and nothing else.
 //
+// The key here is local, which near.marvii.xyz refuses (it approves only
+// keys held in Marvii's OutLayer module: examples/tee-agent.mjs). Use this
+// against your own page and extension.
+//
 //   node examples/quickstart.mjs            prints the link, waits, acts
 // Env: MARVII_PAGE, MARVII_RELAYER (defaults: near.marvii.xyz, relayer.marvii.xyz);
 //      AGENT_KEY_FILE to keep the session key between runs.

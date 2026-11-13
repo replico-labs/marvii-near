@@ -241,9 +241,55 @@ async function loadCore() {
 const UTXO_BROADCAST = { bitcoin: '/utxo/bitcoin/tx', litecoin: '/utxo/litecoin/tx', 'bitcoin-cash': '/chain/bitcoin-cash/tx', zcash: '/chain/zcash/tx' };
 const UTXO_COINS = { bitcoin: '/utxo/bitcoin/address/{}/utxo', litecoin: '/utxo/litecoin/address/{}/utxo', 'bitcoin-cash': '/chain/bitcoin-cash/utxos/{}', zcash: '/chain/zcash/utxos/{}' };
 
+/** Cardano (preprod): core plans the send as for the owner; the extension
+ *  rebuilds the same body from the typed inputs and outputs, checks it and
+ *  has the account's ed25519 key sign its hash. */
+async function payCardano(core, cfg, amount, to) {
+  const k = await view(cfg.rpc, cfg.signer, 'derived_public_key', { path: 'cardano', predecessor: WALLET, domain_id: 1 });
+  const from = core.chain_address('cardano', k);
+  const [utxos, tip] = await Promise.all([relayer(`/chain/cardano/utxos/${encodeURIComponent(from)}`), relayer('/chain/cardano/info')]);
+  const plan = JSON.parse(core.cardano_plan(from, to, BigInt(Math.round(Number(amount) * 1e6)).toString(), JSON.stringify(utxos), BigInt(tip.slot + 7200)));
+  if (plan.inputs.length > 2) throw new Error('agents spend at most 2 coins per payment');
+  const hex = (a) => Buffer.from(core.cardano_address_bytes ? core.cardano_address_bytes(a) : bech32Bytes(a)).toString('hex');
+  const action = {
+    type: 'utxo_pay', chain: 'cardano', expiry_height: plan.ttl,
+    inputs: plan.inputs.map((i) => ({ txid: i.tx_hash, vout: i.tx_index, value: i.lovelace })),
+    outputs: plan.outputs.map((o) => ({ script: hex(o.address), value: o.lovelace })),
+  };
+  console.log(`  ${plan.inputs.length} coin(s) in; out: ${plan.outputs.map((o) => `${o.lovelace} to ${o.address === from ? 'change' : o.address}`).join(', ')}; fee ${plan.fee}`);
+  const s = await view(cfg.rpc, cfg.extension, 'get_session', { wallet: WALLET, key_id: 'aave-agent' });
+  const msg = JSON.stringify({ domain: 'marvii-session-v1', extension: cfg.extension, wallet: WALLET, key_id: 'aave-agent', nonce: s.nonce + 1, deadline_ms: Date.now() + 300_000, action });
+  const out = await relayer('/agent/execute', { msg, signature: crypto.sign(null, crypto.createHash('sha256').update(msg).digest(), agentKey()).toString('hex') });
+  console.log(`  NEAR tx ${out.tx_hash ?? '-'}`);
+  if (!out.ok || !out.mpc_signature) {
+    console.log(`  REFUSED by the extension: ${out.reason ?? out.error ?? 'no signature'}`);
+    return false;
+  }
+  // core checks the signature is the account's key over this plan's body.
+  const signed = JSON.parse(core.cardano_signed_tx(JSON.stringify(plan), JSON.stringify(out.mpc_signature), k));
+  const r = await fetch(RELAYER + '/chain/cardano/tx', { method: 'POST', body: signed.cbor }).then((r) => r.json());
+  console.log(`  broadcast: ${r.txid ?? r.error ?? JSON.stringify(r)}  https://preprod.cardanoscan.io/transaction/${signed.txid}`);
+  return !!r.txid;
+}
+
+/** An addr_test1… address's raw bytes (bech32). */
+function bech32Bytes(a) {
+  const CH = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l';
+  const words = [...a.slice(a.lastIndexOf('1') + 1, -6)].map((c) => CH.indexOf(c));
+  const out = [];
+  let acc = 0, bits = 0;
+  for (const w of words) {
+    acc = (acc << 5) | w;
+    bits += 5;
+    if (bits >= 8) out.push((acc >> (bits -= 8)) & 0xff);
+  }
+  return out;
+}
+
 async function pay(chain, amount, to) {
   const core = await loadCore();
   const cfg = await relayer('/config');
+  if (chain === 'cardano') return payCardano(core, cfg, amount, to);
   const k = await view(cfg.rpc, cfg.signer, 'derived_public_key', { path: chain, predecessor: WALLET, domain_id: 0 });
   const from = core.chain_address(chain, k);
   const units = BigInt(Math.round(Number(amount) * 1e8)).toString();

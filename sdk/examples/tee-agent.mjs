@@ -17,7 +17,7 @@ const signer = new OutLayerSigner({
 const publicKey = await signer.getPublicKey();
 console.log(`TEE key ${publicKey}`);
 console.log(`Open this link and approve with your passkey:\n${permissionLink({
-  publicKey, keyId: 'tee-quickstart', app: { name: 'TEE agent (OutLayer)' }, days: 1,
+  publicKey, keyProof: signer.keyProof, keyId: 'tee-quickstart', app: { name: 'TEE agent (OutLayer)' }, days: 1,
   grant: { near_venues: [{ receiver_id: 'wrap.testnet', method: 'near_deposit' }], caps: [{ asset: 'near', daily: '50000000000000000000000' }] },
   ...(page && { page }),
 })}\n`);

@@ -614,6 +614,25 @@ async fn demo(grant_to: Option<String>, approve: Option<u64>, upgrade: bool, can
                 "recipients": [marvii_near_core::utxo_script(chain, to).map_err(|e| anyhow!(e))?],
             }));
         }
+        // Cardano preprod: the account's address (ed25519, path `cardano`) and
+        // a second address of the deployer's as the listed recipient.
+        {
+            let ada = |who: &str| {
+                let who = who.to_string();
+                let near = near.clone();
+                async move {
+                    let k: String = near.view(signer().as_str(), "derived_public_key").args(json!({ "path": "cardano", "predecessor": who, "domain_id": 1 })).await?;
+                    anyhow::Ok(marvii_near_core::chain_address("cardano", &k).map_err(|e| anyhow!(e))?)
+                }
+            };
+            let (own, to) = (ada(wallet_id.as_str()).await?, ada(deployer.account_id.as_str()).await?);
+            println!("  cardano: account {own}, listed recipient {to}");
+            utxo.push(json!({
+                "chain": "cardano",
+                "self_script": marvii_near_core::cardano_address_hex(&own).map_err(|e| anyhow!(e))?,
+                "recipients": [marvii_near_core::cardano_address_hex(&to).map_err(|e| anyhow!(e))?],
+            }));
+        }
         let grant = json!({
             "key_id": key_id,
             "grant": {
@@ -650,7 +669,13 @@ async fn demo(grant_to: Option<String>, approve: Option<u64>, upgrade: bool, can
                     { "receiver_id": "lst.ref-dev.testnet", "method": "storage_deposit" },
                     { "receiver_id": "lst.ref-dev.testnet", "method": "deposit_and_stake" },
                     { "receiver_id": "lst.ref-dev.testnet", "method": "unstake" },
-                    { "receiver_id": "lst.ref-dev.testnet", "method": "withdraw_all" }
+                    { "receiver_id": "lst.ref-dev.testnet", "method": "withdraw_all" },
+                    // Stader's NearX (v2-nearx.staderlabs.testnet; methods from
+                    // stader-labs/near-liquid-token, each for the caller only).
+                    { "receiver_id": "v2-nearx.staderlabs.testnet", "method": "storage_deposit" },
+                    { "receiver_id": "v2-nearx.staderlabs.testnet", "method": "deposit_and_stake" },
+                    { "receiver_id": "v2-nearx.staderlabs.testnet", "method": "unstake" },
+                    { "receiver_id": "v2-nearx.staderlabs.testnet", "method": "withdraw_all" }
                 ],
                 // Aave V3: supply 0x617ba037, withdraw 0x69328dec, repay
                 // 0x573ade81. Uniswap V3 SwapRouter02 on Base Sepolia
@@ -664,6 +689,9 @@ async fn demo(grant_to: Option<String>, approve: Option<u64>, upgrade: bool, can
                     // Aave V3 borrow(address,uint256,uint256,uint16,address): 0xa415bcad (viem toFunctionSelector).
                     { "chain_id": CHAIN_ID, "to": pool, "selector": "0xa415bcad" },
                     { "chain_id": CHAIN_ID, "to": "0x94cc0aac535ccdb3c01d6787d6413c739ae12bc4", "selector": "0x04e45aaf" },
+                    // Polymarket's CTF exchange on Polygon (getCollateral() is
+                    // USDC.e): its own orders, and cancelOrder(Order) 0xa6dfcf86.
+                    { "chain_id": 137, "to": "0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e", "selector": "0xa6dfcf86" },
                     // Lido on Hoodi (docs.lido.fi/deployed-contracts/hoodi;
                     // the Locator's lido() and withdrawalQueue() checked
                     // on-chain): stETH submit, wstETH wrap and unwrap, the
