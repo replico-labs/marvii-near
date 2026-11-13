@@ -33,7 +33,7 @@ await page.reload();
 // The owner opens the link: the page fills in the account's addresses and
 // shows the grant on the Confirm screen; the passkey approves it.
 await page.goto(link);
-await page.waitForSelector('.sheet >> text=Give', { timeout: Number(process.env.CONFIRM_TIMEOUT_MS ?? 120_000) }).catch(async (e) => {
+await page.waitForSelector('.sheet .req, .sheet >> text=Give', { timeout: Number(process.env.CONFIRM_TIMEOUT_MS ?? 120_000) }).catch(async (e) => {
   const said = await page.$$eval('.status', (els) => els.map((x) => x.textContent.trim()).filter(Boolean)).catch(() => []);
   console.log('page says:', said.join(' | ').replace(/\s+/g, ' ') || '?');
   if (process.env.SHOT) await page.screenshot({ path: process.env.SHOT, fullPage: true });

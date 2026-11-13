@@ -138,6 +138,10 @@ function capWords(asset: string, daily: string): string {
   if (asset === 'polymarket:sell') return `sell up to ${esc(fmtUnits(BigInt(daily), 6, 2))} Polymarket shares, at any price`;
   if (asset === 'nft:ton') return `${esc(daily)} NFT transfer${daily === '1' ? '' : 's'} on TON`;
   if (asset.startsWith('nft:')) return `${esc(daily)} NFT listing${daily === '1' ? '' : 's'} on ${esc(asset.slice(4).replace(/^evm:/, 'chain ').replace('solana', 'Solana'))}`;
+  const be = asset.match(/^borrow:evm:(\d+):(0x[0-9a-fA-F]{40})$/);
+  if (be) return `borrowing ${amount(Number(be[1]), be[2].toLowerCase(), daily).replace(/<\/?b>/g, '')} on ${esc(chainName(Number(be[1])))}`;
+  const bk = KNOWN_TOKENS[asset.replace(/^borrow:solana:/, 'spl:')];
+  if (asset.startsWith('borrow:solana:') && bk) return `borrowing ${esc(fmtUnits(BigInt(daily), bk[0]))} ${bk[1]}`;
   if (asset.startsWith('borrow:')) return `borrowing ${esc(daily)} units of ${esc(asset.split(':').slice(2).join(':'))} (${esc(asset.split(':')[1])})`;
   const known = KNOWN_TOKENS[asset];
   if (known) return `${esc(fmtUnits(BigInt(daily), known[0]))} ${known[1]}`;
@@ -1459,14 +1463,10 @@ async function dashboard() {
         <ul id="queued" class="list"></ul>
       </section>
       <section class="card">
-        <h1>Apps &amp; agents</h1>
-        <label>By protocol <select id="protocol-pick"><option value="">Choose a protocol…</option></select></label>
-        <p class="muted small">Each protocol's page shows which agents can use it, what they may do there and their daily limits.</p>
-      </section>
-      <section class="card">
-        <h2>All agents</h2>
-        <p class="muted small">Each gets a key that NEAR checks on every request: which venues, how much a day, until when. Revoke any of them instantly.</p>
-        <ul id="sessions" class="list"><li class="muted">Loading…</li></ul>
+        <div class="row between wrap-row"><h1>Apps &amp; agents</h1>
+          <select id="protocol-pick" aria-label="Show a protocol" class="compact"><option value="">By protocol…</option></select></div>
+        <p class="muted small">NEAR checks every request against the limits you set. Revoke any agent instantly.</p>
+        <ul id="sessions" class="list agents"><li class="muted">Loading…</li></ul>
       </section>
       <section class="card">
         <h2>Connect an app</h2>
@@ -1680,6 +1680,12 @@ async function loadPending() {
   });
 }
 
+/** A cap without "a day", for lists already headed "Daily limits" ("50 USDC on Base"). */
+function capShort(c: { asset: string; daily: string }): string {
+  const [kind, chain, token] = c.asset.split(':');
+  if (kind === 'evm' && token) return `${amount(Number(chain), token, c.daily)} on ${esc(chainName(Number(chain)))}`;
+  return capWords(c.asset, c.daily);
+}
 /** A daily cap in words ("50 USDC a day on Base"). */
 function capText(c: { asset: string; daily: string }): string {
   const [kind, chain, token] = c.asset.split(':');
@@ -1707,7 +1713,6 @@ async function loadSessions() {
     .map(([k, s]) => {
       const expired = now >= s.grant.expires_at_ms || now >= s.last_used_ms + s.grant.inactivity_ms;
       const state = s.revoked ? '<span class="pill bad">revoked</span>' : expired ? '<span class="pill bad">expired</span>' : '<span class="pill ok">active</span>';
-      const caps = s.grant.caps.map(capText);
       const venues = [
         ...s.grant.evm_venues.map((v) => `${esc(fnName(v.selector))} on ${named(v.chain_id, v.to)}, ${esc(chainName(v.chain_id))}`),
         ...s.grant.near_venues.map((v) => `${esc(v.receiver_id)}.${esc(v.method)}`),
@@ -1715,13 +1720,27 @@ async function loadSessions() {
         ...((s.grant as any).utxo ?? []).map((u: any) => `payments on ${esc(PAY_NAMES[u.chain] ?? u.chain)} to ${u.recipients.map((r: string) => esc(short(utxoAddr(u.chain, r)))).join(', ') || 'no one'}`),
         ...grantChains(s.grant as any),
       ];
-      return `<li class="session">
-        <div class="row between"><b>${esc(s.grant.label)}</b> ${state}</div>
-        <div class="small muted">key ${esc(k)} · ${s.nonce} requests · until ${esc(new Date(s.grant.expires_at_ms).toLocaleString())}</div>
-        <div class="small">Venues: ${venues.length ? fold(venues) : 'none'}</div>
-        <div class="small">Caps: ${caps.length ? fold(caps, 4) : 'no spending'}</div>
+      const rules = grantRules(s.grant);
+      const caps = s.grant.caps.map((c) => capShort(c).replace(/<\/?b>/g, ''));
+      return `<li class="agent agent-card">
+        <div class="app-row"><div class="app-logo">${AGENT_ICON}</div><div class="app-meta"><span class="name-line"><b>${esc(s.grant.label)}</b>${state}</span><span class="mono">Ends ${esc(dayText(s.grant.expires_at_ms))} · ${s.nonce} request${s.nonce === 1 ? '' : 's'}</span></div></div>
+        <div class="rules">
+          ${rules.slice(0, 4).map(([what, where]) => `<div><span class="yes">✓</span><span class="grow">${esc(what)}</span><span class="mono muted">${esc(where)}</span></div>`).join('') || '<div><span class="muted">Nothing</span></div>'}
+          ${rules.length > 4 ? `<div><span class="muted">+${rules.length - 4} more</span></div>` : ''}
+        </div>
+        <div class="pills">
+          ${caps.slice(0, 1).map((c: string) => `<span class="pill brass"><span class="dot"></span>${limitText(c)}</span>`).join('')}
+          ${caps.length > 1 ? `<span class="pill soft">+${caps.length - 1} more limits</span>` : ''}
+        </div>
         ${s.revoked || expired ? '' : `<div class="small muted" data-spent="${esc(k)}"></div>`}
-        ${s.revoked ? '' : `<button class="danger small-btn" data-revoke="${esc(k)}">Revoke</button>`}
+        <div class="row between">
+          <details class="more"><summary>Details</summary>
+            <div class="small muted">Key ${esc(k)}</div>
+            <div class="small">May: ${venues.length ? fold(venues) : 'nothing'}</div>
+            <div class="small">Daily limits: ${caps.length ? fold(caps, 4) : 'no spending'}</div>
+          </details>
+          ${s.revoked ? '' : `<button class="danger small-btn" data-revoke="${esc(k)}">Revoke</button>`}
+        </div>
       </li>`;
     })
     .join('');
@@ -1733,7 +1752,7 @@ async function loadSessions() {
       .then((used) => {
         const parts = used.filter(([, u]) => u !== '0').map(([c, u]) => `${capWords(c.asset, u)} of ${capWords(c.asset, c.daily)}`);
         el.textContent = '';
-        el.innerHTML = parts.length ? `Used today: ${parts.join(', ')}` : 'Nothing used today';
+        el.innerHTML = parts.length ? `Used today: ${parts[0]}${parts.length > 1 ? ` and ${parts.length - 1} more` : ''}` : 'Nothing used today';
       })
       .catch(() => {});
   }
@@ -1928,7 +1947,7 @@ const PROTOCOLS: Protocol[] = [
   { id: 'rhea', name: 'Rhea Lending', chain: 'NEAR', about: 'Lending on NEAR (formerly Burrow). Borrowing counts against its own limit.', access: (g) => nearAt(g, (v) => /burrow/.test(v.receiver_id)), caps: capsByPrefix('near', 'nep141:', 'borrow:near:') },
   { id: 'nearx', name: 'Stader NearX', chain: 'NEAR', about: 'Liquid staking: stake NEAR for NearX, unstake and withdraw.', access: (g) => nearAt(g, (v) => /nearx/.test(v.receiver_id)), caps: capsByPrefix('near', 'nep141:') },
   { id: 'jupiter', name: 'Jupiter', chain: 'Solana', about: 'Token swaps across Solana; output to your account, no extra fee, slippage at most 3%.', access: (g) => solAt(g, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4'), caps: capsByPrefix('sol', 'spl:') },
-  { id: 'phoenix-perps', name: 'Phoenix perps', chain: 'Solana', about: 'Perpetual futures. Each agent trades its own isolated subaccount through a trading key of your account that can trade but never withdraw.', access: (g) => (g.sol?.perps?.length ? [perpsWords(g.sol.perps)] : []), caps: capsByPrefix('phoenix:', 'sol', 'spl:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v') },
+  { id: 'phoenix-perps', name: 'Phoenix perps', chain: 'Solana', about: 'Perpetual futures. Each agent trades its own subaccount with a key that can trade but never withdraw.', access: (g) => (g.sol?.perps?.length ? [perpsWords(g.sol.perps)] : []), caps: capsByPrefix('phoenix:', 'sol', 'spl:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v') },
   { id: 'phoenix', name: 'Phoenix spot', chain: 'Solana', about: 'Order-book swaps; both sides settle in your own token accounts.', access: (g) => solAt(g, 'PhoeNiXZ8ByJGLkxNfZRnkUfjvmuYqLR89jjFHGqdXY'), caps: capsByPrefix('sol', 'spl:') },
   { id: 'jito', name: 'Jito', chain: 'Solana', about: 'Liquid staking: SOL for JitoSOL.', access: (g) => solAt(g, 'SPoo1Ku8WFXoNDMHPsrGSTSG1Y47rzgn41SLUNakuHy', 'DPoo15wWDqpPJJtS2MUZ49aRxqz5ZaaJCJP4z8bLuib'), caps: capsByPrefix('sol', 'spl:') },
   { id: 'kamino', name: 'Kamino', chain: 'Solana', about: 'Lending on Solana. Borrowing counts against its own limit.', access: (g) => solAt(g, 'KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD'), caps: capsByPrefix('sol', 'spl:', 'borrow:solana:') },
@@ -1945,6 +1964,93 @@ const PROTOCOLS: Protocol[] = [
 ];
 const PROTOCOL_CHAINS = [...new Set(PROTOCOLS.map((p) => p.chain))];
 
+/** The protocols a grant opens, as chips, plus contracts no named protocol covers. */
+function protocolChips(g: any, max = Infinity): string {
+  const chips = PROTOCOLS.filter((p) => p.access(g).length).map((p) => `<span class="chip">${esc(p.name)}<small>${esc(p.chain)}</small></span>`);
+  const otherEvm = (g.evm_venues ?? []).filter((v: any) => !POOLS[`${v.chain_id}:${String(v.to).toLowerCase()}`]).length;
+  const otherNear = (g.near_venues ?? []).filter((v: any) => !/ref-finance|burrow|nearx/.test(v.receiver_id) && !String(v.method).startsWith('pool:')).length;
+  const otherTron = (g.tron?.venues ?? []).filter((v: any) => !TRON_NAMES[v.contract]).length;
+  if (otherEvm) chips.push(`<span class="chip">${otherEvm} other contract call${otherEvm === 1 ? '' : 's'}<small>EVM</small></span>`);
+  if (otherNear) chips.push(`<span class="chip">${otherNear} other contract call${otherNear === 1 ? '' : 's'}<small>NEAR</small></span>`);
+  if (otherTron) chips.push(`<span class="chip">${otherTron} other contract call${otherTron === 1 ? '' : 's'}<small>TRON</small></span>`);
+  if (!chips.length) return '<span class="muted">Nothing</span>';
+  const shown = chips.slice(0, max);
+  return `<div class="chips">${shown.join('')}${chips.length > shown.length ? `<span class="chip more">+${chips.length - shown.length} more</span>` : ''}</div>`;
+}
+/** Everyone a grant lets the agent pay directly, on any chain. */
+function payees(g: any): string[] {
+  return [
+    ...(g.evm_recipients ?? []), ...(g.near_recipients ?? []), ...(g.sol?.recipients ?? []), ...(g.ton?.recipients ?? []),
+    ...(g.tron?.recipients ?? []), ...(g.xrpl?.recipients ?? []), ...(g.stellar?.recipients ?? []),
+    ...(g.utxo ?? []).flatMap((u: any) => u.recipients.map((r: string) => utxoAddr(u.chain, r))),
+  ].map(String);
+}
+/** "20 Nov 2026" */
+const dayText = (ms: number) => new Date(ms).toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' });
+/** What each protocol lets an agent do, as a short phrase for the request card. */
+const PROTOCOL_VERBS: Record<string, string> = {
+  aave: 'Lend and borrow on Aave', uniswap: 'Swap on Uniswap', lido: 'Stake ETH with Lido', seaport: 'List NFTs on Seaport', polymarket: 'Trade on Polymarket',
+  ref: 'Swap on Ref', rhea: 'Lend and borrow on Rhea', nearx: 'Stake NEAR with NearX', jupiter: 'Swap on Jupiter', 'phoenix-perps': 'Trade perps on Phoenix',
+  phoenix: 'Swap on Phoenix', jito: 'Stake SOL with Jito', kamino: 'Lend and borrow on Kamino', tensor: 'Trade NFTs on Tensor', justlend: 'Lend and stake on JustLend',
+  sunswap: 'Swap on SunSwap', tonstakers: 'Stake TON with Tonstakers', evaa: 'Lend on EVAA', 'xrpl-dex': 'Trade on the XRP Ledger', 'stellar-dex': 'Trade on Stellar',
+  blend: 'Lend and borrow on Blend', nfts: 'Send NFTs to saved addresses',
+};
+/** The rows of a grant's request card: [what, where]; `only` limits them to one protocol. */
+function grantRules(g: any, only?: string): [string, string][] {
+  const rows: [string, string][] = [];
+  for (const p of PROTOCOLS) {
+    if (only && p.id !== only) continue;
+    if (p.id === 'payments' && only) {
+      for (const u of g.utxo ?? []) rows.push([`Pay ${u.recipients.length} saved address${u.recipients.length === 1 ? '' : 'es'}`, PAY_NAMES[u.chain] ?? u.chain]);
+      continue;
+    }
+    if (p.id === 'payments' || !p.access(g).length) continue;
+    if (p.id === 'hyperliquid') {
+      for (const m of g.hl_markets ?? []) rows.push([`Trade ${hlName(m.asset)} perps on Hyperliquid`, `≤ ${m.max_leverage}x`]);
+      continue;
+    }
+    if (p.id === 'phoenix-perps') {
+      for (const d of g.sol.perps) for (const m of d.markets) rows.push([`Trade ${PERP_MARKETS[m.market]?.[0] ?? 'perps'}-PERP on Phoenix`, `≤ ${perpSize(m.market, m.max_base_lots).replace(/<[^>]+>/g, '')} an order`]);
+      continue;
+    }
+    rows.push([PROTOCOL_VERBS[p.id] ?? p.name, p.chain === 'Other chains' ? '' : p.chain]);
+  }
+  const otherEvm = (g.evm_venues ?? []).filter((v: any) => !POOLS[`${v.chain_id}:${String(v.to).toLowerCase()}`]).length;
+  const otherNear = (g.near_venues ?? []).filter((v: any) => !/ref-finance|burrow|nearx/.test(v.receiver_id) && !String(v.method).startsWith('pool:')).length;
+  const otherTron = (g.tron?.venues ?? []).filter((v: any) => !TRON_NAMES[v.contract]).length;
+  if (only) return rows;
+  if (otherEvm + otherNear + otherTron) rows.push([`Call ${otherEvm + otherNear + otherTron} other contract function${otherEvm + otherNear + otherTron === 1 ? '' : 's'}`, 'see details']);
+  const pay = payees(g).length;
+  if (pay) rows.push([`Pay ${pay} saved address${pay === 1 ? '' : 'es'}`, '']);
+  return rows;
+}
+/** A daily limit as a pill's words: "Up to 50 USDC on Base a day", "Borrow up to 2 USDC on Base a day". */
+const limitText = (c: string) => (c.startsWith('borrowing ') ? `Borrow up to ${c.slice(10)} a day` : `Up to ${c} a day`);
+const AGENT_ICON = `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="8" width="16" height="12" rx="3.5"/><path d="M12 4v4"/><circle cx="12" cy="3.5" r="1"/><path d="M9 13v1.5M15 13v1.5M9.5 17.5h5"/></svg>`;
+/** A grant as a request card, like the landing page's phone: who asks, what it may do, its limits. */
+function grantRequest(g: any, name: string, fromLink: boolean): string {
+  const rows = grantRules(g);
+  const caps = (g.caps ?? []).map((c: any) => capShort(c).replace(/<\/?b>/g, ''));
+  const acct = document.getElementById('acct-name')?.textContent?.trim() || short(wallet);
+  const days = Math.max(1, Math.round((g.expires_at_ms - Date.now()) / 86_400_000));
+  return `<div class="req">
+    <div class="app-row"><div class="app-logo">${AGENT_ICON}</div><div class="app-meta"><span><b>${esc(name)}</b> wants a session key</span><span class="mono">for ${esc(acct)}</span></div></div>
+    <div class="req-title">Let this agent act for you?</div>
+    <div class="rules">
+      ${rows.map(([what, where]) => `<div><span class="yes">✓</span><span class="grow">${esc(what)}</span><span class="mono muted">${esc(where)}</span></div>`).join('')}
+      <div><span class="no">✕</span><span class="muted">Send your money anywhere you didn't list</span></div>
+    </div>
+    <div class="pills">
+      ${caps.slice(0, 2).map((c: string) => `<span class="pill brass"><span class="dot"></span>${limitText(c)}</span>`).join('')}
+      ${caps.length > 2 ? `<span class="pill soft">+${caps.length - 2} more limits</span>` : ''}
+      <span class="pill soft">${days} day${days === 1 ? '' : 's'}</span>
+      <span class="pill soft">Revoke any time</span>
+    </div>
+    ${g.queue_new_targets ? '<p class="small warn">It may also propose new recipients and contracts. Each waits the delay, and you can cancel it.</p>' : ''}
+    ${fromLink ? `<p class="small muted">"${esc(name)}" is the app's own name for itself: approve only if you started this. <span class="tee">✓ Its key was made inside Marvii's TEE, checked on NEAR.</span></p>` : ''}
+  </div>`;
+}
+
 /** A page per protocol, filled in by renderProtocols. */
 function protocolViews(): string {
   return PROTOCOLS.map((p) => `
@@ -1953,9 +2059,9 @@ function protocolViews(): string {
       <section class="card">
         <div class="row between"><h1>${esc(p.name)}</h1><span class="pill">${esc(p.chain)}</span></div>
         <p class="muted small">${esc(p.about)}</p>
-        <h2>Agents that can use it</h2>
+        <div class="sec-label">Agents that can use it</div>
         <ul class="list" data-protocol="${p.id}"><li class="muted">Loading…</li></ul>
-        <p class="muted small">Apps and agents ask for access with a permission link; you see exactly what they ask for before your passkey approves. Revoking stops an agent everywhere, not only here.</p>
+        <p class="muted small">Revoking stops an agent everywhere, not only here.</p>
       </section>
     </section>`).join('');
 }
@@ -1967,7 +2073,7 @@ function renderProtocols(rows: [string, Session][]) {
   const users = (p: Protocol) => live.filter(([, s]) => p.access(s.grant).length);
   const sel = document.getElementById('protocol-pick') as HTMLSelectElement | null;
   if (sel) {
-    sel.innerHTML = '<option value="">Choose a protocol…</option>' + PROTOCOL_CHAINS.map((c) => `<optgroup label="${esc(c)}">${PROTOCOLS.filter((p) => p.chain === c).map((p) => {
+    sel.innerHTML = '<option value="">By protocol…</option>' + PROTOCOL_CHAINS.map((c) => `<optgroup label="${esc(c)}">${PROTOCOLS.filter((p) => p.chain === c).map((p) => {
       const n = users(p).length;
       return `<option value="${p.id}">${esc(p.name)}${n ? ` · ${n} agent${n === 1 ? '' : 's'}` : ''}</option>`;
     }).join('')}</optgroup>`).join('');
@@ -1977,16 +2083,19 @@ function renderProtocols(rows: [string, Session][]) {
     if (!ul) continue;
     const us = users(p);
     ul.innerHTML = us.length
-      ? us.map(([k, s]) => `<li class="session">
-          <div class="row between"><b>${esc(s.grant.label)}</b><span class="pill ok">active</span></div>
-          <div class="small muted">key ${esc(k)} · until ${esc(new Date(s.grant.expires_at_ms).toLocaleString())}</div>
-          <div class="small">May: ${fold(p.access(s.grant))}</div>
-          <div class="small">Its daily limits here: ${(() => {
-            const mine = s.grant.caps.filter((c) => p.caps?.(c.asset, s.grant) ?? true);
-            return mine.length ? fold(mine.map(capText), 4) : 'none that apply';
-          })()}</div>
-          <button class="danger small-btn" data-revoke="${esc(k)}">Revoke</button>
-        </li>`).join('')
+      ? us.map(([k, s]) => {
+          const rules = grantRules(s.grant, p.id);
+          const caps = s.grant.caps.filter((c) => p.caps?.(c.asset, s.grant) ?? true).map((c) => capShort(c).replace(/<\/?b>/g, ''));
+          return `<li class="agent agent-card">
+          <div class="app-row"><div class="app-logo">${AGENT_ICON}</div><div class="app-meta"><span class="name-line"><b>${esc(s.grant.label)}</b><span class="pill ok">active</span></span><span class="mono">Ends ${esc(dayText(s.grant.expires_at_ms))}</span></div></div>
+          <div class="rules">${rules.map(([what, where]) => `<div><span class="yes">✓</span><span class="grow">${esc(what)}</span><span class="mono muted">${esc(where)}</span></div>`).join('')}</div>
+          <div class="pills">${caps.length ? caps.map((c) => `<span class="pill brass"><span class="dot"></span>${limitText(c)}</span>`).join('') : '<span class="pill soft">No limits that apply here</span>'}</div>
+          <div class="row between">
+            <details class="more"><summary>Details</summary><div class="small">${p.access(s.grant).join('; ')}</div></details>
+            <button class="danger small-btn" data-revoke="${esc(k)}">Revoke</button>
+          </div>
+        </li>`;
+        }).join('')
       : `<li class="muted">No agent can use ${esc(p.name)}.</li>`;
   }
 }
@@ -2219,8 +2328,10 @@ function explain(receiver: string, a: Described['external'][0]['actions'][0], ct
       ...g.near_venues.map((v: any) => `call ${esc(v.method)} on ${esc(v.receiver_id)}`),
     ];
     const pays = [...g.evm_recipients, ...g.near_recipients].map(esc);
-    return `<b>Give "${esc(g.label)}" a session key</b> (${esc(a.args.key_id)})
-      <ul>
+    return `${grantRequest(g, (ctx as any).app?.name ?? g.label, !!(ctx as any).app)}
+      <details class="more"><summary>Details</summary>
+      <p class="small"><b>Session key for "${esc(g.label)}"</b> (${esc(a.args.key_id)})</p>
+      <ul class="small">
         <li>Agent key <span class="mono">${esc(g.public_key.slice(0, 16))}…</span></li>
         <li>May ${venues.length ? venues.join('; ') : 'call nothing'}</li>
         <li>May pay ${pays.length ? pays.join(', ') : 'no one directly'}</li>
@@ -2231,7 +2342,7 @@ function explain(receiver: string, a: Described['external'][0]['actions'][0], ct
         <li>At most ${g.caps.length ? g.caps.map((c: any) => capWords(c.asset, c.daily)).join(', ') : 'nothing'} a day</li>
         <li>Until ${esc(new Date(g.expires_at_ms).toLocaleString())}, or after ${esc(Math.round(g.inactivity_ms / 86_400_000))} days unused</li>
         <li>${g.queue_new_targets ? '<span class="warn">May propose new recipients and contracts: each waits the delay, and you can cancel it</span>' : 'May not propose anything new'}</li>
-      </ul>`;
+      </ul></details>`;
   }
   if (receiver === cfg.signer && a.method === 'sign') {
     // The wallet asks the MPC network to sign for its EVM address. Show the
@@ -2361,15 +2472,36 @@ function confirm(msgJson: string, ctx: SignCtx & { pendingId?: number; app?: { n
   const calls = d.external.flatMap((p) =>
     p.actions.map(
       (a) => `<li>${explainSafe(p.receiver_id, a, ctx)}
-        <div class="small muted">${a.deposit_yocto && a.deposit_yocto !== '0' ? `Attaches ${formatNear(a.deposit_yocto)} NEAR · ` : ''}${a.gas_tgas ? `${a.gas_tgas} TGas` : ''}</div>
-        ${a.args === undefined ? '' : `<details><summary class="small">Exact arguments</summary><pre class="mono small">${esc(JSON.stringify(a.args, null, 2))}</pre></details>`}</li>`,
+        <details class="more"><summary>Technical details</summary>
+          <div class="small muted">${a.deposit_yocto && a.deposit_yocto !== '0' ? `Attaches ${formatNear(a.deposit_yocto)} NEAR · ` : ''}${a.gas_tgas ? `${a.gas_tgas} TGas` : ''}</div>
+          ${a.args === undefined ? '' : `<pre class="mono small">${esc(JSON.stringify(a.args, null, 2))}</pre>`}
+        </details></li>`,
     ),
   );
-  m.innerHTML = `
+  const lone = d.internal.length === 0 && d.external.length === 1 && d.external[0].actions.length === 1;
+  const isRequest = lone && d.external[0].receiver_id === cfg.extension && d.external[0].actions[0].method === 'grant_session';
+  // A request: one "Details" holding everything, the technical part included.
+  const reqCall = () => {
+    const a = d.external[0].actions[0];
+    const tech = `<p class="small muted">${a.deposit_yocto && a.deposit_yocto !== '0' ? `Attaches ${formatNear(a.deposit_yocto)} NEAR · ` : ''}${a.gas_tgas ? `${a.gas_tgas} TGas` : ''}</p><pre class="mono small">${esc(JSON.stringify(a.args, null, 2))}</pre>`;
+    const html = explainSafe(d.external[0].receiver_id, a, ctx);
+    return html.endsWith('</ul></details>') ? html.slice(0, -'</details>'.length) + tech + '</details>' : html;
+  };
+  m.innerHTML = isRequest
+    ? `
+    <div class="backdrop"><div class="card sheet request">
+      <ul class="list bare"><li>${reqCall()}</li></ul>
+      <div class="req-actions"><button class="primary big" id="yes">Approve with passkey</button><button class="ghost" id="no">Not now</button></div>
+      <p class="small muted center">Valid until ${esc(new Date(d.deadline).toLocaleTimeString())}. Decoded on this page from the exact message your passkey signs.</p>
+      <div id="status" class="status"></div>
+    </div></div>`
+    : `
     <div class="backdrop"><div class="card sheet">
-      <h2>Confirm</h2>
-      ${ctx.app ? `<p class="notice small">A request from <b>${esc(ctx.app.name)}</b>${ctx.app.url ? ` (${esc(ctx.app.url)})` : ''}. That name is the app's own claim: approve only if you started this.</p><p class="small">The agent's key lives inside Marvii's OutLayer module (TEE): checked on NEAR, it was made there, so not even the app's operator can read it.</p>` : ''}
-      <p class="small muted">Your account will:</p>
+      ${ctx.app
+        ? `<h2><b>${esc(ctx.app.name)}</b> wants access to your account</h2>
+           <p class="small muted">${ctx.app.url ? `${esc(ctx.app.url)} · ` : ''}The name is the app's own claim: approve only if you started this.</p>
+           <p class="small tee">✓ Its key was made inside Marvii's TEE, checked on NEAR. No one, not even the app, can read it.</p>`
+        : `<h2>Confirm</h2><p class="small muted">Your account will:</p>`}
       <ul class="list">${[...ops, ...calls].join('') || '<li>Nothing</li>'}</ul>
       <p class="small muted">Valid until ${esc(new Date(d.deadline).toLocaleString())}. Decoded on this page from the exact message your passkey signs.</p>
       <div class="row end"><button class="secondary" id="no">Reject</button><button class="primary" id="yes">Approve with passkey</button></div>
