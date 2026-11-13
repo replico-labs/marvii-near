@@ -286,6 +286,9 @@ mod evm;
 mod legacy;
 mod cardano;
 mod hyperliquid;
+mod ton_cell;
+mod ton;
+mod stellar;
 pub use hyperliquid::*;
 pub use legacy::*;
 pub use cardano::*;
@@ -503,7 +506,7 @@ pub fn evm_send_tx(chain_id: u64, nonce: u64, max_priority_fee_per_gas: &str, ma
 pub fn chain_path(chain: &str) -> Result<String, String> {
     let (path, domain) = match chain {
         "bitcoin" | "litecoin" | "dogecoin" | "bitcoin-cash" | "zcash" | "tron" | "xrp" => (chain, 0),
-        "solana" | "cardano" => (chain, 1),
+        "solana" | "cardano" | "stellar" | "ton" => (chain, 1),
         _ => return Err(format!("unknown chain {chain}")),
     };
     Ok(serde_json::json!({ "path": path, "domain_id": domain }).to_string())
@@ -599,6 +602,8 @@ pub fn chain_address(chain: &str, derived_public_key: &str) -> Result<String, St
         }
         return Ok(match chain {
             "solana" => bs58::encode(&pk).into_string(),
+            "stellar" => stellar_strkey(&pk),
+            "ton" => ton::address(&pk.clone().try_into().unwrap())?,
             "cardano" => {
                 use blake2::{Blake2bVar, digest::{Update, VariableOutput}};
                 let mut h = Blake2bVar::new(28).unwrap();
@@ -614,6 +619,35 @@ pub fn chain_address(chain: &str, derived_public_key: &str) -> Result<String, St
         });
     }
     Err("unknown key type".into())
+}
+
+/// A Stellar G… address: base32(version 6<<3 || key || crc16-xmodem LE).
+fn stellar_strkey(pk: &[u8]) -> String {
+    let mut b = vec![6u8 << 3];
+    b.extend(pk);
+    let mut crc: u16 = 0;
+    for &x in &b {
+        crc ^= (x as u16) << 8;
+        for _ in 0..8 {
+            crc = if crc & 0x8000 != 0 { crc << 1 ^ 0x1021 } else { crc << 1 };
+        }
+    }
+    b.extend(crc.to_le_bytes());
+    const A: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let (mut out, mut buf, mut bits) = (String::new(), 0u32, 0u32);
+    for x in b {
+        buf = buf << 8 | x as u32;
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            out.push(A[((buf >> bits) & 31) as usize] as char);
+        }
+        buf &= (1 << bits) - 1;
+    }
+    if bits > 0 {
+        out.push(A[((buf << (5 - bits)) & 31) as usize] as char);
+    }
+    out
 }
 
 // ---- Solana: the owner sends SOL ----

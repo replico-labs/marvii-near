@@ -17,6 +17,9 @@ pub const SEL_AAVE_SUPPLY: [u8; 4] = [0x61, 0x7b, 0xa0, 0x37];
 pub const SEL_AAVE_WITHDRAW: [u8; 4] = [0x69, 0x32, 0x8d, 0xec];
 /// Aave V3 Pool `repay(address,uint256,uint256,address)`: onBehalfOf.
 pub const SEL_AAVE_REPAY: [u8; 4] = [0x57, 0x3a, 0xde, 0x81];
+/// Aave V3 Pool `borrow(address,uint256,uint256,uint16,address)`:
+/// onBehalfOf. The borrowed tokens go to the caller, the account itself.
+pub const SEL_AAVE_BORROW: [u8; 4] = [0xa4, 0x15, 0xbc, 0xad];
 /// Uniswap V3 SwapRouter02 `exactInputSingle((address,address,uint24,
 /// address,uint256,uint256,uint160))`: recipient.
 pub const SEL_UNI_EXACT_INPUT_SINGLE: [u8; 4] = [0x04, 0xe4, 0x5a, 0xaf];
@@ -34,6 +37,7 @@ pub fn beneficiary(data: &[u8]) -> Result<Option<[u8; 20]>, &'static str> {
         SEL_AAVE_SUPPLY => (4, 2),
         SEL_AAVE_WITHDRAW => (3, 2),
         SEL_AAVE_REPAY => (4, 3),
+        SEL_AAVE_BORROW => (5, 4),
         SEL_UNI_EXACT_INPUT_SINGLE => (7, 3),
         _ => return Ok(None),
     };
@@ -45,6 +49,7 @@ pub fn beneficiary(data: &[u8]) -> Result<Option<[u8; 20]>, &'static str> {
         SEL_AAVE_SUPPLY => &[0, 2],
         SEL_AAVE_WITHDRAW => &[0, 2],
         SEL_AAVE_REPAY => &[0, 3],
+        SEL_AAVE_BORROW => &[0, 4],
         _ => &[0, 1, 3],
     };
     for w in addr_words {
@@ -158,7 +163,7 @@ pub fn decode(data: &[u8]) -> Result<Decoded, &'static str> {
     Ok(Decoded::Call { selector })
 }
 
-fn word_address(w: &[u8]) -> Result<[u8; 20], &'static str> {
+pub fn word_address(w: &[u8]) -> Result<[u8; 20], &'static str> {
     if w[..12].iter().any(|b| *b != 0) {
         return Err("address word has dirty high bytes");
     }
@@ -166,7 +171,7 @@ fn word_address(w: &[u8]) -> Result<[u8; 20], &'static str> {
 }
 
 /// Amounts above u128 are refused: no cap could cover them.
-fn word_u128(w: &[u8]) -> Result<u128, &'static str> {
+pub fn word_u128(w: &[u8]) -> Result<u128, &'static str> {
     if w[..16].iter().any(|b| *b != 0) {
         return Err("amount too large");
     }
@@ -228,4 +233,19 @@ mod tests {
         assert!(decode(&[1, 2]).is_err());
         assert_eq!(decode(&[]), Ok(Decoded::Native));
     }
+}
+
+/// For an Aave borrow: (asset, amount). Only the variable rate (mode 2).
+pub fn aave_borrow(data: &[u8]) -> Result<Option<([u8; 20], u128)>, &'static str> {
+    if data.len() != 4 + 32 * 5 || data[..4] != SEL_AAVE_BORROW {
+        return Ok(None);
+    }
+    let w = |i: usize| &data[4 + 32 * i..4 + 32 * (i + 1)];
+    if w(2)[..31].iter().any(|b| *b != 0) || w(2)[31] != 2 {
+        return Err("borrow at the variable rate only");
+    }
+    if w(1)[..16].iter().any(|b| *b != 0) {
+        return Err("amount too large");
+    }
+    Ok(Some((word_address(w(0))?, u128::from_be_bytes(w(1)[16..].try_into().unwrap()))))
 }

@@ -5,6 +5,18 @@
   "type": "module",
   "description": "A demo agent: holds a session key, asks the Marvii extension for EVM transactions, and broadcasts them once Chain Signatures has signed",
   "dependencies": {
-    "viem": "2.57.8"
+    "@evaafi/sdk": "^1.0.3",
+    "@kamino-finance/klend-sdk": "^13.0.3",
+    "@solana/spl-stake-pool": "^1.1.8",
+    "@solana/spl-token": "^0.4.14",
+    "@solana/web3.js": "^1.98.4",
+    "@stellar/stellar-sdk": "^13.3.0",
+    "@ton/core": "^0.63.1",
+    "@ton/crypto": "^3.3.0",
+    "@ton/ton": "^15.4.0",
+    "ripple-binary-codec": "^2.11.0",
+    "tronweb": "^6.5.1",
+    "viem": "2.57.8",
+    "xrpl": "^4.7.0"
   }
 }

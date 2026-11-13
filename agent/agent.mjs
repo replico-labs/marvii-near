@@ -52,6 +52,10 @@ const abi = parseAbi([
   'function approve(address spender, uint256 amount) returns (bool)',
   'function transfer(address to, uint256 amount) returns (bool)',
   'function supply(address asset, uint256 amount, address onBehalfOf, uint16 referralCode)',
+  'function borrow(address asset, uint256 amount, uint256 interestRateMode, uint16 referralCode, address onBehalfOf)',
+  'function repay(address asset, uint256 amount, uint256 interestRateMode, address onBehalfOf) returns (uint256)',
+  'function balanceOf(address) view returns (uint256)',
+  'function getUserAccountData(address user) view returns (uint256 totalCollateralBase, uint256 totalDebtBase, uint256 availableBorrowsBase, uint256 currentLiquidationThreshold, uint256 ltv, uint256 healthFactor)',
 ]);
 
 const keyFile = () => path.join(KEYS, 'demo-agent.json');
@@ -317,6 +321,23 @@ if (cmd === 'keygen') {
   const from = await walletAddress(await relayer('/config'));
   console.log(`withdraw ${a1} USDC from Aave to ${from}`);
   await send(POOL, encodeFunctionData({ abi, functionName: 'withdraw', args: [USDC, usdc(a1), from] }));
+} else if (cmd === 'position') {
+  const from = await walletAddress(await relayer('/config'));
+  const [usdcBal, acct] = await Promise.all([
+    evm.readContract({ address: USDC, abi, functionName: 'balanceOf', args: [from] }),
+    evm.readContract({ address: POOL, abi, functionName: 'getUserAccountData', args: [from] }),
+  ]);
+  console.log(`${from}: ${Number(usdcBal) / 1e6} USDC; Aave collateral ${Number(acct[0]) / 1e8} USD, debt ${Number(acct[1]) / 1e8} USD, can borrow ${Number(acct[2]) / 1e8} USD`);
+} else if (cmd === 'borrow') {
+  const from = await walletAddress(await relayer('/config'));
+  console.log(`borrow ${a1} USDC from Aave (variable rate) for ${a2 ?? from}`);
+  await send(POOL, encodeFunctionData({ abi, functionName: 'borrow', args: [USDC, usdc(a1), 2n, 0, a2 ?? from] }));
+} else if (cmd === 'repay') {
+  const from = await walletAddress(await relayer('/config'));
+  console.log(`approve and repay ${a1} USDC of the account's Aave debt`);
+  if (await send(USDC, encodeFunctionData({ abi, functionName: 'approve', args: [POOL, usdc(a1)] }))) {
+    await send(POOL, encodeFunctionData({ abi, functionName: 'repay', args: [USDC, usdc(a1), 2n, from] }));
+  }
 } else if (cmd === 'pay') {
   const [chain, amount, to] = process.argv.slice(3);
   console.log(`pay ${amount} on ${chain} to ${to}`);

@@ -30,7 +30,7 @@ const fmt = (n: bigint, d: number, shown = 4) => {
 
 export function hasHistory(chain: string): boolean {
   const id = Number(chain);
-  return chain === 'near' || chain in ESPLORA || ['solana', 'tron', 'xrp'].includes(chain) || (!Number.isNaN(id) && id in BLOCKSCOUT);
+  return chain === 'near' || chain in ESPLORA || ['solana', 'tron', 'xrp', 'ton', 'stellar'].includes(chain) || (!Number.isNaN(id) && id in BLOCKSCOUT);
 }
 
 export async function history(chain: string, address: string, wallet: string): Promise<HistoryItem[]> {
@@ -95,6 +95,31 @@ export async function history(chain: string, address: string, wallet: string): P
       const label = t.TransactionType === 'Payment' ? `${out ? 'Sent' : 'Received'}${amt}` : (t.TransactionType ?? 'Transaction');
       const time = t.date !== undefined ? (t.date + 946_684_800) * 1000 : undefined;
       return { hash, time, label, link: `https://testnet.xrpl.org/transactions/${hash}`, ok: e.meta?.TransactionResult === 'tesSUCCESS' };
+    });
+  }
+  if (chain === 'stellar') {
+    const r = await fetch(`https://horizon-testnet.stellar.org/accounts/${address}/operations?order=desc&limit=15`, { signal: AbortSignal.timeout(10000) });
+    if (r.status === 404) return [];
+    const j = await r.json();
+    return (j._embedded?.records ?? []).map((o: any) => {
+      const amt = o.amount ?? o.starting_balance;
+      const code = o.asset_type === 'native' || o.type === 'create_account' ? 'XLM' : (o.asset_code ?? '');
+      const dir = o.to === address || o.account === address ? 'Received' : 'Sent';
+      const label = o.type === 'payment' || o.type === 'create_account' ? `${dir} ${Number(amt).toFixed(4)} ${code}` : o.type.replace(/_/g, ' ');
+      return { hash: o.transaction_hash, time: Date.parse(o.created_at), label, link: `https://stellar.expert/explorer/testnet/tx/${o.transaction_hash}`, ok: o.transaction_successful };
+    });
+  }
+  if (chain === 'ton') {
+    const r = await j(`https://testnet.toncenter.com/api/v3/transactions?account=${encodeURIComponent(address)}&limit=15&sort=desc`);
+    return (r.transactions ?? []).map((t: any) => {
+      const inVal = BigInt(t.in_msg?.value ?? 0);
+      const outs = (t.out_msgs ?? []) as any[];
+      const outVal = outs.reduce((a, m) => a + BigInt(m.value ?? 0), 0n);
+      const label = outs.length ? `Sent ${fmt(outVal, 9)} TON` : inVal > 0n ? `Received ${fmt(inVal, 9)} TON` : 'Transaction';
+      const ok = !t.description?.aborted && (t.description?.compute_ph?.success ?? true);
+      // TON Center gives the hash in base64; the explorer takes hex.
+      const hex = Array.from(atob(t.hash), (c) => c.charCodeAt(0).toString(16).padStart(2, '0')).join('');
+      return { hash: hex, time: t.now * 1000, label, link: `https://testnet.tonviewer.com/transaction/${hex}`, ok };
     });
   }
   return [];

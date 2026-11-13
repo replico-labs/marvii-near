@@ -6,15 +6,19 @@
 //! hash itself. Each of these digests commits to the amounts of the coins
 //! being spent, so an agent that misstates an input gets a signature the
 //! chain rejects: the totals the extension counts are the real ones, fee
-//! included. Dogecoin's legacy digest doesn't commit to amounts, so it isn't
-//! offered to agents.
+//! included. Dogecoin's legacy digest doesn't commit to amounts, so for
+//! Dogecoin the agent also sends each input's previous transaction: the
+//! extension checks it hashes to the input's txid and reads the coin's real
+//! amount and script from it (as hardware wallets do).
 //!
 //! Must match `near/core` (the page's and agent's transaction assembly):
 //! the same versions, sequences and lock time.
 
 use near_sdk::env;
 
-pub const CHAINS: [&str; 4] = ["bitcoin", "litecoin", "bitcoin-cash", "zcash"];
+pub const CHAINS: [&str; 5] = ["bitcoin", "litecoin", "bitcoin-cash", "zcash", "dogecoin"];
+/// The largest previous transaction accepted (Dogecoin inputs).
+pub const MAX_PREV_TX: usize = 20_000;
 pub const MAX_INPUTS: usize = 2;
 pub const MAX_OUTPUTS: usize = 3;
 
@@ -40,7 +44,7 @@ pub struct Output {
 pub fn self_script_ok(chain: &str, s: &[u8]) -> bool {
     match chain {
         "bitcoin" | "litecoin" => s.len() == 22 && s[0] == 0x00 && s[1] == 0x14,
-        "bitcoin-cash" | "zcash" => s.len() == 25 && s[..3] == [0x76, 0xa9, 0x14] && s[23..] == [0x88, 0xac],
+        "bitcoin-cash" | "zcash" | "dogecoin" => s.len() == 25 && s[..3] == [0x76, 0xa9, 0x14] && s[23..] == [0x88, 0xac],
         _ => false,
     }
 }
@@ -52,6 +56,59 @@ pub fn recipient_script_ok(chain: &str, s: &[u8]) -> bool {
     let p2sh = s.len() == 23 && s[..2] == [0xa9, 0x14] && s[22] == 0x87;
     let segwit = s.len() >= 4 && s.len() <= 42 && (s[0] == 0 || (0x51..=0x60).contains(&s[0])) && s[1] as usize == s.len() - 2;
     p2pkh || p2sh || (matches!(chain, "bitcoin" | "litecoin") && segwit)
+}
+
+/// The amount and script of output `vout` of a previous (non-SegWit)
+/// transaction, after checking it hashes to `txid` (display order).
+pub fn prev_output(prev: &[u8], txid: &[u8; 32], vout: u32) -> Result<(u64, Vec<u8>), &'static str> {
+    if prev.len() > MAX_PREV_TX {
+        return Err("previous transaction too large");
+    }
+    let mut h = sha256d(prev);
+    h.reverse();
+    if &h != txid {
+        return Err("previous transaction doesn't match the input's txid");
+    }
+    let bad = "can't read the previous transaction";
+    let mut at = 4usize;
+    let take = |at: &mut usize, n: usize| -> Result<&[u8], &'static str> {
+        let v = prev.get(*at..*at + n).ok_or(bad)?;
+        *at += n;
+        Ok(v)
+    };
+    let var = |at: &mut usize| -> Result<usize, &'static str> {
+        let b = take(at, 1)?[0];
+        Ok(match b {
+            0xfd => u16::from_le_bytes(take(at, 2)?.try_into().unwrap()) as usize,
+            0xfe => u32::from_le_bytes(take(at, 4)?.try_into().unwrap()) as usize,
+            0xff => return Err(bad),
+            n => n as usize,
+        })
+    };
+    let ins = var(&mut at)?;
+    if ins == 0 {
+        return Err(bad); // a SegWit marker; Dogecoin has none
+    }
+    for _ in 0..ins {
+        take(&mut at, 36)?;
+        let n = var(&mut at)?;
+        take(&mut at, n + 4)?;
+    }
+    let outs = var(&mut at)?;
+    let mut found = None;
+    for k in 0..outs {
+        let value = u64::from_le_bytes(take(&mut at, 8)?.try_into().unwrap());
+        let n = var(&mut at)?;
+        let script = take(&mut at, n)?.to_vec();
+        if k as u32 == vout {
+            found = Some((value, script));
+        }
+    }
+    take(&mut at, 4)?;
+    if at != prev.len() {
+        return Err(bad);
+    }
+    found.ok_or("no such output")
 }
 
 fn sha256d(b: &[u8]) -> [u8; 32] {
@@ -117,6 +174,31 @@ pub fn sighashes(chain: &str, self_script: &[u8], inputs: &[Input], outputs: &[O
                     pre.extend(0u32.to_le_bytes());
                     pre.extend(hash_type.to_le_bytes());
                     sha256d(&pre)
+                })
+                .collect()
+        }
+        "dogecoin" => {
+            // The original digest: version 1, this input's scriptSig set to
+            // the spent script, the others empty, SIGHASH_ALL. As near/core.
+            (0..inputs.len())
+                .map(|n| {
+                    let mut t = 1u32.to_le_bytes().to_vec();
+                    varint(&mut t, inputs.len());
+                    for (j, i) in inputs.iter().enumerate() {
+                        outpoint(&mut t, i);
+                        if j == n {
+                            varint(&mut t, self_script.len());
+                            t.extend(self_script);
+                        } else {
+                            t.push(0);
+                        }
+                        t.extend(SEQ_FINAL.to_le_bytes());
+                    }
+                    varint(&mut t, outputs.len());
+                    t.extend(&outs);
+                    t.extend(0u32.to_le_bytes());
+                    t.extend(1u32.to_le_bytes());
+                    sha256d(&t)
                 })
                 .collect()
         }

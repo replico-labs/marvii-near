@@ -93,6 +93,7 @@ async fn main() -> Result<()> {
         Some("e2e") => e2e().await,
         Some("outlayer-upload") => outlayer_upload(args.get(2).context("module wasm")?).await,
         Some("outlayer-run") => outlayer_run(args.get(2).context("module wasm")?, args.get(3).context("input JSON")?).await.map(|v| println!("{v}")),
+        Some("reclaim") => reclaim(args.get(2).context("key file name, e.g. extension-a0d73493")?).await,
         Some("fund") => fund(args.get(2).context("account")?, args.get(3).context("NEAR amount")?).await,
         Some("demo-wallet") => demo_wallet(None, None, false).await,
         Some("demo-sign-solana") => {
@@ -341,6 +342,22 @@ async fn publish_wallet(path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Deletes an account we no longer use (an abandoned extension), sending
+/// its balance back to the deployer. Never the current `extension`.
+async fn reclaim(name: &str) -> Result<()> {
+    if name == "extension" || name == "deployer" {
+        bail!("refusing to delete {name}");
+    }
+    let deployer = Key::load("deployer")?;
+    let k = Key::load(name)?;
+    let out = k.near()?.transaction(k.account_id.as_str()).delete_account(deployer.account_id.as_str()).send().wait_until::<Final>().await?;
+    println!("deleted {} (balance to the deployer): {}, tx {}", k.account_id, out.is_success(), out.transaction_hash());
+    if out.is_success() {
+        fs::rename(keys_dir()?.join(format!("{name}.json")), keys_dir()?.join(format!("deleted-{name}.json")))?;
+    }
+    Ok(())
+}
+
 async fn deploy_extension(path: &str) -> Result<()> {
     let wasm = fs::read(path)?;
     let deployer = Key::load("deployer")?;
@@ -558,9 +575,15 @@ async fn demo(grant_to: Option<String>, approve: Option<u64>, upgrade: bool, can
         // Payments: Bitcoin testnet4 and Zcash testnet, to one address each,
         // with change back to the account. Scripts from core.
         let mut utxo = vec![];
-        for (chain, to) in [("bitcoin", "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"), ("zcash", "tmYjAZFpvdDXTaJrq2WikAntitBNJJo9VSo")] {
+        // Dogecoin: a second address of the deployer's (its `dogecoin` path), as the listed recipient.
+        let doge_friend = {
+            let k: String = near.view(signer().as_str(), "derived_public_key").args(json!({ "path": "dogecoin", "predecessor": deployer.account_id, "domain_id": 0 })).await?;
+            marvii_near_core::chain_address("dogecoin", &k).map_err(|e| anyhow!(e))?
+        };
+        for (chain, to) in [("bitcoin", "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"), ("zcash", "tmYjAZFpvdDXTaJrq2WikAntitBNJJo9VSo"), ("dogecoin", doge_friend.as_str())] {
             let k: String = near.view(signer().as_str(), "derived_public_key").args(json!({ "path": chain, "predecessor": wallet_id, "domain_id": 0 })).await?;
             let own = marvii_near_core::chain_address(chain, &k).map_err(|e| anyhow!(e))?;
+            println!("  {chain}: account {own}, listed recipient {to}");
             utxo.push(json!({
                 "chain": chain,
                 "self_script": marvii_near_core::utxo_script(chain, &own).map_err(|e| anyhow!(e))?,
@@ -584,6 +607,8 @@ async fn demo(grant_to: Option<String>, approve: Option<u64>, upgrade: bool, can
                     { "chain_id": CHAIN_ID, "to": pool, "selector": "0x617ba037" },
                     { "chain_id": CHAIN_ID, "to": pool, "selector": "0x69328dec" },
                     { "chain_id": CHAIN_ID, "to": pool, "selector": "0x573ade81" },
+                    // Aave V3 borrow(address,uint256,uint256,uint16,address): 0xa415bcad (viem toFunctionSelector).
+                    { "chain_id": CHAIN_ID, "to": pool, "selector": "0xa415bcad" },
                     { "chain_id": CHAIN_ID, "to": "0x94cc0aac535ccdb3c01d6787d6413c739ae12bc4", "selector": "0x04e45aaf" }
                 ],
                 "evm_self": evm_self,
@@ -591,12 +616,63 @@ async fn demo(grant_to: Option<String>, approve: Option<u64>, upgrade: bool, can
                 "evm_recipients": [],
                 // Hyperliquid testnet: ETH perps (asset 4, from the testnet
                 // `meta`), at most 5x, up to 100 USD of orders a day.
-                "caps": [{ "asset": format!("evm:{CHAIN_ID}:{usdc}"), "daily": "50000000" }, { "asset": "hyperliquid:usd", "daily": "100000000" }, { "asset": "utxo:bitcoin", "daily": "100000" }, { "asset": "utxo:zcash", "daily": "2000000" }],
+                "caps": [{ "asset": format!("evm:{CHAIN_ID}:{usdc}"), "daily": "50000000" }, { "asset": "hyperliquid:usd", "daily": "100000000" }, { "asset": "utxo:bitcoin", "daily": "100000" }, { "asset": "utxo:zcash", "daily": "2000000" }, { "asset": "utxo:dogecoin", "daily": "50000000000" }, { "asset": format!("borrow:evm:{CHAIN_ID}:{usdc}"), "daily": "2000000" }],
                 "queue_new_targets": true,
                 "hl_markets": [{ "asset": 4, "max_leverage": 5 }],
                 "utxo": utxo
             }
         });
+        // MARVII_GRANT_EXTRA: a JSON file of more grant fields (Solana and
+        // other chains); its caps are added to the ones above, other fields
+        // replace them. `{sol_self}` in it becomes the account's Solana address.
+        let mut grant = grant;
+        if let Ok(p) = std::env::var("MARVII_GRANT_EXTRA") {
+            let mut text = fs::read_to_string(p)?;
+            if text.contains("{sol_self}") {
+                let k: String = near.view(signer().as_str(), "derived_public_key").args(json!({ "path": "solana", "predecessor": wallet_id, "domain_id": 1 })).await?;
+                text = text.replace("{sol_self}", &marvii_near_core::chain_address("solana", &k).map_err(|e| anyhow!(e))?);
+            }
+            for chain in ["tron"] {
+                let ph = format!("{{{chain}_self}}");
+                if text.contains(&ph) {
+                    let k: String = near.view(signer().as_str(), "derived_public_key").args(json!({ "path": chain, "predecessor": wallet_id, "domain_id": 0 })).await?;
+                    text = text.replace(&ph, &marvii_near_core::chain_address(chain, &k).map_err(|e| anyhow!(e))?);
+                }
+                // A second address of the deployer's on that chain, as a listed recipient.
+                let ph = format!("{{{chain}_friend}}");
+                if text.contains(&ph) {
+                    let k: String = near.view(signer().as_str(), "derived_public_key").args(json!({ "path": chain, "predecessor": deployer.account_id, "domain_id": 0 })).await?;
+                    text = text.replace(&ph, &marvii_near_core::chain_address(chain, &k).map_err(|e| anyhow!(e))?);
+                }
+            }
+            for chain in ["stellar", "ton"] {
+                let ph = format!("{{{chain}_self}}");
+                if text.contains(&ph) {
+                    let k: String = near.view(signer().as_str(), "derived_public_key").args(json!({ "path": chain, "predecessor": wallet_id, "domain_id": 1 })).await?;
+                    text = text.replace(&ph, &marvii_near_core::chain_address(chain, &k).map_err(|e| anyhow!(e))?);
+                }
+                let ph = format!("{{{chain}_friend}}");
+                if text.contains(&ph) {
+                    let k: String = near.view(signer().as_str(), "derived_public_key").args(json!({ "path": chain, "predecessor": deployer.account_id, "domain_id": 1 })).await?;
+                    text = text.replace(&ph, &marvii_near_core::chain_address(chain, &k).map_err(|e| anyhow!(e))?);
+                }
+            }
+            if text.contains("{xrp_self}") || text.contains("{xrp_pk}") {
+                let k: String = near.view(signer().as_str(), "derived_public_key").args(json!({ "path": "xrp", "predecessor": wallet_id, "domain_id": 0 })).await?;
+                let xy = bs58::decode(k.trim_start_matches("secp256k1:")).into_vec()?;
+                let mut pk = vec![if xy[63] & 1 == 0 { 2u8 } else { 3 }];
+                pk.extend(&xy[..32]);
+                text = text.replace("{xrp_self}", &marvii_near_core::chain_address("xrp", &k).map_err(|e| anyhow!(e))?).replace("{xrp_pk}", &hex::encode(pk));
+            }
+            let extra: Value = serde_json::from_str(&text)?;
+            for (k, v) in extra.as_object().context("extra grant must be an object")? {
+                if k == "caps" {
+                    grant["grant"]["caps"].as_array_mut().unwrap().extend(v.as_array().cloned().unwrap_or_default());
+                } else {
+                    grant["grant"][k] = v.clone();
+                }
+            }
+        }
         let req = NearPromise::new(ext.account_id.parse::<defuse_wallet::AccountId>()?).function_call(
             FunctionCall::name("grant_session").args_json(grant).attach_deposit(NearToken::from_millinear(10)).gas(Gas::from_tgas(20)),
         );

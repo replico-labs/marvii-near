@@ -718,3 +718,64 @@ fn utxo_scripts_round_trip() {
     assert!(utxo_address("bitcoin", "6a0568656c6c6f").is_err());
     assert!(utxo_address("dogecoin", "76a914fc7250a211deddc70ee5a2738de5f07817351cef88ac").is_err());
 }
+
+#[test]
+fn stellar_address() {
+    // From @stellar/stellar-sdk: Keypair.fromRawEd25519Seed(32 × 0x01).
+    let pk = hex::decode("8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c").unwrap();
+    let k = format!("ed25519:{}", bs58::encode(pk).into_string());
+    assert_eq!(chain_address("stellar", &k).unwrap(), "GCFIRY65OQE7DFP5KLNS2PF2LVZMUZYJX4OZIEQ36N2IQANUB5XVYOJR");
+}
+
+#[test]
+fn ton_wallet_and_payment() {
+    use crate::ton;
+    use crate::ton_cell::{self, Cell};
+    // @ton/ton 15.4: WalletContractV4.create({ workchain: 0, publicKey: 0x01..0x20 }).
+    let pk: [u8; 32] = core::array::from_fn(|i| i as u8 + 1);
+    let k = format!("ed25519:{}", bs58::encode(pk).into_string());
+    let code = Cell::from_boc(&hex::decode(ton::V4R2_CODE).unwrap()).unwrap();
+    assert_eq!(hex::encode(code.hash()), "feb5ff6820e2ff0d9483e7e0d62c817d846789fb4ae580c878866d959dabd5c0");
+    assert_eq!(code.boc(), hex::decode(ton::V4R2_CODE).unwrap());
+    assert_eq!(chain_address("ton", &k).unwrap(), "0QDTfiC_IZ4yY-2KMRBEbypS2W_zbA4bCLu7G9_oAx6ammG5");
+    // 1.5 TON with comment "hello" to a bounceable address, valid until
+    // 1800000000, seqno 0; @ton/core with forceRef (body in a reference).
+    let t: serde_json::Value = serde_json::from_str(&ton::ton_transfer(&k, "kQDaY5yUatYnHei73HBqRX_Ox9LK2XnR7XuCY9MFC2INbfYI", "1500000000", 0, 1800000000, "hello").unwrap()).unwrap();
+    assert_eq!(t["signing_hash"], "9564416aef650bc0fb2cba03bbfcac62deec511396cd4ba29a3bf06793fdf183");
+    let d: serde_json::Value = serde_json::from_str(&ton::describe_ton(t["signing_boc"].as_str().unwrap()).unwrap()).unwrap();
+    assert_eq!(d["to"], "kQDaY5yUatYnHei73HBqRX_Ox9LK2XnR7XuCY9MFC2INbfYI");
+    assert_eq!(d["nanotons"], "1500000000");
+    assert_eq!(d["comment"], "hello");
+    let m = Cell::from_boc(&hex::decode(t["signing_boc"].as_str().unwrap()).unwrap()).unwrap();
+    assert_eq!(hex::encode(ton::external(&pk, &[7; 64], &m, true).unwrap().hash()), "079a4426cdbceb24291ee3c020967689507c677cc74d3858a969652b1e1c5f75");
+    assert_eq!(hex::encode(ton::external(&pk, &[7; 64], &m, false).unwrap().hash()), "577684cf125af1b5cb1a405596691cd376f373d1bbb48b5259dabcc4acfaf1ef");
+    // Addresses: both forms parse; a bad checksum doesn't.
+    let (a, b) = ton_cell::parse_address("kQDaY5yUatYnHei73HBqRX_Ox9LK2XnR7XuCY9MFC2INbfYI").unwrap();
+    assert!(b);
+    assert_eq!(ton_cell::friendly(&a, true, true), "kQDaY5yUatYnHei73HBqRX_Ox9LK2XnR7XuCY9MFC2INbfYI");
+    assert!(ton_cell::parse_address("kQDaY5yUatYnHei73HBqRX_Ox9LK2XnR7XuCY9MFC2INbfYJ").is_err());
+    // A different layout is refused by the describer.
+    assert!(ton::describe_ton(&hex::encode(Cell::new().uint(1, 8).done().unwrap().boc())).is_err());
+}
+
+#[test]
+fn stellar_owner_send() {
+    use crate::stellar;
+    // @stellar/stellar-sdk 13: source key 0x01..0x20, sequence 1234566 (so
+    // seq 1234567), fee 100, time bounds 0..1800000000, 2.5 XLM to
+    // GCFIRY65…: a payment with memo text "hello", and a create-account.
+    let pk: [u8; 32] = core::array::from_fn(|i| i as u8 + 1);
+    let k = format!("ed25519:{}", bs58::encode(pk).into_string());
+    let to = "GCFIRY65OQE7DFP5KLNS2PF2LVZMUZYJX4OZIEQ36N2IQANUB5XVYOJR";
+    let p: serde_json::Value = serde_json::from_str(&stellar::stellar_payment(&k, to, "25000000", false, 100, "1234567", 1800000000.0, "hello").unwrap()).unwrap();
+    assert_eq!(p["hash"], "279be905b96edab1c1f0e09b88d6dd1ebb605665cde715502985d1209d994e60");
+    let d: serde_json::Value = serde_json::from_str(&stellar::describe_stellar(p["tx_xdr"].as_str().unwrap()).unwrap()).unwrap();
+    assert_eq!((d["to"].as_str().unwrap(), d["stroops"].as_str().unwrap(), d["memo"].as_str().unwrap(), d["kind"].as_str().unwrap()), (to, "25000000", "hello", "stellar_payment"));
+    let c: serde_json::Value = serde_json::from_str(&stellar::stellar_payment(&k, to, "25000000", true, 100, "1234567", 1800000000.0, "").unwrap()).unwrap();
+    assert_eq!(c["hash"], "e6f806aa77a758d784110dcfb3b8307a40a0e7a6f4ebd92b884e6fa30af785fc");
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&stellar::describe_stellar(c["tx_xdr"].as_str().unwrap()).unwrap()).unwrap()["kind"], "stellar_create_account");
+    // Refused: a new account under 1 XLM, a bad checksum, a long memo.
+    assert!(stellar::stellar_payment(&k, to, "5000000", true, 100, "1", 1.0, "").is_err());
+    assert!(stellar::stellar_payment(&k, "GCFIRY65OQE7DFP5KLNS2PF2LVZMUZYJX4OZIEQ36N2IQANUB5XVYOJS", "1", false, 100, "1", 1.0, "").is_err());
+    assert!(stellar::stellar_payment(&k, to, "1", false, 100, "1", 1.0, "this memo is far too long to fit").is_err());
+}

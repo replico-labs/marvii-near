@@ -4,6 +4,11 @@
 use crate::evm::{self, Decoded, Eip1559};
 use crate::hl;
 use crate::utxo;
+use crate::sol;
+use crate::xrpl;
+use crate::stellar;
+use crate::tron;
+use crate::ton;
 use near_sdk::{AccountId, NearToken, json_types::U128, near};
 
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
@@ -44,6 +49,117 @@ pub struct UtxoGrant {
     pub chain: String,
     pub self_script: String,
     pub recipients: Vec<String>,
+}
+
+/// A Solana venue: a program with a decoder in `sol.rs`, and the pool or
+/// market (`scope`) the agent may use there, base58.
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SolVenue {
+    pub program: String,
+    pub scope: String,
+}
+
+/// What the agent may do on Solana. Caps use `sol` (lamports, wrapped SOL
+/// included, fees counted) and `spl:<mint>`.
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SolGrant {
+    /// The account's Solana address (Chain Signatures, path `solana`), as
+    /// the passkey saw it.
+    pub self_address: String,
+    pub venues: Vec<SolVenue>,
+    /// Addresses SOL and token payments may go to.
+    pub recipients: Vec<String>,
+}
+
+/// What the agent may do on the XRP Ledger. Caps use `xrp` (drops, fees
+/// counted) and `xrpl:<currency>.<issuer>` (millionths of a unit).
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct XrplGrant {
+    /// The account's classic address and its key (Chain Signatures, path
+    /// `xrp`, compressed, hex), as the passkey saw them.
+    pub self_address: String,
+    pub public_key: String,
+    /// Issued currencies it may hold and trade, as `<currency>.<issuer>`.
+    /// XRP is always allowed.
+    pub assets: Vec<String>,
+    pub recipients: Vec<String>,
+    /// The ledger's order book.
+    pub dex: bool,
+    /// AMM deposits and withdrawals.
+    pub amm: bool,
+    /// Minting and trading NFTs.
+    pub nft: bool,
+}
+
+/// What the agent may do on Stellar. Caps use `xlm` and
+/// `stellar:<code>:<issuer>`, in stroops (fees counted in `xlm`).
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StellarGrant {
+    /// The account's G… address (Chain Signatures, path `stellar`).
+    pub self_address: String,
+    /// Issued assets it may hold and trade, as `<code>:<issuer>`. XLM is
+    /// always allowed.
+    pub assets: Vec<String>,
+    pub recipients: Vec<String>,
+    pub dex: bool,
+    pub amm: bool,
+    /// Blend pools (C… contracts) it may supply to, borrow from, repay and
+    /// withdraw from. Caps: `xlm` or `soroban:<token>` for what the pool
+    /// pulls, `borrow:stellar:<token>` for borrows.
+    #[serde(default)]
+    pub blend: Vec<String>,
+}
+
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TronVenue {
+    /// T… contract address.
+    pub contract: String,
+    /// 0x-prefixed 4-byte selector.
+    pub selector: String,
+}
+
+/// What the agent may do on TRON. Caps use `trx` (sun; call values and
+/// energy fee limits counted), `trc20:<contract>` and `borrow:tron:<jToken>`.
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TronGrant {
+    /// The account's T… address (Chain Signatures, path `tron`).
+    pub self_address: String,
+    pub venues: Vec<TronVenue>,
+    pub recipients: Vec<String>,
+    /// TRC-721 contracts whose NFTs it may move or approve a marketplace for.
+    #[serde(default)]
+    pub nfts: Vec<String>,
+}
+
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TonJetton {
+    /// The jetton's master contract.
+    pub master: String,
+    /// The account's own jetton wallet for it (the master's
+    /// get_wallet_address for the account), approved with the passkey.
+    pub wallet: String,
+}
+
+/// What the agent may do on TON. Caps use `ton` (nanotons; gas attached to
+/// calls counted), `jetton:<master>` and `borrow:ton:<EVAA asset id>`.
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TonGrant {
+    /// The account's wallet address (v4r2, the MPC key on path `ton`).
+    pub self_address: String,
+    pub recipients: Vec<String>,
+    #[serde(default)]
+    pub jettons: Vec<TonJetton>,
+    /// EVAA lending masters it may supply to and withdraw (borrow) from.
+    #[serde(default)]
+    pub evaa: Vec<String>,
 }
 
 /// The cap asset for Hyperliquid orders: their value, price × size, in
@@ -96,6 +212,17 @@ pub struct Grant {
     /// Payment-only chains the agent may pay on.
     #[serde(default)]
     pub utxo: Vec<UtxoGrant>,
+    /// Solana, if the agent may act there.
+    #[serde(default)]
+    pub sol: Option<SolGrant>,
+    #[serde(default)]
+    pub xrpl: Option<XrplGrant>,
+    #[serde(default)]
+    pub stellar: Option<StellarGrant>,
+    #[serde(default)]
+    pub tron: Option<TronGrant>,
+    #[serde(default)]
+    pub ton: Option<TonGrant>,
 }
 
 #[near(serializers = [borsh, json])]
@@ -169,6 +296,52 @@ pub enum Action {
         #[serde(default)]
         expiry_height: u32,
     },
+    /// A Solana transaction: its instructions, a recent blockhash, and the
+    /// bumps of the associated token accounts it uses.
+    /// An XRP Ledger transaction from typed fields.
+    XrplTx { tx: xrpl::XrplTx },
+    /// A Stellar transaction from typed operations.
+    StellarTx { tx: stellar::StellarTx },
+    /// A TRON transaction from typed fields.
+    TronTx { tx: tron::TronTx },
+    /// A TON wallet message from typed messages.
+    TonTx { tx: ton::TonTx },
+    SolTx {
+        recent_blockhash: String,
+        instructions: Vec<SolIx>,
+        #[serde(default)]
+        atas: Vec<SolAta>,
+    },
+}
+
+#[near(serializers = [json])]
+#[derive(Clone, Debug)]
+pub struct SolIx {
+    pub program: String,
+    pub accounts: Vec<SolMeta>,
+    /// Instruction data, hex.
+    pub data: String,
+}
+
+#[near(serializers = [json])]
+#[derive(Clone, Debug)]
+pub struct SolMeta {
+    pub pubkey: String,
+    #[serde(default)]
+    pub signer: bool,
+    #[serde(default)]
+    pub writable: bool,
+}
+
+/// An associated token account the transaction uses: its owner, mint, token
+/// program and bump. The extension derives the address itself.
+#[near(serializers = [json])]
+#[derive(Clone, Debug)]
+pub struct SolAta {
+    pub owner: String,
+    pub mint: String,
+    pub token_program: String,
+    pub bump: u8,
 }
 
 #[near(serializers = [json])]
@@ -178,6 +351,9 @@ pub struct UtxoIn {
     pub txid: String,
     pub vout: u32,
     pub value: u64,
+    /// Dogecoin only: the whole previous transaction, hex.
+    #[serde(default)]
+    pub prev_tx: Option<String>,
 }
 
 #[near(serializers = [json])]
@@ -226,6 +402,8 @@ pub enum Kind {
     Evm { path: String, hash: [u8; 32] },
     /// One signature per input, on the chain's own path.
     Utxo { path: String, hashes: Vec<[u8; 32]> },
+    /// An ed25519 signature over the message, on the chain's own path.
+    Eddsa { path: String, message: Vec<u8> },
 }
 
 /// `Direct`: everything must be on the grant's lists. `Queued`: recipients
@@ -294,7 +472,7 @@ pub fn validate_grant(
     }
     for (i, u) in g.utxo.iter().enumerate() {
         if !utxo::CHAINS.contains(&u.chain.as_str()) {
-            return Err("agents can pay only on Bitcoin, Litecoin, Bitcoin Cash and Zcash");
+            return Err("agents can pay only on Bitcoin, Litecoin, Bitcoin Cash, Zcash and Dogecoin");
         }
         if g.utxo[..i].iter().any(|x| x.chain == u.chain) {
             return Err("a chain is listed twice");
@@ -313,6 +491,87 @@ pub fn validate_grant(
             }
         }
     }
+    let mut sol_items = 0;
+    if let Some(sg) = &g.sol {
+        sol::b58(&sg.self_address)?;
+        for v in &sg.venues {
+            if !(sol::STAKE_POOL_PROGRAMS.contains(&v.program.as_str()) || v.program == sol::KAMINO) {
+                return Err("no decoder for that Solana program");
+            }
+            sol::b58(&v.scope)?;
+        }
+        for r in &sg.recipients {
+            sol::b58(r)?;
+        }
+        sol_items = sg.venues.len() + sg.recipients.len();
+    }
+    let mut xrpl_items = 0;
+    if let Some(x) = &g.xrpl {
+        let id = xrpl::account_id(&x.self_address)?;
+        let pk = hex::decode(&x.public_key).map_err(|_| "XRPL key must be hex")?;
+        if pk.len() != 33 || !(pk[0] == 2 || pk[0] == 3) || xrpl::key_account(&pk) != id {
+            return Err("the XRPL key isn't the account's");
+        }
+        for a in &x.assets {
+            let (cur, iss) = a.split_once('.').ok_or("XRPL assets are <currency>.<issuer>")?;
+            xrpl::account_id(iss)?;
+            if cur.is_empty() || cur == "XRP" {
+                return Err("bad XRPL currency");
+            }
+        }
+        for r in &x.recipients {
+            xrpl::account_id(r)?;
+        }
+        xrpl_items = x.assets.len() + x.recipients.len();
+    }
+    let mut stellar_items = 0;
+    if let Some(x) = &g.stellar {
+        stellar::account(&x.self_address)?;
+        for a in &x.assets {
+            let (code, iss) = a.split_once(':').ok_or("Stellar assets are <code>:<issuer>")?;
+            stellar::account(iss)?;
+            if code.is_empty() || code.len() > 12 || code == "XLM" {
+                return Err("bad Stellar asset code");
+            }
+        }
+        for r in &x.recipients {
+            stellar::account(r)?;
+        }
+        for p in &x.blend {
+            stellar::contract(p)?;
+        }
+        stellar_items = x.assets.len() + x.recipients.len() + x.blend.len();
+    }
+    let mut tron_items = 0;
+    if let Some(t) = &g.tron {
+        tron::address(&t.self_address)?;
+        for v in &t.venues {
+            tron::address(&v.contract)?;
+            let sel = evm::parse_hex(&v.selector)?;
+            if sel.len() != 4 {
+                return Err("selector must be 4 bytes");
+            }
+            if sel == evm::SEL_TRANSFER || sel == evm::SEL_APPROVE {
+                return Err("transfer and approve can't be venues; use caps and recipients");
+            }
+        }
+        for r in t.recipients.iter().chain(&t.nfts) {
+            tron::address(r)?;
+        }
+        tron_items = t.venues.len() + t.recipients.len() + t.nfts.len();
+    }
+    let mut ton_items = 0;
+    if let Some(t) = &g.ton {
+        ton::address(&t.self_address)?;
+        for r in t.recipients.iter().chain(&t.evaa) {
+            ton::address(r)?;
+        }
+        for j in &t.jettons {
+            ton::address(&j.master)?;
+            ton::address(&j.wallet)?;
+        }
+        ton_items = t.recipients.len() + t.evaa.len() + t.jettons.len();
+    }
     for (i, m) in g.hl_markets.iter().enumerate() {
         if m.max_leverage == 0 || m.max_leverage > 50 {
             return Err("max leverage must be 1 to 50");
@@ -322,11 +581,12 @@ pub fn validate_grant(
         }
     }
     for c in &g.caps {
-        if c.asset != c.asset.to_lowercase() {
+        // Solana mints are base58, which is case-sensitive.
+        if !c.asset.starts_with("spl:") && !c.asset.starts_with("xrpl:") && !c.asset.starts_with("stellar:") && !c.asset.starts_with("trc20:") && !c.asset.starts_with("borrow:tron:") && !c.asset.starts_with("jetton:") && !c.asset.starts_with("soroban:") && !c.asset.starts_with("borrow:stellar:") && c.asset != c.asset.to_lowercase() {
             return Err("cap assets must be lowercase");
         }
     }
-    if g.near_venues.len() + g.evm_venues.len() + g.near_recipients.len() + g.evm_recipients.len() + g.caps.len() + g.hl_markets.len() + g.utxo.len() > 64 {
+    if g.near_venues.len() + g.evm_venues.len() + g.near_recipients.len() + g.evm_recipients.len() + g.caps.len() + g.hl_markets.len() + g.utxo.len() + sol_items + xrpl_items + stellar_items + tron_items + ton_items > 64 {
         return Err("grant too large");
     }
     Ok(())
@@ -453,6 +713,10 @@ pub fn check(
                             return Err("venue call sends the result to someone else");
                         }
                     }
+                    // Borrowing counts against its own cap: `borrow:evm:<chain>:<token>`.
+                    if let Some((asset, amount)) = evm::aave_borrow(&t.data)? {
+                        spends.push((format!("borrow:evm:{chain}:{}", evm::fmt_address(&asset)), amount));
+                    }
                 }
             }
             Plan { kind: Kind::Evm { path: EVM_PATH.to_string(), hash: t.signing_hash() }, spends }
@@ -472,6 +736,14 @@ pub fn check(
                 let txid: [u8; 32] = hex::decode(&i.txid).ok().and_then(|v| v.try_into().ok()).ok_or("txid must be 32 bytes hex")?;
                 if ins.iter().any(|x: &utxo::Input| x.txid == txid && x.vout == i.vout) {
                     return Err("an input is listed twice");
+                }
+                if chain == "dogecoin" {
+                    // The digest doesn't commit to amounts: read the real one.
+                    let prev = hex::decode(i.prev_tx.as_deref().ok_or("Dogecoin inputs need their previous transaction")?).map_err(|_| "previous transaction must be hex")?;
+                    let (value, script) = utxo::prev_output(&prev, &txid, i.vout)?;
+                    if value != i.value || script != own {
+                        return Err("input isn't the account's coin of that amount");
+                    }
                 }
                 total_in = total_in.checked_add(i.value).ok_or("overflow")?;
                 ins.push(utxo::Input { txid, vout: i.vout, value: i.value });
@@ -504,6 +776,31 @@ pub fn check(
             let spends = vec![(format!("utxo:{chain}"), (total_in - change) as u128)];
             let hashes = utxo::sighashes(chain, &own, &ins, &outs, *branch_id, *expiry_height);
             Plan { kind: Kind::Utxo { path: chain.clone(), hashes }, spends }
+        }
+        Action::XrplTx { tx } => {
+            let x = g.xrpl.as_ref().ok_or("XRP Ledger not allowed")?;
+            let (_, hash, spends) = xrpl::check(x, tx, queued)?;
+            Plan { kind: Kind::Evm { path: "xrp".into(), hash }, spends }
+        }
+        Action::TronTx { tx } => {
+            let t = g.tron.as_ref().ok_or("TRON not allowed")?;
+            let (_, id, spends) = tron::check(t, tx, queued)?;
+            Plan { kind: Kind::Evm { path: "tron".into(), hash: id }, spends }
+        }
+        Action::TonTx { tx } => {
+            let t = g.ton.as_ref().ok_or("TON not allowed")?;
+            let (_, hash, spends) = ton::check(t, tx, queued)?;
+            Plan { kind: Kind::Eddsa { path: "ton".into(), message: hash.to_vec() }, spends }
+        }
+        Action::StellarTx { tx } => {
+            let x = g.stellar.as_ref().ok_or("Stellar not allowed")?;
+            let (_, hash, spends) = stellar::check(x, tx, queued, stellar::TESTNET)?;
+            Plan { kind: Kind::Eddsa { path: "stellar".into(), message: hash.to_vec() }, spends }
+        }
+        Action::SolTx { recent_blockhash, instructions, atas } => {
+            let sg = g.sol.as_ref().ok_or("Solana not allowed")?;
+            let (message, spends) = sol_message(sg, recent_blockhash, instructions, atas, queued)?;
+            Plan { kind: Kind::Eddsa { path: "solana".into(), message }, spends }
         }
         Action::HlOrder { .. } | Action::HlCancel { .. } | Action::HlLeverage { .. } => {
             if queued {
@@ -561,4 +858,22 @@ pub fn hl_check(g: &Grant, action: &Action, now: u64) -> Result<(Vec<u8>, Vec<(S
 struct FtArgs {
     receiver_id: AccountId,
     amount: U128,
+}
+
+/// Checks a Solana transaction against the grant and compiles its message.
+pub fn sol_message(sg: &SolGrant, blockhash: &str, ixs: &[SolIx], atas: &[SolAta], queued: bool) -> Result<(Vec<u8>, Vec<(String, u128)>), &'static str> {
+    let me = sol::b58(&sg.self_address)?;
+    if atas.len() > 12 {
+        return Err("too many token accounts");
+    }
+    let mut own = sol::Own { me, atas: vec![] };
+    for a in atas {
+        let (o, m, tp) = (sol::b58(&a.owner)?, sol::b58(&a.mint)?, sol::b58(&a.token_program)?);
+        if a.token_program != sol::TOKEN && a.token_program != sol::TOKEN_2022 {
+            return Err("unknown token program");
+        }
+        own.atas.push((sol::ata(&o, &m, &tp, a.bump), o, m));
+    }
+    let ixs = sol::parse(ixs)?;
+    sol::check(sg, &own, &ixs, &sol::b58(blockhash)?, queued)
 }

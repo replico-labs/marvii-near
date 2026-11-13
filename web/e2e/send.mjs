@@ -34,6 +34,9 @@ await page.reload();
 const chain = process.env.CHAIN ?? '84532';
 await page.waitForSelector(`#chain-${chain} [data-send]`, { state: 'attached', timeout: 90_000 });
 await page.evaluate((c) => (location.hash = `#/chain-${c}`), chain);
+// The dashboard loads every chain before the page is usable.
+await page.waitForSelector(`#chain-${chain} [data-send]`, { state: 'visible', timeout: 90_000 });
+await page.waitForSelector('#busy', { state: 'detached', timeout: 90_000 });
 await page.click(`#chain-${chain} [data-send]`);
 if (await page.$('#send select[name=asset]')) {
   const opts = await page.$$eval('#send select[name=asset] option', (o) => o.map((x) => [x.value, x.textContent]));

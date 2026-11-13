@@ -96,6 +96,18 @@ export function describe_message(msg_json: string): string;
 export function describe_solana_message(message_hex: string): string;
 
 /**
+ * Decodes a send for Confirm by re-encoding it from its fields: only the
+ * exact layout stellar_payment builds is recognised.
+ */
+export function describe_stellar(tx_hex: string): string;
+
+/**
+ * Decodes a signing message for Confirm: only the exact one-payment layout
+ * ton_transfer builds is recognised, by rebuilding it from its fields.
+ */
+export function describe_ton(signing_boc_hex: string): string;
+
+/**
  * For Confirm: decodes a raw transaction, accepting only the exact
  * single-TRX-transfer layout built above.
  */
@@ -232,6 +244,33 @@ export function solana_signed_tx(message_hex: string, mpc_signature_json: string
 export function solana_transfer_message(from: string, to: string, lamports: string, recent_blockhash: string): string;
 
 /**
+ * An XLM send from the owner: the transaction XDR (hex) and its hash,
+ * which the MPC key signs. `create` when the recipient doesn't exist yet
+ * (at least 1 XLM, Stellar's minimum balance).
+ */
+export function stellar_payment(derived_public_key: string, to: string, stroops: string, create: boolean, fee: number, seq_num: string, max_time: number, memo: string): string;
+
+/**
+ * The signed envelope (base64, for Horizon's /transactions), after
+ * checking the MPC signature verifies for the account over the hash.
+ */
+export function stellar_signed_tx(tx_hex: string, mpc_signature_json: string, derived_public_key: string): string;
+
+/**
+ * The external message (BOC, base64, for sendBoc) carrying a signed
+ * signing message, after checking the MPC signature verifies for the
+ * account's key over its hash. `deploy` adds the state init (seqno 0).
+ */
+export function ton_signed_tx(signing_boc_hex: string, mpc_signature_json: string, derived_public_key: string, deploy: boolean): string;
+
+/**
+ * One TON payment from the owner: the signing message (BOC hex) and its
+ * hash, which the MPC key signs. Bounce follows the recipient's address
+ * form (EQ/kQ bounceable, UQ/0Q not), as wallets do.
+ */
+export function ton_transfer(derived_public_key: string, to: string, nanotons: string, seqno: number, valid_until: number, comment: string): string;
+
+/**
  * The owner sends NEAR: one transfer to `receiver` (any account, a name
  * included). Confirm shows it from the decoded message.
  */
@@ -308,6 +347,8 @@ export interface InitOutput {
     readonly describe_legacy_plan: (a: number, b: number) => [number, number, number, number];
     readonly describe_message: (a: number, b: number) => [number, number, number, number];
     readonly describe_solana_message: (a: number, b: number) => [number, number, number, number];
+    readonly describe_stellar: (a: number, b: number) => [number, number, number, number];
+    readonly describe_ton: (a: number, b: number) => [number, number, number, number];
     readonly describe_tron_raw: (a: number, b: number) => [number, number, number, number];
     readonly describe_xrp_tx: (a: number, b: number) => [number, number, number, number];
     readonly empty_message: (a: number, b: number, c: number, d: number, e: number, f: bigint) => [number, number, number, number];
@@ -329,6 +370,10 @@ export interface InitOutput {
     readonly request_hash: (a: number, b: number) => [number, number, number, number];
     readonly solana_signed_tx: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
     readonly solana_transfer_message: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => [number, number, number, number];
+    readonly stellar_payment: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number) => [number, number, number, number];
+    readonly stellar_signed_tx: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
+    readonly ton_signed_tx: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number, number];
+    readonly ton_transfer: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number) => [number, number, number, number];
     readonly transfer_message: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number, h: number, i: number, j: number) => [number, number, number, number];
     readonly tron_signed_tx: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
     readonly tron_transfer_raw: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: bigint, l: bigint) => [number, number, number, number];

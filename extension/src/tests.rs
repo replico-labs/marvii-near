@@ -60,6 +60,11 @@ fn grant() -> Grant {
         hl_markets: vec![rules::HlMarket { asset: 4, max_leverage: 5 }],
         evm_self: Some(SELF.into()),
         utxo: vec![],
+        sol: None,
+        xrpl: None,
+        stellar: None,
+        tron: None,
+        ton: None,
     }
 }
 
@@ -762,9 +767,9 @@ fn utxo_attacks_are_refused() {
     assert_eq!(plan_for(&c, pay("bitcoin", &[(BTC_FRIEND, 10_000_000)])).err(), Some("over the daily cap"));
     // More out than in.
     assert_eq!(plan_for(&c, pay("bitcoin", &[(BTC_FRIEND, 900_000_000)])).err(), Some("outputs exceed inputs"));
-    // A chain the grant doesn't list, and Dogecoin at all.
+    // A chain the grant doesn't list, and an unknown chain at all.
     let mut g = grant();
-    g.utxo = vec![UtxoGrant { chain: "dogecoin".into(), self_script: P2PKH_SELF.into(), recipients: vec![] }];
+    g.utxo = vec![UtxoGrant { chain: "monero".into(), self_script: P2PKH_SELF.into(), recipients: vec![] }];
     assert!(rules::validate_grant(&g, "k", NOW, &wallet(), &ext(), &signer()).is_err());
     let mut a = pay("bitcoin", &[(BTC_FRIEND, 1_000)]);
     a["chain"] = "dogecoin".into();
@@ -795,4 +800,616 @@ fn utxo_payment_executes_with_one_signature_per_input() {
     assert_eq!(c.spent_today(wallet(), "agent-1".into(), "utxo:bitcoin".into()), U128(700_000_418));
     // The next one goes over: 7.00000418 + 7.00000418 > 10.
     assert_eq!(plan_for(&c, pay("bitcoin", &[(BTC_FRIEND, 700_000_000), (BTC_SELF, 149_999_582)])).err(), Some("over the daily cap"));
+}
+
+mod solana {
+    use super::*;
+    use crate::rules::{SolGrant, SolVenue};
+    use crate::sol;
+
+    const ME: &str = "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM";
+    const FRIEND: &str = "7VHUFJHWu2CuExkJcJrzhQPJ2oygupTWkL2A2For4BmE";
+    const THIEF: &str = "3Kz9QnDWYB8kMHJUZB6YNp6Cbwjcm5JBEsJfpG5Q2Ns1";
+    const JITO_PROG: &str = "DPoo15wWDqpPJJtS2MUZ49aRxqz5ZaaJCJP4z8bLuib";
+    const JITO_POOL: &str = "JitoY5pcAxWX6iyP2QdFwTznGb8A99PRCUCVVxB46WZ";
+    const JITOSOL: &str = "J1tos8mqbhdGcF3pgj4PCKyVjzWSURcpLZU7pPGHxSYi";
+    const FAKE_POOL: &str = "4qQeZ5LwSz6HuupUu8jCtgXyW1mYQcNbFAW1sWZp89HL";
+    const ANY: &str = "SysvarC1ock11111111111111111111111111111111";
+    const BH: &str = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG";
+
+    fn sol_grant() -> Grant {
+        let mut g = grant();
+        g.sol = Some(SolGrant {
+            self_address: ME.into(),
+            venues: vec![SolVenue { program: JITO_PROG.into(), scope: JITO_POOL.into() }],
+            recipients: vec![FRIEND.into()],
+        });
+        g.caps.push(Cap { asset: "sol".into(), daily: U128(2_000_000_000) });
+        g.caps.push(Cap { asset: format!("spl:{JITOSOL}"), daily: U128(1_000_000_000) });
+        g
+    }
+
+    fn setup_sol() -> Extension {
+        ctx(owner(), NearToken::ZERO, NOW);
+        let mut c = Extension::new(owner(), signer(), DELAY);
+        ctx(wallet(), GRANT_DEPOSIT, NOW);
+        c.grant_session("agent-1".into(), sol_grant());
+        c
+    }
+
+    fn ata_of(owner: &str, mint: &str, bump: u8) -> String {
+        sol::fmt(&sol::ata(&sol::b58(owner).unwrap(), &sol::b58(mint).unwrap(), &sol::b58(sol::TOKEN).unwrap(), bump))
+    }
+
+    fn m(k: &str, signer: bool, writable: bool) -> serde_json::Value {
+        serde_json::json!({ "pubkey": k, "signer": signer, "writable": writable })
+    }
+
+    /// Jito DepositSol: lamports in, JitoSOL to `dest`, referral fee to `referral`.
+    fn deposit(pool: &str, dest: &str, referral: &str, lamports: u64) -> serde_json::Value {
+        let mut data = vec![14u8];
+        data.extend(lamports.to_le_bytes());
+        serde_json::json!({ "program": JITO_PROG, "data": hex::encode(data), "accounts": [
+            m(pool, false, true), m(ANY, false, false), m(ANY, false, true), m(ME, true, true),
+            m(dest, false, true), m(ANY, false, true), m(referral, false, true), m(JITOSOL, false, true),
+            m(sol::SYSTEM, false, false), m(sol::TOKEN, false, false)
+        ]})
+    }
+
+    fn tx(ixs: Vec<serde_json::Value>, atas: Vec<serde_json::Value>) -> serde_json::Value {
+        serde_json::json!({ "type": "sol_tx", "recent_blockhash": BH, "instructions": ixs, "atas": atas })
+    }
+    fn hint(owner: &str, bump: u8) -> serde_json::Value {
+        serde_json::json!({ "owner": owner, "mint": JITOSOL, "token_program": sol::TOKEN, "bump": bump })
+    }
+
+    fn run(action: serde_json::Value) -> Result<(), &'static str> {
+        let c = setup_sol();
+        try_action(&c, action, NOW + 1000)
+    }
+
+    #[test]
+    fn ata_matches_spl() {
+        // From @solana/spl-token's getAssociatedTokenAddressSync (bump 254).
+        assert_eq!(ata_of(ME, JITOSOL, 254), "AJKRBfFSWpGzpaZLqHir69WwcxPk9urB8JhSayCELPzs");
+    }
+
+    #[test]
+    fn jito_stake_to_own_account() {
+        let own = ata_of(ME, JITOSOL, 254);
+        assert_eq!(run(tx(vec![deposit(JITO_POOL, &own, &own, 100_000_000)], vec![hint(ME, 254)])), Ok(()));
+    }
+
+    #[test]
+    fn jito_stake_output_to_someone_else_refused() {
+        let theirs = ata_of(THIEF, JITOSOL, 255);
+        assert_eq!(
+            run(tx(vec![deposit(JITO_POOL, &theirs, &theirs, 100_000_000)], vec![hint(THIEF, 255)])),
+            Err("venue call sends the result to someone else")
+        );
+    }
+
+    #[test]
+    fn jito_referral_to_someone_else_refused() {
+        let own = ata_of(ME, JITOSOL, 254);
+        let theirs = ata_of(THIEF, JITOSOL, 255);
+        assert_eq!(
+            run(tx(vec![deposit(JITO_POOL, &own, &theirs, 1)], vec![hint(ME, 254), hint(THIEF, 255)])),
+            Err("referral fee must go to the account")
+        );
+    }
+
+    #[test]
+    fn unlisted_pool_refused() {
+        let own = ata_of(ME, JITOSOL, 254);
+        assert_eq!(run(tx(vec![deposit(FAKE_POOL, &own, &own, 1)], vec![hint(ME, 254)])), Err("not an allowed venue"));
+    }
+
+    #[test]
+    fn over_sol_cap_refused() {
+        let own = ata_of(ME, JITOSOL, 254);
+        assert_eq!(run(tx(vec![deposit(JITO_POOL, &own, &own, 2_000_000_000)], vec![hint(ME, 254)])), Err("over the daily cap"));
+    }
+
+    fn transfer(to: &str, lamports: u64) -> serde_json::Value {
+        let mut data = vec![2u8, 0, 0, 0];
+        data.extend(lamports.to_le_bytes());
+        serde_json::json!({ "program": sol::SYSTEM, "data": hex::encode(data), "accounts": [m(ME, true, true), m(to, false, true)] })
+    }
+
+    #[test]
+    fn sol_payments_only_to_listed() {
+        assert_eq!(run(tx(vec![transfer(FRIEND, 1000)], vec![])), Ok(()));
+        assert_eq!(run(tx(vec![transfer(THIEF, 1000)], vec![])), Err("recipient not allowed"));
+    }
+
+    #[test]
+    fn unknown_program_refused() {
+        let ix = serde_json::json!({ "program": THIEF, "data": "00", "accounts": [m(ME, true, true)] });
+        assert_eq!(run(tx(vec![ix], vec![])), Err("no decoder for this Solana program"));
+    }
+
+    #[test]
+    fn another_signer_refused() {
+        let ix = serde_json::json!({ "program": sol::SYSTEM, "data": hex::encode([2u8,0,0,0,1,0,0,0,0,0,0,0]),
+            "accounts": [m(THIEF, true, true), m(FRIEND, false, true)] });
+        assert_eq!(run(tx(vec![ix], vec![])), Err("only the account may sign"));
+    }
+
+    #[test]
+    fn other_system_instructions_refused() {
+        // Assign (1): hand the account to another program.
+        let ix = serde_json::json!({ "program": sol::SYSTEM, "data": hex::encode([1u8,0,0,0]), "accounts": [m(ME, true, true)] });
+        assert_eq!(run(tx(vec![ix], vec![])), Err("only SOL transfers on the System program"));
+    }
+
+    #[test]
+    fn priority_fee_capped_and_counted() {
+        let price = |p: u64| { let mut d = vec![3u8]; d.extend(p.to_le_bytes()); serde_json::json!({ "program": sol::COMPUTE_BUDGET, "data": hex::encode(d), "accounts": [] }) };
+        assert_eq!(run(tx(vec![price(sol::MAX_CU_PRICE + 1), transfer(FRIEND, 1)], vec![])), Err("priority fee too high"));
+        assert_eq!(run(tx(vec![price(1000), transfer(FRIEND, 1)], vec![])), Ok(()));
+    }
+
+    #[test]
+    fn executes_through_eddsa() {
+        let mut c = setup_sol();
+        let own = ata_of(ME, JITOSOL, 254);
+        exec(&mut c, 1, tx(vec![deposit(JITO_POOL, &own, &own, 100_000_000)], vec![hint(ME, 254)]));
+        let s = c.get_session(wallet(), "agent-1".into()).unwrap();
+        assert_eq!(s.nonce, 1);
+        // 0.1 SOL plus the 5,000-lamport signature fee.
+        assert_eq!(s.spent_on("sol", NOW + 1000), 100_005_000);
+    }
+
+    #[test]
+    fn message_layout() {
+        let a: Action = serde_json::from_value(tx(vec![transfer(FRIEND, 7)], vec![])).unwrap();
+        let Action::SolTx { recent_blockhash, instructions, .. } = a else { unreachable!() };
+        let ixs = sol::parse(&instructions).unwrap();
+        let msg = sol::compile(&sol::b58(ME).unwrap(), &ixs, &sol::b58(&recent_blockhash).unwrap()).unwrap();
+        // header 1 signer, 0 read-only signed, 1 read-only unsigned; 3 keys.
+        assert_eq!(&msg[..4], &[1, 0, 1, 3]);
+        assert_eq!(&msg[4..36], &sol::b58(ME).unwrap());
+        assert_eq!(&msg[36..68], &sol::b58(FRIEND).unwrap());
+        assert_eq!(&msg[68..100], &[0u8; 32]);
+    }
+}
+
+mod xrp_ledger {
+    use super::*;
+    use crate::rules::XrplGrant;
+    use crate::xrpl::{self, XrplTx};
+
+    const ME: &str = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
+    const PK: &str = "0330E7FC9D56BB25D6893BA3F317AE5BCF33B3291BD63DB32654A313222F7FD020";
+    const ISS: &str = "rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe";
+
+    fn xg() -> XrplGrant {
+        XrplGrant {
+            self_address: ME.into(), public_key: PK.into(), assets: vec![format!("USD.{ISS}")],
+            recipients: vec![ISS.into()], dex: true, amm: true, nft: true,
+        }
+    }
+    fn tx(op: serde_json::Value) -> XrplTx {
+        serde_json::from_value(serde_json::json!({ "sequence": 7, "fee": "12", "last_ledger_sequence": 1000, "op": op })).unwrap()
+    }
+    fn usd(v: &str) -> serde_json::Value { serde_json::json!({ "currency": "USD", "issuer": ISS, "value": v }) }
+    fn xrp(drops: &str) -> serde_json::Value { serde_json::json!({ "currency": "XRP", "value": drops }) }
+    fn enc(op: serde_json::Value) -> String {
+        ctx(owner(), NearToken::ZERO, NOW);
+        hex::encode_upper(xrpl::check(&xg(), &tx(op), false).unwrap().0)
+    }
+
+    // Expected bytes from ripple-binary-codec 2's encodeForSigning (prefix removed).
+    #[test]
+    fn offer_matches_codec() {
+        assert_eq!(enc(serde_json::json!({ "kind": "offer_create", "taker_pays": usd("1.5"), "taker_gets": xrp("2000000"), "flags": 0x80000 })),
+            "12000722000800002400000007201B000003E864D485543DF729C0000000000000000000000000005553440000000000F667B0CA50CC7709A220B0561B85E53A48461FA86540000000001E848068400000000000000C73210330E7FC9D56BB25D6893BA3F317AE5BCF33B3291BD63DB32654A313222F7FD0208114B5F762798A53D543A014CAF8B297CFF8F2F937E8");
+    }
+    #[test]
+    fn trust_matches_codec() {
+        assert_eq!(enc(serde_json::json!({ "kind": "trust_set", "limit": usd("1000") })),
+            "12001422000200002400000007201B000003E863D5438D7EA4C680000000000000000000000000005553440000000000F667B0CA50CC7709A220B0561B85E53A48461FA868400000000000000C73210330E7FC9D56BB25D6893BA3F317AE5BCF33B3291BD63DB32654A313222F7FD0208114B5F762798A53D543A014CAF8B297CFF8F2F937E8");
+    }
+    #[test]
+    fn amm_matches_codec() {
+        assert_eq!(enc(serde_json::json!({ "kind": "amm_deposit", "asset": { "currency": "XRP" }, "asset2": { "currency": "USD", "issuer": ISS }, "amount": xrp("1000000"), "amount2": usd("0.25") })),
+            "12002422001000002400000007201B000003E86140000000000F424068400000000000000C6BD448E1BC9BF040000000000000000000000000005553440000000000F667B0CA50CC7709A220B0561B85E53A48461FA873210330E7FC9D56BB25D6893BA3F317AE5BCF33B3291BD63DB32654A313222F7FD0208114B5F762798A53D543A014CAF8B297CFF8F2F937E80318000000000000000000000000000000000000000004180000000000000000000000005553440000000000F667B0CA50CC7709A220B0561B85E53A48461FA8");
+        assert_eq!(enc(serde_json::json!({ "kind": "amm_withdraw_all", "asset": { "currency": "XRP" }, "asset2": { "currency": "USD", "issuer": ISS } })),
+            "12002522000200002400000007201B000003E868400000000000000C73210330E7FC9D56BB25D6893BA3F317AE5BCF33B3291BD63DB32654A313222F7FD0208114B5F762798A53D543A014CAF8B297CFF8F2F937E80318000000000000000000000000000000000000000004180000000000000000000000005553440000000000F667B0CA50CC7709A220B0561B85E53A48461FA8");
+    }
+    #[test]
+    fn nft_matches_codec() {
+        assert_eq!(enc(serde_json::json!({ "kind": "nft_mint", "taxon": 0, "uri": "697066733A2F2F62616679" })),
+            "12001922000000082400000007201B000003E8202A0000000068400000000000000C73210330E7FC9D56BB25D6893BA3F317AE5BCF33B3291BD63DB32654A313222F7FD020750B697066733A2F2F626166798114B5F762798A53D543A014CAF8B297CFF8F2F937E8");
+        assert_eq!(enc(serde_json::json!({ "kind": "nft_buy_offer", "nftoken_id": "000800006203F49C21D5D6E022CB16DE3538F248662FC73C00000099B00000A8", "owner": ISS, "amount": xrp("5000000") })),
+            "12001B22000000002400000007201B000003E85A000800006203F49C21D5D6E022CB16DE3538F248662FC73C00000099B00000A86140000000004C4B4068400000000000000C73210330E7FC9D56BB25D6893BA3F317AE5BCF33B3291BD63DB32654A313222F7FD0208114B5F762798A53D543A014CAF8B297CFF8F2F937E88214F667B0CA50CC7709A220B0561B85E53A48461FA8");
+    }
+    #[test]
+    fn nft_cancel_matches_codec() {
+        assert_eq!(enc(serde_json::json!({ "kind": "nft_cancel_offers", "offers": ["F7848C8B999C645C0ED49AAB5D75AF324A173AB087DC6D63DC0EE51555CA68EC"] })),
+            "12001C22000000002400000007201B000003E868400000000000000C73210330E7FC9D56BB25D6893BA3F317AE5BCF33B3291BD63DB32654A313222F7FD0208114B5F762798A53D543A014CAF8B297CFF8F2F937E8041320F7848C8B999C645C0ED49AAB5D75AF324A173AB087DC6D63DC0EE51555CA68EC");
+    }
+    #[test]
+    fn payment_matches_codec() {
+        assert_eq!(enc(serde_json::json!({ "kind": "payment", "destination": ISS, "amount": usd("12.3456"), "destination_tag": 42 })),
+            "120000220000000024000000072E0000002A201B000003E861D4C462D3664100000000000000000000000000005553440000000000F667B0CA50CC7709A220B0561B85E53A48461FA868400000000000000C73210330E7FC9D56BB25D6893BA3F317AE5BCF33B3291BD63DB32654A313222F7FD0208114B5F762798A53D543A014CAF8B297CFF8F2F937E88314F667B0CA50CC7709A220B0561B85E53A48461FA8");
+    }
+
+    fn check(op: serde_json::Value) -> Result<Vec<(String, u128)>, &'static str> {
+        ctx(owner(), NearToken::ZERO, NOW);
+        xrpl::check(&xg(), &tx(op), false).map(|r| r.2)
+    }
+
+    #[test]
+    fn refusals() {
+        let other = "rLHzPsX6oXkzU2qL12kHCH8G8cnZv1rBJh";
+        assert_eq!(check(serde_json::json!({ "kind": "payment", "destination": other, "amount": xrp("1") })), Err("recipient not allowed"));
+        let eur = serde_json::json!({ "currency": "EUR", "issuer": ISS, "value": "1" });
+        assert_eq!(check(serde_json::json!({ "kind": "offer_create", "taker_pays": eur, "taker_gets": xrp("1") })), Err("asset not allowed"));
+        // tfPartialPayment-style or unknown flags never pass.
+        assert_eq!(check(serde_json::json!({ "kind": "offer_create", "taker_pays": usd("1"), "taker_gets": xrp("1"), "flags": 0x1 })), Err("offer flag not allowed"));
+        assert_eq!(check(serde_json::json!({ "kind": "payment", "destination": ISS, "amount": usd("0.0000001") })), Err("more than 6 decimals"));
+    }
+
+    #[test]
+    fn spends_counted() {
+        // An offer spends what it gives, plus the fee.
+        assert_eq!(check(serde_json::json!({ "kind": "offer_create", "taker_pays": xrp("2000000"), "taker_gets": usd("1.5") })),
+            Ok(vec![("xrp".into(), 12), (format!("xrpl:USD.{ISS}"), 1_500_000)]));
+        assert_eq!(check(serde_json::json!({ "kind": "amm_withdraw_all", "asset": { "currency": "XRP" }, "asset2": { "currency": "USD", "issuer": ISS } })),
+            Ok(vec![("xrp".into(), 12)]));
+    }
+}
+
+mod stellar_ledger {
+    use super::*;
+    use crate::rules::StellarGrant;
+    use crate::stellar::{self, StellarTx};
+
+    const ME: &str = "GCFIRY65OQE7DFP5KLNS2PF2LVZMUZYJX4OZIEQ36N2IQANUB5XVYOJR";
+    const ISS: &str = "GCATS5YOVB6ROX2WUNKGNQ2MP3GMXDMKSG2O4N5CLX3A6W4PZGZZI55U";
+
+    fn sg() -> StellarGrant {
+        StellarGrant { self_address: ME.into(), assets: vec![format!("USD:{ISS}"), format!("MARVIITOKEN1:{ISS}")], blend: vec![], recipients: vec![ISS.into()], dex: true, amm: true }
+    }
+    fn usd() -> serde_json::Value { serde_json::json!({ "code": "USD", "issuer": ISS }) }
+    fn xlm() -> serde_json::Value { serde_json::json!({ "code": "XLM" }) }
+    fn tx(ops: serde_json::Value, fee: u32) -> StellarTx {
+        serde_json::from_value(serde_json::json!({ "seq_num": "42", "fee": fee, "max_time": "1800000000", "ops": ops })).unwrap()
+    }
+
+    /// The same eight operations built with @stellar/stellar-sdk 13: XDR and hash match.
+    #[test]
+    fn matches_sdk() {
+        ctx(owner(), NearToken::ZERO, NOW);
+        let ops = serde_json::json!([
+            { "kind": "payment", "destination": ISS, "asset": usd(), "amount": "15000000" },
+            { "kind": "change_trust", "asset": usd(), "limit": "10000000000" },
+            { "kind": "sell_offer", "selling": usd(), "buying": xlm(), "amount": "20000000", "price_n": 3, "price_d": 2 },
+            { "kind": "swap_send", "send_asset": xlm(), "send_amount": "100000000", "dest_asset": usd(), "dest_min": "5000000" },
+            { "kind": "pool_trust", "asset_a": xlm(), "asset_b": usd() },
+            { "kind": "pool_deposit", "asset_a": xlm(), "asset_b": usd(), "max_a": "100000000", "max_b": "50000000", "min_price": [1, 3], "max_price": [3, 1] },
+            { "kind": "pool_withdraw", "asset_a": xlm(), "asset_b": usd(), "amount": "10000000", "min_a": "0", "min_b": "0" },
+            { "kind": "payment", "destination": ISS, "asset": { "code": "MARVIITOKEN1", "issuer": ISS }, "amount": "1" }
+        ]);
+        let (xdr, hash, spends) = stellar::check(&sg(), &tx(ops, 800), false, stellar::TESTNET).unwrap();
+        assert_eq!(hex::encode(&xdr), "000000008a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c00000320000000000000002a000000010000000000000000000000006b49d20000000000000000080000000000000001000000008139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b3940000000155534400000000008139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b3940000000000e4e1c000000000000000060000000155534400000000008139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b39400000002540be40000000000000000030000000155534400000000008139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394000000000000000001312d0000000003000000020000000000000000000000000000000d000000000000000005f5e100000000008a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c0000000155534400000000008139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b39400000000004c4b400000000000000000000000060000000300000000000000000000000155534400000000008139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b3940000001e7fffffffffffffff0000000000000016274f2c9a53bb2448e00e66e073fd8a22659e552808960a87505305079520aaee0000000005f5e1000000000002faf080000000010000000300000003000000010000000000000017274f2c9a53bb2448e00e66e073fd8a22659e552808960a87505305079520aaee0000000000989680000000000000000000000000000000000000000000000001000000008139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394000000024d4152564949544f4b454e31000000008139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394000000000000000100000000");
+        assert_eq!(hex::encode(hash), "2652f16dd93cca3fc527bf49a7fe34d9f416817fa2a026885879b7ea749cff51");
+        assert_eq!(spends[0], ("xlm".to_string(), 800 + 100_000_000 + 100_000_000));
+    }
+
+    #[test]
+    fn refusals() {
+        ctx(owner(), NearToken::ZERO, NOW);
+        let stranger = "GBRPYHIL2CI3FNQ4BXLFMNDLFJUNPU2HY3ZMFSHONUCEOASW7QC7OX2H";
+        let pay = serde_json::json!([{ "kind": "payment", "destination": stranger, "asset": xlm(), "amount": "1" }]);
+        assert_eq!(stellar::check(&sg(), &tx(pay, 100), false, stellar::TESTNET).map(|_| ()), Err("recipient not allowed"));
+        let eur = serde_json::json!([{ "kind": "sell_offer", "selling": { "code": "EUR", "issuer": ISS }, "buying": xlm(), "amount": "1", "price_n": 1, "price_d": 1 }]);
+        assert_eq!(stellar::check(&sg(), &tx(eur, 100), false, stellar::TESTNET).map(|_| ()), Err("asset not allowed"));
+        let fee = serde_json::json!([{ "kind": "change_trust", "asset": usd(), "limit": "1" }]);
+        assert_eq!(stellar::check(&sg(), &tx(fee, stellar::MAX_FEE + 1), false, stellar::TESTNET).map(|_| ()), Err("fee outside 1 stroop to 0.01 XLM"));
+    }
+}
+
+mod aave_borrow {
+    use super::*;
+
+    fn borrow(asset: &str, amount: u128, mode: u128, on_behalf: &str) -> serde_json::Value {
+        evm(POOL, 0, format!("0xa415bcad{}{}{}{}{}", word_addr(asset), word_u(amount), word_u(mode), word_u(0), word_addr(on_behalf)))
+    }
+
+    fn with_borrow() -> Extension {
+        ctx(owner(), NearToken::ZERO, NOW);
+        let mut c = Extension::new(owner(), signer(), DELAY);
+        let mut g = grant();
+        g.evm_venues.push(EvmVenue { chain_id: BASE_SEPOLIA, to: POOL.into(), selector: "0xa415bcad".into() });
+        g.caps.push(Cap { asset: format!("borrow:evm:{BASE_SEPOLIA}:{USDC}"), daily: U128(10_000_000) });
+        ctx(wallet(), GRANT_DEPOSIT, NOW);
+        c.grant_session("agent-1".into(), g);
+        c
+    }
+
+    #[test]
+    fn borrow_for_itself_within_cap() {
+        let c = with_borrow();
+        assert_eq!(try_action(&c, borrow(USDC, 5_000_000, 2, SELF), NOW + 1000), Ok(()));
+        assert_eq!(try_action(&c, borrow(USDC, 20_000_000, 2, SELF), NOW + 1000), Err("over the daily cap"));
+    }
+
+    #[test]
+    fn borrow_for_someone_else_refused() {
+        let c = with_borrow();
+        assert_eq!(try_action(&c, borrow(USDC, 1, 2, STRANGER), NOW + 1000), Err("venue call sends the result to someone else"));
+    }
+
+    #[test]
+    fn stable_rate_refused() {
+        let c = with_borrow();
+        assert_eq!(try_action(&c, borrow(USDC, 1, 1, SELF), NOW + 1000), Err("borrow at the variable rate only"));
+    }
+}
+
+mod dogecoin {
+    use super::*;
+    use crate::utxo;
+
+    /// A legacy transaction with one input and two outputs, the second to `script`.
+    fn prev_tx(script: &str, value: u64) -> Vec<u8> {
+        let mut t = 1u32.to_le_bytes().to_vec();
+        t.push(1);
+        t.extend([7u8; 32]);
+        t.extend(0u32.to_le_bytes());
+        t.push(0);
+        t.extend(0xffff_ffffu32.to_le_bytes());
+        t.push(2);
+        let other = hex::decode("76a914000000000000000000000000000000000000000088ac").unwrap();
+        t.extend(5u64.to_le_bytes());
+        t.push(other.len() as u8);
+        t.extend(other);
+        let s = hex::decode(script).unwrap();
+        t.extend(value.to_le_bytes());
+        t.push(s.len() as u8);
+        t.extend(s);
+        t.extend(0u32.to_le_bytes());
+        t
+    }
+    fn txid(t: &[u8]) -> [u8; 32] {
+        let mut h: [u8; 32] = Sha256::digest(Sha256::digest(t)).into();
+        h.reverse();
+        h
+    }
+
+    #[test]
+    fn reads_the_real_amount() {
+        ctx(owner(), NearToken::ZERO, NOW);
+        let t = prev_tx(P2PKH_SELF, 123_456);
+        assert_eq!(utxo::prev_output(&t, &txid(&t), 1).unwrap(), (123_456, hex::decode(P2PKH_SELF).unwrap()));
+        // A different transaction than the txid names.
+        let mut wrong = t.clone();
+        wrong[5] ^= 1;
+        assert_eq!(utxo::prev_output(&wrong, &txid(&t), 1).err(), Some("previous transaction doesn't match the input's txid"));
+        assert_eq!(utxo::prev_output(&t, &txid(&t), 9).err(), Some("no such output"));
+    }
+
+    #[test]
+    fn understated_input_refused() {
+        ctx(owner(), NearToken::ZERO, NOW);
+        let mut c = Extension::new(owner(), signer(), DELAY);
+        let mut g = grant();
+        g.utxo = vec![UtxoGrant { chain: "dogecoin".into(), self_script: P2PKH_SELF.into(), recipients: vec![] }];
+        g.caps.push(Cap { asset: "utxo:dogecoin".into(), daily: U128(100_000_000_000) });
+        g.queue_new_targets = true;
+        ctx(wallet(), GRANT_DEPOSIT, NOW);
+        c.grant_session("agent-1".into(), g);
+        let t = prev_tx(P2PKH_SELF, 50_000_000_000);
+        let id = hex::encode(txid(&t));
+        let action = |value: u64, prev: Option<String>| serde_json::json!({ "type": "utxo_pay", "chain": "dogecoin",
+            "inputs": [{ "txid": id, "vout": 1, "value": value, "prev_tx": prev }],
+            "outputs": [{ "script": P2PKH_SELF, "value": 1_000_000_000 }] });
+        // The real amount: fine (all change, so only the fee leaves).
+        assert_eq!(try_action(&c, action(50_000_000_000, Some(hex::encode(&t))), NOW + 1000), Ok(()));
+        // Claiming the coin is smaller than it is, to hide a huge fee.
+        assert_eq!(try_action(&c, action(1_100_000_000, Some(hex::encode(&t))), NOW + 1000), Err("input isn't the account's coin of that amount"));
+        assert_eq!(try_action(&c, action(50_000_000_000, None), NOW + 1000), Err("Dogecoin inputs need their previous transaction"));
+    }
+}
+
+mod tron_chain {
+    use super::*;
+    use crate::rules::{TronGrant, TronVenue};
+    use crate::tron::{self, TronTx};
+
+    const ME: &str = "THqBvSMndYYoZzmXmA1obnfGMSPRJ9oqdR";
+    const JTRX: &str = "TKM7w4qFmkXQLEF2MgrQroBYpd5TY7i1pq";
+    const ROUTER: &str = "TYMjxCXfqLpMWW1QToP6hbcjpion7EE25p";
+    const WTRX: &str = "TYsbWxNnyTgsZaTFaue9hqpxkU3Fkco94a";
+    const FRIEND: &str = "TJUCStq3WqfKqZLuZje5v7z6Ua6iBry1P6";
+
+    fn tg() -> TronGrant {
+        TronGrant {
+            self_address: ME.into(),
+            venues: vec![
+                TronVenue { contract: JTRX.into(), selector: "0x1249c58b".into() },
+                TronVenue { contract: JTRX.into(), selector: "0xc5ebeaec".into() },
+                TronVenue { contract: ROUTER.into(), selector: "0x7ff36ab5".into() },
+            ],
+            recipients: vec![FRIEND.into()],
+            nfts: vec![],
+        }
+    }
+    fn tx(call: serde_json::Value) -> TronTx {
+        serde_json::from_value(serde_json::json!({ "ref_block_bytes": "baf4", "ref_block_hash": "4d5c23452999646b",
+            "expiration": "1794525327000", "timestamp": "1794525269886", "fee_limit": "100000000", "call": call })).unwrap()
+    }
+
+    /// The same call built by a Nile node (wallet/triggersmartcontract): identical raw_data and ID.
+    #[test]
+    fn matches_node() {
+        ctx(owner(), NearToken::ZERO, NOW);
+        let (raw, id, spends) = tron::check(&tg(), &tx(serde_json::json!({ "kind": "trigger", "contract": JTRX, "call_value": "1000000", "data": "0x1249c58b" })), false).unwrap();
+        assert_eq!(hex::encode(raw), "0a02baf422084d5c23452999646b4098ddad909d345a71081f126d0a31747970652e676f6f676c65617069732e636f6d2f70726f746f636f6c2e54726967676572536d617274436f6e747261637412380a1541563cc6fdde0981931f2eaea8fbb2e829d3244b6912154166de0d4dbe8ca9865423ceccacc699c682d4cc9418c0843d22041249c58b70fe9eaa909d34900180c2d72f");
+        assert_eq!(hex::encode(id), "aaa3215f07397ea29ec5f8e92a808da8c424dc32e64d40f8aedb6ad547b035e2");
+        // The supplied TRX plus the whole fee limit.
+        assert_eq!(spends, vec![("trx".to_string(), 101_000_000)]);
+    }
+
+    fn word(a: &str) -> String { format!("{:0>64}", hex::encode(&tron::address(a).unwrap()[1..])) }
+
+    #[test]
+    fn swap_output_must_come_back() {
+        ctx(owner(), NearToken::ZERO, NOW);
+        // swapExactETHForTokens(amountOutMin, path, to, deadline), path [WTRX, x].
+        let swap = |to: &str| format!("0x7ff36ab5{:064x}{:064x}{}{:064x}{:064x}{}{}", 1, 128, word(to), 9_999_999_999u64, 2, word(WTRX), word(JTRX));
+        let ok = tron::check(&tg(), &tx(serde_json::json!({ "kind": "trigger", "contract": ROUTER, "call_value": "5", "data": swap(ME) })), false);
+        assert!(ok.is_ok());
+        let bad = tron::check(&tg(), &tx(serde_json::json!({ "kind": "trigger", "contract": ROUTER, "call_value": "5", "data": swap(FRIEND) })), false);
+        assert_eq!(bad.map(|_| ()), Err("venue call sends the result to someone else"));
+    }
+
+    #[test]
+    fn borrow_counted_and_refusals() {
+        ctx(owner(), NearToken::ZERO, NOW);
+        let (_, _, s) = tron::check(&tg(), &tx(serde_json::json!({ "kind": "trigger", "contract": JTRX, "data": format!("0xc5ebeaec{:064x}", 7) })), false).unwrap();
+        assert!(s.contains(&(format!("borrow:tron:{JTRX}"), 7)));
+        let pay = |to: &str| tron::check(&tg(), &tx(serde_json::json!({ "kind": "transfer", "to": to, "amount": "1" })), false).map(|_| ());
+        assert_eq!(pay(FRIEND), Ok(()));
+        assert_eq!(pay(ROUTER), Err("recipient not allowed"));
+        // redeem isn't a listed venue.
+        let r = tron::check(&tg(), &tx(serde_json::json!({ "kind": "trigger", "contract": JTRX, "data": format!("0xdb006a75{:064x}", 1) })), false);
+        assert_eq!(r.map(|_| ()), Err("not an allowed venue"));
+    }
+}
+
+mod ton_chain {
+    use crate::rules::{TonGrant, TonJetton};
+    use crate::ton::{self, TonMsg, TonTx};
+    use crate::ton_cell::{self, Cell};
+    use near_sdk::json_types::{U128, U64};
+
+    // The demo account's wallet (v4r2 of its MPC key), EVAA's testnet
+    // classic master (@evaafi/sdk 1.0.3), its jUSDC test jetton.
+    const ME: &str = "0QATZwvqCTfh9MWmVH-mFtTAHPpXaSNf7GX2eCWczYkjUZTx";
+    const EVAA: &str = "kQBTmXNOP6TUEQ-v85mlefDnVUor6tX_ZYFvQnaoxkM7LFVl";
+    const JUSDC: &str = "kQDaY5yUatYnHei73HBqRX_Ox9LK2XnR7XuCY9MFC2INbfYI";
+    const FRIEND: &str = "kQBe4gtSQMxM5RpMYLr4ydNY72F8JkY-icZXG1NJcsju8XM7";
+    const JUSDC_ID: &str = "83d916c68510802104d1f75aa6ce30eb1e477aede0d380eee2188e0e56581fc6";
+
+    fn grant() -> TonGrant {
+        TonGrant {
+            self_address: ME.into(),
+            recipients: vec![FRIEND.into()],
+            // Any address stands in for the jetton wallet in these tests.
+            jettons: vec![TonJetton { master: JUSDC.into(), wallet: FRIEND.into() }],
+            evaa: vec![EVAA.into()],
+        }
+    }
+
+    #[test]
+    fn evaa_bodies_match_the_sdk() {
+        // Hashes from @evaafi/sdk 1.0.3 (supplies with includeUserCode and
+        // customPayloadRecipient = the account, as the masters require):
+        // supply 2 TON; supply 3 jUSDC (forward 0.25 TON); withdraw 1 jUSDC
+        // with a stand-in price cell; query id 7.
+        let me = ton::address(ME).unwrap();
+        let pool = ton::address(EVAA).unwrap();
+        assert_eq!(hex::encode(ton::evaa_supply(Some((7, 2_000_000_000)), &me).unwrap().hash()), "05f03108c4a7e1df94abc6d9f1a84049e874232105245b0d4f2aadf8b49a0263");
+        let j = ton::jetton_transfer(7, 3_000_000, &pool, &me, 250_000_000, Some(ton::evaa_supply(None, &me).unwrap())).unwrap();
+        assert_eq!(hex::encode(j.hash()), "88ed34bb0af4911961b85c240c6398e504e38f26c1a7991c856c8a29f34c42f3");
+        let prices = Cell::from_boc(&hex::decode("b5ee9c724101010100030000022a35c1830a").unwrap()).unwrap();
+        let id: [u8; 32] = hex::decode(JUSDC_ID).unwrap().try_into().unwrap();
+        assert_eq!(hex::encode(ton::evaa_withdraw(7, &id, 1_000_000, &me, Some(prices)).unwrap().hash()), "1cc34fde96a52e1a787b3d8b6352716b8f3730a19974a02d6d25dadfde56ec38");
+        // Without prices (EvaaMasterPyth, testnet): withdraw 0.3 TON.
+        let ton_id: [u8; 32] = hex::decode("1a4219fe5e60d63af2a3cc7dce6fec69b45c6b5718497a6148e7c232ac87bd8a").unwrap().try_into().unwrap();
+        assert_eq!(hex::encode(ton::evaa_withdraw(7, &ton_id, 300_000_000, &me, None).unwrap().hash()), "de671ed1f2091622b7ce040d20a330df0be6fda4344c6c2d646e0f3ede36def8");
+    }
+
+    fn tx(messages: Vec<TonMsg>) -> TonTx {
+        TonTx { seqno: 3, valid_until: 1_800_000_000, messages }
+    }
+
+    #[test]
+    fn ton_rules() {
+        let g = grant();
+        // A listed payment: counted against `ton`; the signing message is
+        // what core's wallet code builds (same layout, mode 3).
+        let (m, h, spends) = ton::check(&g, &tx(vec![TonMsg::Pay { to: FRIEND.into(), amount: U128(5), comment: Some("hi".into()) }]), false).unwrap();
+        assert_eq!(h, m.hash());
+        assert_eq!(spends, vec![("ton".to_string(), 5)]);
+        // Supplying TON counts the amount and the gas.
+        let (_, _, spends) = ton::check(&g, &tx(vec![TonMsg::EvaaSupply { master: EVAA.into(), asset: "ton".into(), amount: U128(2_000_000_000), ton: U64(250_000_000), forward_ton: U64(0) }]), false).unwrap();
+        assert_eq!(spends, vec![("ton".to_string(), 2_250_000_000)]);
+        // Withdrawing counts against the borrow cap.
+        let w = TonMsg::EvaaWithdraw { master: EVAA.into(), asset_id: JUSDC_ID.into(), amount: U64(1_000_000), prices: "b5ee9c724101010100030000022a35c1830a".into(), ton: U64(480_000_000) };
+        let (_, _, spends) = ton::check(&g, &tx(vec![w]), false).unwrap();
+        assert_eq!(spends[0], (format!("borrow:ton:{JUSDC_ID}"), 1_000_000));
+        // Jettons go only from the listed wallet, only to listed recipients.
+        let (m, _, spends) = ton::check(&g, &tx(vec![TonMsg::Jetton { jetton: JUSDC.into(), to: FRIEND.into(), amount: U128(9), ton: U64(50_000_000), forward_ton: U64(1) }]), false).unwrap();
+        assert_eq!(spends[0], (format!("jetton:{}", ton_cell::friendly(&ton::address(JUSDC).unwrap(), true, true)), 9));
+        assert_eq!(m.refs.len(), 1);
+
+        // Refused:
+        let refuse = |msgs: Vec<TonMsg>| ton::check(&g, &tx(msgs), false).unwrap_err();
+        assert_eq!(refuse(vec![TonMsg::Pay { to: EVAA.into(), amount: U128(5), comment: None }]), "recipient not allowed");
+        assert_eq!(refuse(vec![TonMsg::Pay { to: ME.into(), amount: U128(5), comment: None }]), "payment to itself");
+        assert_eq!(refuse(vec![TonMsg::Jetton { jetton: FRIEND.into(), to: FRIEND.into(), amount: U128(9), ton: U64(50_000_000), forward_ton: U64(0) }]), "jetton not allowed");
+        assert_eq!(refuse(vec![TonMsg::Jetton { jetton: JUSDC.into(), to: EVAA.into(), amount: U128(9), ton: U64(50_000_000), forward_ton: U64(0) }]), "recipient not allowed");
+        assert_eq!(refuse(vec![TonMsg::EvaaSupply { master: FRIEND.into(), asset: "ton".into(), amount: U128(1), ton: U64(1), forward_ton: U64(0) }]), "not an allowed lending pool");
+        assert_eq!(refuse(vec![TonMsg::Pay { to: FRIEND.into(), amount: U128(0), comment: None }]), "amount must be more than zero");
+        assert_eq!(refuse(vec![TonMsg::EvaaSupply { master: EVAA.into(), asset: "ton".into(), amount: U128(1), ton: U64(2_000_000_000), forward_ton: U64(0) }]), "gas must be 1 nanoton to 1 TON");
+        assert_eq!(refuse(vec![]), "1 to 4 messages");
+        let five = (0..5).map(|_| TonMsg::Pay { to: FRIEND.into(), amount: U128(1), comment: None }).collect();
+        assert_eq!(refuse(five), "1 to 4 messages");
+    }
+}
+
+mod blend {
+    use crate::rules::StellarGrant;
+    use crate::stellar::{self, StellarTx};
+
+    // The demo account; Blend's testnet pool and tokens
+    // (blend-capital/blend-utils testnet.contracts.json: TestnetV2, XLM, USDC).
+    const ME: &str = "GDKKV36ZUBM4EOZL7DOYLKG7CNVKCYYI6XTYAHQY5LDRH6EOUQ4EMAPE";
+    const POOL: &str = "CCEBVDYM32YNYCVNRXQKDFFPISJJCV557CDZEIRBEE4NCV4KHPQ44HGF";
+    const XLM: &str = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
+    const USDC: &str = "CAQCFVLOBK5GIULPNZRGATJJMIZL5BSP7X5YJVMGCPTUEPFM4AVSRCJU";
+    const DATA: &str = "000000000000000000000000000f4240000007d000000bb8000000000007a120";
+
+    fn g() -> StellarGrant {
+        StellarGrant { self_address: ME.into(), assets: vec![], recipients: vec![], dex: false, amm: false, blend: vec![POOL.into()] }
+    }
+    fn tx(requests: serde_json::Value, data: Option<&str>, fee: u32) -> StellarTx {
+        serde_json::from_value(serde_json::json!({ "seq_num": "100", "fee": fee, "max_time": "1800000000",
+            "ops": [{ "kind": "blend_submit", "pool": POOL, "requests": requests }], "soroban_data": data })).unwrap()
+    }
+
+    #[test]
+    fn submit_matches_the_sdk() {
+        // @stellar/stellar-sdk 13: submit(me, me, me, [collateral 10 XLM,
+        // borrow 0.5 USDC]) with source-account auth over it and the pool's
+        // XLM transfer under it, fee 600000, resource fee 500000.
+        assert_eq!(stellar::contract_strkey(&stellar::xlm_contract(stellar::TESTNET)), XLM);
+        let t = tx(serde_json::json!([{ "kind": "supply_collateral", "asset": XLM, "amount": "100000000" }, { "kind": "borrow", "asset": USDC, "amount": "5000000" }]), Some(DATA), 600_000);
+        let (_, hash, spends) = stellar::check(&g(), &t, false, stellar::TESTNET).unwrap();
+        assert_eq!(hex::encode(hash), "fa8a102a2077b99999a61665259ea0230cc8afafc1586573b072f49ff0a72a84");
+        assert_eq!(spends, vec![("xlm".to_string(), 100_600_000), (format!("borrow:stellar:{USDC}"), 5_000_000)]);
+    }
+
+    #[test]
+    fn blend_rules() {
+        let one = |kind: &str| serde_json::json!([{ "kind": kind, "asset": XLM, "amount": "1" }]);
+        // Withdrawals pay the account: only the fee is spent.
+        let (_, _, spends) = stellar::check(&g(), &tx(one("withdraw_collateral"), Some(DATA), 600_000), false, stellar::TESTNET).unwrap();
+        assert_eq!(spends, vec![("xlm".to_string(), 600_000)]);
+        let err = |t: StellarTx| stellar::check(&g(), &t, false, stellar::TESTNET).unwrap_err();
+        let mut other = tx(one("supply"), Some(DATA), 600_000);
+        if let stellar::StellarOp::BlendSubmit { pool, .. } = &mut other.ops[0] {
+            *pool = USDC.into();
+        }
+        assert_eq!(err(other), "not an allowed lending pool");
+        assert_eq!(err(tx(one("liquidate"), Some(DATA), 600_000)), "unknown Blend request");
+        assert_eq!(err(tx(one("supply"), None, 600_000)), "a Soroban call needs its resources (soroban_data)");
+        assert_eq!(err(tx(one("supply"), Some(DATA), 400_000)), "the fee doesn't cover the resource fee");
+        assert_eq!(err(tx(one("supply"), Some(DATA), 30_000_000)), "fee outside 1 stroop to 2 XLM");
+    }
 }

@@ -22,6 +22,12 @@
 pub mod evm;
 mod hl;
 mod utxo;
+pub mod sol;
+pub mod xrpl;
+pub mod stellar;
+pub mod tron;
+pub mod ton;
+pub mod ton_cell;
 pub mod rules;
 
 use defuse_wallet::{
@@ -292,6 +298,47 @@ impl Extension {
         hex::encode(hl::signing_hash(&bytes, nonce))
     }
 
+    /// The Solana message a transaction compiles to, hex, so the agent can
+    /// attach the returned signature. Checks nothing about any session.
+    pub fn sol_message(&self, self_address: String, action: Action) -> String {
+        let Action::SolTx { recent_blockhash, instructions, atas } = action else { env::panic_str("not a Solana transaction") };
+        let sg = rules::SolGrant { self_address, venues: vec![], recipients: vec![] };
+        let me = sol::b58(&sg.self_address).unwrap_or_else(|e| env::panic_str(e));
+        let ixs = sol::parse(&instructions).unwrap_or_else(|e| env::panic_str(e));
+        let _ = atas;
+        hex::encode(sol::compile(&me, &ixs, &sol::b58(&recent_blockhash).unwrap_or_else(|e| env::panic_str(e))).unwrap_or_else(|e| env::panic_str(e)))
+    }
+
+    /// The unsigned XRPL transaction (hex) the session's grant builds for
+    /// `tx`, so the agent can attach the signature.
+    pub fn xrpl_unsigned(&self, wallet: AccountId, key_id: String, tx: xrpl::XrplTx) -> String {
+        let s = self.sessions.get(&(wallet, key_id)).unwrap_or_else(|| env::panic_str("unknown session"));
+        let x = s.grant.xrpl.as_ref().unwrap_or_else(|| env::panic_str("no XRPL grant"));
+        hex::encode(xrpl::check(x, &tx, true).unwrap_or_else(|e| env::panic_str(e)).0)
+    }
+
+    /// The unsigned Stellar transaction XDR (hex) the session's grant builds.
+    pub fn stellar_unsigned(&self, wallet: AccountId, key_id: String, tx: stellar::StellarTx) -> String {
+        let s = self.sessions.get(&(wallet, key_id)).unwrap_or_else(|| env::panic_str("unknown session"));
+        let x = s.grant.stellar.as_ref().unwrap_or_else(|| env::panic_str("no Stellar grant"));
+        hex::encode(stellar::check(x, &tx, true, stellar::TESTNET).unwrap_or_else(|e| env::panic_str(e)).0)
+    }
+
+    /// The TON wallet signing message (BOC hex) the session's grant builds;
+    /// the agent prepends the signature and wraps it in an external message.
+    pub fn ton_unsigned(&self, wallet: AccountId, key_id: String, tx: ton::TonTx) -> String {
+        let s = self.sessions.get(&(wallet, key_id)).unwrap_or_else(|| env::panic_str("unknown session"));
+        let t = s.grant.ton.as_ref().unwrap_or_else(|| env::panic_str("no TON grant"));
+        hex::encode(ton::check(t, &tx, true).unwrap_or_else(|e| env::panic_str(e)).0.boc())
+    }
+
+    /// The unsigned TRON raw_data (hex) the session's grant builds.
+    pub fn tron_unsigned(&self, wallet: AccountId, key_id: String, tx: tron::TronTx) -> String {
+        let s = self.sessions.get(&(wallet, key_id)).unwrap_or_else(|| env::panic_str("unknown session"));
+        let t = s.grant.tron.as_ref().unwrap_or_else(|| env::panic_str("no TRON grant"));
+        hex::encode(tron::check(t, &tx, true).unwrap_or_else(|e| env::panic_str(e)).0)
+    }
+
     pub fn spent_today(&self, wallet: AccountId, key_id: String, asset: String) -> U128 {
         let now = env::block_timestamp_ms();
         U128(self.sessions.get(&(wallet, key_id)).map(|s| s.spent_on(&asset, now)).unwrap_or(0))
@@ -357,6 +404,14 @@ impl Extension {
             );
         }
         let promise = match plan.kind {
+            rules::Kind::Eddsa { path, message } => NearPromise::new(self.signer.clone()).function_call(
+                FunctionCall::name("sign")
+                    .args_json(serde_json::json!({
+                        "request": { "path": path, "payload_v2": { "Eddsa": hex::encode(message) }, "domain_id": 1 }
+                    }))
+                    .attach_deposit(NearToken::from_yoctonear(1))
+                    .gas(SIGN_GAS),
+            ),
             rules::Kind::Near { receiver_id, method, args, deposit } => NearPromise::new(receiver_id)
                 .function_call(FunctionCall::name(method).args(args).attach_deposit(deposit).gas(CALL_GAS)),
             rules::Kind::Evm { path, hash } => sign(&path, hash),

@@ -63,6 +63,10 @@ const utxoBalance = async (chain: string, a: string) => {
   const c = j.chain_stats, m = j.mempool_stats;
   return BigInt(c.funded_txo_sum - c.spent_txo_sum + m.funded_txo_sum - m.spent_txo_sum);
 };
+// Stellar's public testnet Horizon (CORS open).
+const HORIZON = 'https://horizon-testnet.stellar.org';
+// TON Center's public testnet API (CORS open; about one request a second without a key).
+const TONCENTER = 'https://testnet.toncenter.com/api/v2';
 const relayerBalance = async (chain: string, a: string) => BigInt((await get(`${RELAYER}/chain/${chain}/balance/${encodeURIComponent(a)}`)).balance);
 const OTHER_CHAINS: OtherChain[] = [
   { id: 'bitcoin', name: 'Bitcoin', sym: 'BTC', decimals: 8, explorer: 'https://mempool.space/testnet4/address/', balance: (a) => utxoBalance('bitcoin', a) },
@@ -76,6 +80,15 @@ const OTHER_CHAINS: OtherChain[] = [
       if (r.error === 'actNotFound') return 0n;
       return BigInt(r.account_data.Balance);
     } },
+  { id: 'stellar', name: 'Stellar', sym: 'XLM', decimals: 7, explorer: 'https://stellar.expert/explorer/testnet/account/',
+    balance: async (a) => {
+      const r = await fetch(`${HORIZON}/accounts/${a}`, { signal: AbortSignal.timeout(8000) });
+      if (r.status === 404) return 0n; // not created yet: it needs 1 XLM sent to it
+      const native = (await r.json()).balances.find((b: any) => b.asset_type === 'native');
+      return BigInt(Math.round(Number(native?.balance ?? 0) * 1e7));
+    } },
+  { id: 'ton', name: 'TON', sym: 'TON', decimals: 9, explorer: 'https://testnet.tonviewer.com/',
+    balance: async (a) => BigInt((await get(`${TONCENTER}/getAddressBalance?address=${encodeURIComponent(a)}`)).result) },
   { id: 'cardano', name: 'Cardano', sym: 'ADA', decimals: 6, explorer: 'https://preprod.cardanoscan.io/address/',
     // Through the relayer: Koios's POST responses carry no CORS header.
     balance: (a) => relayerBalance('cardano', a) },
@@ -334,12 +347,12 @@ async function until<T>(check: () => Promise<T | null | undefined>, ms: number):
   return null;
 }
 /** Back to the wallet after an action; if that fails, reload the page. */
+/** Shows the wallet. dashboard() draws the page at once, then fills in
+ *  balances and the agent lists as they arrive: if those are slow (a rate-
+ *  limited RPC), stop waiting and let them land. Reloading here would start
+ *  over and could loop for as long as the RPC stays slow. */
 async function backToWallet() {
-  try {
-    await within(dashboard(), 30000);
-  } catch {
-    location.reload();
-  }
+  await within(dashboard(), 30000).catch(() => {});
 }
 
 async function main() {
@@ -685,6 +698,106 @@ function xrpSendForm() {
           const r = (await post(XRPL, { method: 'submit', params: [{ tx_blob: signed.tx_blob }] })).result;
           if (!['tesSUCCESS', 'terQUEUED'].includes(r.engine_result)) throw new Error(r.engine_result_message ?? r.error_message ?? r.engine_result ?? 'XRP refused the transaction');
           return `Sent. <a target="_blank" rel="noopener" href="https://testnet.xrpl.org/transactions/${esc(signed.hash)}">View transaction</a>`;
+        },
+      });
+    } catch (e) {
+      status(String((e as Error).message ?? e), 'error');
+    }
+  };
+}
+
+let ton = { address: '', balance: '0', key: '' };
+let stellar = { address: '', balance: '0', key: '' };
+
+/** Sends XLM. The transaction is built on this page (core); Horizon only
+ *  supplies the sequence number, whether the recipient exists (if not, the
+ *  send creates it) and the base fee (capped in core). */
+function stellarSendForm() {
+  const m = document.getElementById('modal')!;
+  m.innerHTML = `
+    <div class="backdrop"><form class="card sheet" id="send">
+      <h2>Send on Stellar</h2>
+      <p class="small muted">Balance ${esc(stellar.balance)} XLM</p>
+      <label>To <input name="to" required class="mono" placeholder="G…"></label>
+      <label>Amount (XLM) <input name="amount" required inputmode="decimal" placeholder="0.0"></label>
+      <label>Memo (optional) <input name="memo" maxlength="28" placeholder="Exchanges often need one"></label>
+      <div class="row end"><button type="button" class="secondary" id="cancel">Cancel</button><button class="primary">Review</button></div>
+      <div id="status" class="status"></div>
+    </form></div>`;
+  document.getElementById('cancel')!.onclick = () => (m.innerHTML = '');
+  (document.getElementById('send') as HTMLFormElement).onsubmit = async (ev) => {
+    ev.preventDefault();
+    try {
+      const f = new FormData(ev.target as HTMLFormElement);
+      const to = String(f.get('to')).trim();
+      const stroops = toUnits(String(f.get('amount')), 7);
+      const memo = String(f.get('memo') ?? '').trim();
+      status('Preparing…');
+      const [me, dest, fees] = await Promise.all([
+        fetch(`${HORIZON}/accounts/${stellar.address}`).then((r) => (r.ok ? r.json() : null)),
+        fetch(`${HORIZON}/accounts/${encodeURIComponent(to)}`).then((r) => r.status),
+        get(`${HORIZON}/fee_stats`),
+      ]);
+      if (!me) throw new Error('This Stellar account has no XLM yet');
+      const fee = Math.max(100, Number(fees.last_ledger_base_fee ?? 100));
+      // Ten minutes to approve and submit, then it expires.
+      const p = JSON.parse(core.stellar_payment(stellar.key, to, stroops, dest === 404, fee, (BigInt(me.sequence) + 1n).toString(), Math.floor(Date.now() / 1000) + 600, memo));
+      const msg = core.owner_eddsa_sign_message(cfg.chain_id, wallet, nonce32(), createdAt(), cfg.signer, 'stellar', p.hash);
+      confirm(msg, {
+        stellarTx: p.tx_xdr,
+        after: async (out) => {
+          if (!out.mpc_signature) throw new Error('No signature came back');
+          const env = core.stellar_signed_tx(p.tx_xdr, JSON.stringify(out.mpc_signature), stellar.key);
+          const r = await fetch(`${HORIZON}/transactions`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: `tx=${encodeURIComponent(env)}` });
+          const j = await r.json();
+          if (!r.ok) throw new Error(j.extras?.result_codes ? JSON.stringify(j.extras.result_codes) : (j.title ?? 'Stellar refused the transaction'));
+          return `Sent. <a target="_blank" rel="noopener" href="https://stellar.expert/explorer/testnet/tx/${esc(j.hash)}">View transaction</a>`;
+        },
+      });
+    } catch (e) {
+      status(String((e as Error).message ?? e), 'error');
+    }
+  };
+}
+
+/** Sends TON. The wallet message is built on this page (core); the node only
+ *  supplies the wallet's seqno and whether it is deployed yet. The first
+ *  send deploys the wallet (the address is its code and key's hash). */
+function tonSendForm() {
+  const m = document.getElementById('modal')!;
+  m.innerHTML = `
+    <div class="backdrop"><form class="card sheet" id="send">
+      <h2>Send on TON</h2>
+      <p class="small muted">Balance ${esc(ton.balance)} TON</p>
+      <label>To <input name="to" required class="mono" placeholder="UQ… or EQ…"></label>
+      <label>Amount (TON) <input name="amount" required inputmode="decimal" placeholder="0.0"></label>
+      <label>Comment (optional) <input name="comment" maxlength="120" placeholder="Exchanges often need one"></label>
+      <div class="row end"><button type="button" class="secondary" id="cancel">Cancel</button><button class="primary">Review</button></div>
+      <div id="status" class="status"></div>
+    </form></div>`;
+  document.getElementById('cancel')!.onclick = () => (m.innerHTML = '');
+  (document.getElementById('send') as HTMLFormElement).onsubmit = async (ev) => {
+    ev.preventDefault();
+    try {
+      const f = new FormData(ev.target as HTMLFormElement);
+      const to = String(f.get('to')).trim();
+      const nano = toUnits(String(f.get('amount')), 9);
+      const note = String(f.get('comment') ?? '').trim();
+      status('Preparing…');
+      const info = (await get(`${TONCENTER}/getWalletInformation?address=${encodeURIComponent(ton.address)}`)).result;
+      const deployed = info.account_state === 'active';
+      const seqno = deployed ? Number(info.seqno ?? 0) : 0;
+      // Ten minutes to approve and send, then the message expires.
+      const p = JSON.parse(core.ton_transfer(ton.key, to, nano, seqno, Math.floor(Date.now() / 1000) + 600, note));
+      const msg = core.owner_eddsa_sign_message(cfg.chain_id, wallet, nonce32(), createdAt(), cfg.signer, 'ton', p.signing_hash);
+      confirm(msg, {
+        tonBoc: p.signing_boc,
+        after: async (out) => {
+          if (!out.mpc_signature) throw new Error('No signature came back');
+          const boc = core.ton_signed_tx(p.signing_boc, JSON.stringify(out.mpc_signature), ton.key, !deployed);
+          const r = await post(`${TONCENTER}/sendBoc`, { boc });
+          if (!r.ok) throw new Error(r.error ?? 'TON refused the message');
+          return `Sent. It shows on the explorer in a few seconds. <a target="_blank" rel="noopener" href="https://testnet.tonviewer.com/${esc(ton.address)}">View account</a>`;
         },
       });
     } catch (e) {
@@ -1176,7 +1289,7 @@ async function dashboard() {
     const sb = (e.target as HTMLElement).closest<HTMLElement>('[data-send]');
     if (sb) {
       const k = sb.dataset.send!;
-      k === 'near' ? nearSendForm() : k === 'solana' ? solSendForm() : k === 'bitcoin' || k === 'litecoin' ? btcSendForm(k) : k === 'tron' ? tronSendForm() : k === 'xrp' ? xrpSendForm() : k === 'cardano' ? adaSendForm() : k in LEGACY_SEND ? legacySendForm(k) : sendForm(Number(k));
+      k === 'near' ? nearSendForm() : k === 'solana' ? solSendForm() : k === 'bitcoin' || k === 'litecoin' ? btcSendForm(k) : k === 'tron' ? tronSendForm() : k === 'xrp' ? xrpSendForm() : k === 'ton' ? tonSendForm() : k === 'stellar' ? stellarSendForm() : k === 'cardano' ? adaSendForm() : k in LEGACY_SEND ? legacySendForm(k) : sendForm(Number(k));
     }
   };
 
@@ -1192,9 +1305,11 @@ async function dashboard() {
         if (c.id in UTXO_SEND) utxoAccounts[c.id] = { address: addr, balance: bal };
         if (c.id === 'tron') tron = { address: addr, balance: bal };
         if (c.id === 'xrp') xrp = { address: addr, balance: bal, key: k };
+        if (c.id === 'ton') ton = { address: addr, balance: bal, key: k };
+        if (c.id === 'stellar') stellar = { address: addr, balance: bal, key: k };
         if (c.id in LEGACY_SEND) legacyAccounts[c.id] = { address: addr, balance: bal };
         if (c.id === 'cardano') ada = { address: addr, balance: bal, key: k };
-        const canSend = ['solana', 'bitcoin', 'litecoin', 'tron', 'xrp', 'cardano', ...Object.keys(LEGACY_SEND)].includes(c.id);
+        const canSend = ['solana', 'bitcoin', 'litecoin', 'tron', 'xrp', 'ton', 'stellar', 'cardano', ...Object.keys(LEGACY_SEND)].includes(c.id);
         fillChain(`chain-${c.id}`, addr, `${bal} ${c.sym}`, [], explorer, canSend ? c.id : undefined);
       })
       .catch(() => fillChain(`chain-${c.id}`, '', `– ${c.sym}`, []));
@@ -1488,7 +1603,7 @@ type Described = {
 
 /** Plain words for a call, worked out from the decoded arguments. */
 function explain(receiver: string, a: Described['external'][0]['actions'][0], ctx: SignCtx = {}): string {
-  const { tx, solMessage, btcPlan, tronRaw, xrpTx, legacyPlan, adaPlan, hlTransfer } = ctx;
+  const { tx, solMessage, btcPlan, tronRaw, xrpTx, tonBoc, stellarTx, legacyPlan, adaPlan, hlTransfer } = ctx;
   if (a.kind === 'transfer') return `<b>Approve:</b> Send <b>${formatNear(a.amount_yocto!)} NEAR</b> to ${receiver.length > 32 ? copyable(receiver) : copyableName(receiver)} on NEAR`;
   if (a.kind !== 'function_call') return `<span class="error">Unrecognised action: ${esc(JSON.stringify(a))}</span>`;
   const ours = receiver === cfg.extension;
@@ -1528,6 +1643,25 @@ function explain(receiver: string, a: Described['external'][0]['actions'][0], ct
       if (req.payload_v2?.Ecdsa !== d.signing_hash) throw new Error('The signature request does not match the transaction shown');
       const tag = d.destination_tag != null ? ` · destination tag ${esc(d.destination_tag)}` : '';
       return `<b>Approve:</b> Send <b>${esc(fmtUnits(BigInt(d.drops), 6))} XRP</b> to ${copyable(d.to)} on XRP<div class="small muted">Network fee ${esc(fmtUnits(BigInt(d.fee_drops), 6, 6))} XRP${tag}</div>`;
+    }
+    if (req?.path === 'stellar') {
+      // Stellar: the key signs the transaction hash; show the transaction,
+      // and only if the hash requested is its hash.
+      if (!stellarTx || req.domain_id !== 1) throw new Error('A Stellar signature request with no transaction to show');
+      const d = JSON.parse(core.describe_stellar(stellarTx));
+      if (req.payload_v2?.Eddsa !== d.hash) throw new Error('The signature request does not match the payment shown');
+      const memo = d.memo ? ` · memo "${esc(d.memo)}"` : '';
+      const create = d.kind === 'stellar_create_account' ? ' (a new account: this send creates it)' : '';
+      return `<b>Approve:</b> Send <b>${esc(fmtUnits(BigInt(d.stroops), 7))} XLM</b> to ${copyable(d.to)} on Stellar${create}<div class="small muted">Network fee ${esc(fmtUnits(BigInt(d.fee_stroops), 7, 7))} XLM${memo}</div>`;
+    }
+    if (req?.path === 'ton') {
+      // TON: the key signs the wallet message's hash; show the message, and
+      // only if the hash requested is its hash.
+      if (!tonBoc || req.domain_id !== 1) throw new Error('A TON signature request with no message to show');
+      const d = JSON.parse(core.describe_ton(tonBoc));
+      if (req.payload_v2?.Eddsa !== d.signing_hash) throw new Error('The signature request does not match the payment shown');
+      const note = d.comment ? ` · comment "${esc(d.comment)}"` : '';
+      return `<b>Approve:</b> Send <b>${esc(fmtUnits(BigInt(d.nanotons), 9))} TON</b> to ${copyable(d.to)} on TON<div class="small muted">Network fee paid from the balance${note}</div>`;
     }
     if (req?.path === 'bitcoin' || req?.path === 'litecoin') {
       // Bitcoin and Litecoin: each input needs its own signature. Confirm
@@ -1594,7 +1728,7 @@ function explain(receiver: string, a: Described['external'][0]['actions'][0], ct
 
 /** What a Confirm sheet decodes alongside the message: the transaction each
  *  signature request must match. */
-type SignCtx = { tx?: string; solMessage?: string; btcPlan?: string; tronRaw?: string; xrpTx?: string; legacyPlan?: string; adaPlan?: string; hlTransfer?: { amount: string; to_perp: boolean; nonce: number } };
+type SignCtx = { tx?: string; solMessage?: string; btcPlan?: string; tronRaw?: string; xrpTx?: string; tonBoc?: string; stellarTx?: string; legacyPlan?: string; adaPlan?: string; hlTransfer?: { amount: string; to_perp: boolean; nonce: number } };
 
 function confirm(msgJson: string, ctx: SignCtx & { pendingId?: number; after?: (out: Outcome & { mpc_signature?: unknown }) => Promise<string> } = {}) {
   const msg = core.normalize_request(msgJson);
