@@ -27,7 +27,7 @@ Testnet only (top-ups through NEAR Intents use real mainnet funds). The contract
 
 ## What happened on testnet
 
-These ran on NEAR testnet and each chain's testnet (8 to 13 November 2026), or, for protocols that exist only on mainnet (Jupiter, Phoenix, Polymarket), on a local fork of mainnet: Aave and Uniswap on Base Sepolia, Lido on Hoodi, Hyperliquid testnet, Bitcoin, Zcash and Cardano payments, sTRX on TRON, tsTON on TON, NearX on NEAR, Phoenix perps from an agent whose key is in a TEE, and the refusals for each. Jito, Kamino and Tensor have rules and unit tests but no recorded on-chain run yet. A summary table, transaction hashes and explorer links are in [TESTNET.md](TESTNET.md).
+These ran on NEAR testnet and each chain's testnet (8 to 13 November 2026), or, for protocols that exist only on mainnet (Jupiter, Phoenix, Polymarket), on a local fork of mainnet: Aave (supply, borrow, repay, withdraw), Uniswap and Seaport on Base Sepolia; Lido on Hoodi; Hyperliquid testnet; Jito, Kamino and Tensor on Solana devnet; Ref, Rhea Lending, NearX, rNEAR, Meta Pool and LiNEAR on NEAR; SunSwap, JustLend, sTRX and NFTs on TRON (Nile); EVAA and tsTON on TON; the order book, AMM and NFTs on the XRP Ledger; the order book, AMM and Blend on Stellar; Bitcoin, Zcash and Cardano payments; Phoenix perps from an agent whose key is in a TEE; and the refusals for each. A summary table, transaction hashes and explorer links are in [TESTNET.md](TESTNET.md).
 
 ## How it works
 
