@@ -28,6 +28,8 @@ pub mod stellar;
 pub mod tron;
 pub mod ton;
 pub mod ton_cell;
+pub mod seaport;
+pub mod intents;
 pub mod rules;
 
 use defuse_wallet::{
@@ -58,8 +60,11 @@ pub const MIN_QUEUE_DELAY_MS: u64 = 60 * 1000;
 pub const MAX_SESSIONS: usize = 32;
 /// Gas for the MPC signer's `sign` (it needs at least 15 TGas attached).
 pub const SIGN_GAS: Gas = Gas::from_tgas(30);
-/// Gas for a NEAR venue call.
-pub const CALL_GAS: Gas = Gas::from_tgas(60);
+/// Gas for a NEAR venue call: enough for a lending borrow with Pyth prices
+/// (Rhea's execute_with_pyth ran out at 60). The wallet gets 40 more to
+/// make it; the relayer attaches 300 in all.
+pub const CALL_GAS: Gas = Gas::from_tgas(200);
+const WALLET_CALL_GAS: Gas = Gas::from_tgas(240);
 
 /// The signed message an agent sends. The JSON text itself is what's
 /// signed: `ed25519(sha256(msg))`.
@@ -130,7 +135,12 @@ impl Extension {
     /// passkey signed (or another enabled extension) can make it call this.
     #[payable]
     pub fn grant_session(&mut self, key_id: String, grant: Grant) {
-        require!(env::attached_deposit() >= GRANT_DEPOSIT, "attach 0.01 NEAR for storage");
+        // 0.01 NEAR up to 2 KB of grant (what the page has always attached);
+        // a larger grant pays for all its bytes, so it isn't stored at the
+        // extension's expense.
+        let bytes = near_sdk::borsh::to_vec(&grant).map(|b| b.len()).unwrap_or(usize::MAX) as u128;
+        let need = if bytes <= 2048 { GRANT_DEPOSIT } else { env::storage_byte_cost().saturating_mul(bytes + 256) };
+        require!(env::attached_deposit() >= need, format!("attach {} yoctoNEAR for storage", need.as_yoctonear()));
         let wallet = env::predecessor_account_id();
         let now = env::block_timestamp_ms();
         if let Err(e) = rules::validate_grant(&grant, &key_id, now, &wallet, &env::current_account_id(), &self.signer) {
@@ -301,8 +311,8 @@ impl Extension {
     /// The Solana message a transaction compiles to, hex, so the agent can
     /// attach the returned signature. Checks nothing about any session.
     pub fn sol_message(&self, self_address: String, action: Action) -> String {
-        let Action::SolTx { recent_blockhash, instructions, atas } = action else { env::panic_str("not a Solana transaction") };
-        let sg = rules::SolGrant { self_address, venues: vec![], recipients: vec![] };
+        let Action::SolTx { recent_blockhash, instructions, atas, .. } = action else { env::panic_str("not a Solana transaction") };
+        let sg = rules::SolGrant { self_address, venues: vec![], recipients: vec![], nft_floor: near_sdk::json_types::U128(0) };
         let me = sol::b58(&sg.self_address).unwrap_or_else(|e| env::panic_str(e));
         let ixs = sol::parse(&instructions).unwrap_or_else(|e| env::panic_str(e));
         let _ = atas;
@@ -403,6 +413,7 @@ impl Extension {
                 Gas::from_tgas(100),
             );
         }
+        let is_call = matches!(plan.kind, rules::Kind::Near { .. });
         let promise = match plan.kind {
             rules::Kind::Eddsa { path, message } => NearPromise::new(self.signer.clone()).function_call(
                 FunctionCall::name("sign")
@@ -422,7 +433,7 @@ impl Extension {
             "w_execute_extension".to_string(),
             serde_json::to_vec(&serde_json::json!({ "request": request })).unwrap(),
             deposit,
-            Gas::from_tgas(100),
+            if is_call { WALLET_CALL_GAS } else { Gas::from_tgas(100) },
         )
     }
 }

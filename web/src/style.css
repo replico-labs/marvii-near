@@ -166,3 +166,11 @@ pre { white-space: pre-wrap; word-break: break-all; background: var(--mv-paper);
 .notice { margin: 0; padding: 12px 14px; border-radius: 12px; background: var(--mv-surface); border: 1px solid var(--mv-line); }
 
 .check { display: flex; align-items: center; gap: 10px; margin: 6px 0; }
+
+/* Long lists in the agents view, folded after the first few. */
+details.inline { display: inline; }
+details.inline summary { display: inline; cursor: pointer; color: var(--mv-iris); }
+details.inline[open] summary { display: block; margin-bottom: 4px; }
+.card pre { white-space: pre-wrap; word-break: break-word; background: var(--mv-paper); border: 1px solid var(--mv-line); padding: 10px; border-radius: 10px; }
+#connect-paste input { flex: 1; min-width: 0; }
+.session { overflow-wrap: anywhere; }

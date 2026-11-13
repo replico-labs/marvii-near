@@ -8,8 +8,9 @@
 //!
 //! The module never signs bytes it's handed. It builds the agent's message
 //! itself, in the extension's format (`marvii-session-v1`), from fields it has
-//! parsed and checked, and only for Hyperliquid actions. The extension on NEAR
-//! still checks every rule and cap; this only decides where the key lives.
+//! parsed and checked: an action of a type the extension knows (Hyperliquid
+//! fields checked here too), never raw bytes. The extension on NEAR still
+//! checks every rule and cap; this only decides where the key lives.
 //!
 //! Input (stdin, JSON):
 //!   {"operation": "public_key"}
@@ -43,14 +44,65 @@ mod host {
     wit_bindgen::generate!({ world: "signing-keys-host", path: "wit" });
 }
 
-/// The Hyperliquid actions this agent may ask for, in the extension's JSON
-/// shape (`rules::Action`). Unknown types and fields are refused.
+/// Hyperliquid actions, in the extension's JSON shape (`rules::Action`),
+/// checked field by field. Unknown fields are refused.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum Action {
+pub enum HlAction {
     HlOrder { asset: u32, is_buy: bool, price: String, size: String, reduce_only: bool, tif: String, nonce: u64 },
     HlCancel { asset: u32, oid: u64, nonce: u64 },
     HlLeverage { asset: u32, is_cross: bool, leverage: u32, nonce: u64 },
+}
+
+/// The extension's action types (`rules::Action`); any other is refused.
+const ACTION_TYPES: [&str; 11] = ["near_call", "evm_tx", "hl_order", "hl_cancel", "hl_leverage", "utxo_pay", "xrpl_tx", "stellar_tx", "tron_tx", "ton_tx", "sol_tx"];
+const MORE_TYPES: [&str; 2] = ["seaport_order", "intents_deposit"];
+/// The largest action accepted (a Solana transaction with 12 instructions fits).
+const MAX_ACTION_BYTES: usize = 16 * 1024;
+
+/// An action for the extension: a JSON object of a known type. Hyperliquid
+/// actions are parsed into their exact fields; the others are passed as
+/// parsed JSON (the extension checks every field against the grant).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "Value", into = "Value")]
+pub struct Action(Value);
+
+impl TryFrom<Value> for Action {
+    type Error = String;
+    fn try_from(v: Value) -> Result<Self, String> {
+        let t = v.get("type").and_then(Value::as_str).ok_or("the action needs a type")?;
+        if !ACTION_TYPES.contains(&t) && !MORE_TYPES.contains(&t) {
+            return Err(format!("not an action the extension knows: {t}"));
+        }
+        if serde_json::to_vec(&v).map_err(|e| e.to_string())?.len() > MAX_ACTION_BYTES {
+            return Err("action too large".into());
+        }
+        if t == "intents_deposit" {
+            // 1Click's signed quote and the deposit transfer, itself an
+            // action of a known type (never another top-up). The extension
+            // checks the quote's signature and every rule.
+            let o = v.as_object().ok_or("bad top-up")?;
+            if o.len() != 4 || !o["quote"].is_string() || !o["signature"].is_string() {
+                return Err("a top-up has exactly type, quote, signature and action".into());
+            }
+            let inner = Action::try_from(o.get("action").cloned().ok_or("a top-up needs its deposit action")?)?;
+            if inner.0["type"] == "intents_deposit" {
+                return Err("one top-up at a time".into());
+            }
+            return Ok(Action(v));
+        }
+        if t.starts_with("hl_") {
+            let hl: HlAction = serde_json::from_value(v).map_err(|e| e.to_string())?;
+            return Ok(Action(serde_json::to_value(hl).map_err(|e| e.to_string())?));
+        }
+        Ok(Action(v))
+    }
+}
+
+impl From<Action> for Value {
+    fn from(a: Action) -> Value {
+        a.0
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -99,8 +151,9 @@ fn decimal_ok(s: &str) -> bool {
 }
 
 fn check_action(a: &Action) -> Result<(), String> {
-    match a {
-        Action::HlOrder { price, size, tif, .. } => {
+    let Ok(hl) = serde_json::from_value::<HlAction>(a.0.clone()) else { return Ok(()) };
+    match &hl {
+        HlAction::HlOrder { price, size, tif, .. } => {
             if !decimal_ok(price) || !decimal_ok(size) {
                 return Err("price and size must be plain decimals".into());
             }
@@ -108,7 +161,7 @@ fn check_action(a: &Action) -> Result<(), String> {
                 return Err("tif must be Gtc, Ioc or Alo".into());
             }
         }
-        Action::HlLeverage { leverage, .. } if *leverage == 0 || *leverage > 50 => return Err("leverage must be 1 to 50".into()),
+        HlAction::HlLeverage { leverage, .. } if *leverage == 0 || *leverage > 50 => return Err("leverage must be 1 to 50".into()),
         _ => {}
     }
     Ok(())

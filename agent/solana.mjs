@@ -10,16 +10,29 @@
 //   node solana.mjs jito-unstake <jitosol>       unstake JitoSOL back to SOL
 //   node solana.mjs kamino-supply <sol>          lend SOL on Kamino (devnet market)
 //   node solana.mjs kamino-redeem <ktokens|all>  take it back
+//   node solana.mjs kamino-open                  create the account's Kamino obligation (rent ~0.032 SOL)
+//   node solana.mjs kamino-collateral <sol>      deposit SOL as collateral
+//   node solana.mjs kamino-borrow <usdc>         borrow devnet USDC against it
+//   node solana.mjs kamino-borrow-to <usdc> <a>  the same, paid to someone else (refused)
+//   node solana.mjs kamino-repay <usdc|all>      repay
+//   node solana.mjs kamino-withdraw <sol|all>    take the collateral back (as SOL)
+//   node solana.mjs kamino-position              the obligation's deposits and debt
+//   node solana.mjs tensor-buy <mint> [maxSOL]   buy a Metaplex NFT listed on Tensor for SOL
+//   node solana.mjs tensor-list <mint> <sol>     list one of the account's NFTs (at or above the passkey's floor)
+//   node solana.mjs tensor-delist <mint>         take it down; the NFT comes back
+//
+// Tensor's instructions come from Tensor's own client, as protean-bot builds
+// them (src/solana/integrations/tensor.js): legacy Metaplex NFTs only.
 //
 // Env as agent.mjs: MARVII_NEAR_KEYS, RELAYER, WALLET; SOL_RPC (default devnet).
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
-import { Connection, PublicKey, SystemProgram, LAMPORTS_PER_SOL } from '@solana/web3.js';
+import { Connection, PublicKey, SystemProgram, LAMPORTS_PER_SOL, SYSVAR_RENT_PUBKEY } from '@solana/web3.js';
 import {
   TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID, NATIVE_MINT,
-  createAssociatedTokenAccountIdempotentInstruction, createSyncNativeInstruction,
+  createAssociatedTokenAccountIdempotentInstruction, createSyncNativeInstruction, createCloseAccountInstruction,
 } from '@solana/spl-token';
 import { StakePoolInstruction, getStakePoolAccount } from '@solana/spl-stake-pool';
 
@@ -43,6 +56,8 @@ const KAMINO = {
   program: new PublicKey('KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD'),
   market: new PublicKey('Fcv68kert8VhyqjD1Cb7bCtPocHm6sWcrKkpQ2vwnYDM'),
   reserve: new PublicKey('5qTRnm1VKGmNsjfcVB2ShScM2Rez3NjjfrXyh7hSYYiY'),
+  // The market's other reserve: Circle's devnet USDC (4zMMC9…).
+  usdcReserve: new PublicKey('AgwKsQVbpmkikvnDUU1texZaxVYohm4USzk5g2ZErCup'),
 };
 const SYSVAR_INSTRUCTIONS = new PublicKey('Sysvar1nstructions1111111111111111111111111');
 
@@ -87,10 +102,10 @@ const wire = (ix) => ({
 });
 
 /** Sends the instructions through the extension; broadcasts if it agrees. */
-async function run(ixs, atas, from, core) {
+async function run(ixs, atas, from, core, obligations = []) {
   const cfg = await relayer('/config');
   const { blockhash, lastValidBlockHeight } = await sol.getLatestBlockhash('finalized');
-  const action = { type: 'sol_tx', recent_blockhash: blockhash, instructions: ixs.map(wire), atas: atas.map((a) => a.hint) };
+  const action = { type: 'sol_tx', recent_blockhash: blockhash, instructions: ixs.map(wire), atas: atas.map((a) => a.hint), obligations };
   const s = await view(cfg.rpc, cfg.extension, 'get_session', { wallet: WALLET, key_id: KEY_ID });
   const msg = JSON.stringify({ domain: 'marvii-session-v1', extension: cfg.extension, wallet: WALLET, key_id: KEY_ID, nonce: s.nonce + 1, deadline_ms: Date.now() + 300_000, action });
   const out = await relayer('/agent/execute', { msg, signature: crypto.sign(null, crypto.createHash('sha256').update(msg).digest(), agentKey()).toString('hex') });
@@ -127,15 +142,18 @@ async function jitoPool() {
 }
 const onProgram = (ix, program) => Object.assign(ix, { programId: program });
 
-async function kaminoReserve() {
+async function kaminoReserve(address = KAMINO.reserve) {
   const klend = require('@kamino-finance/klend-sdk');
-  const info = await sol.getAccountInfo(KAMINO.reserve);
+  const info = await sol.getAccountInfo(address);
   if (!info.owner.equals(KAMINO.program)) throw new Error('reserve not owned by Kamino');
   const r = klend.Reserve.decode(info.data);
   if (String(r.lendingMarket) !== KAMINO.market.toBase58()) throw new Error('reserve is in another market');
   const opt = (a) => (a && String(a) !== PublicKey.default.toBase58() ? new PublicKey(String(a)) : KAMINO.program);
   const ti = r.config.tokenInfo;
   return {
+    address,
+    feeVault: new PublicKey(String(r.liquidity.feeVault)),
+    csupply: new PublicKey(String(r.collateral.supplyVault)),
     mint: new PublicKey(String(r.liquidity.mintPubkey)),
     supply: new PublicKey(String(r.liquidity.supplyVault)),
     liqTokenProgram: new PublicKey(String(r.liquidity.tokenProgram)),
@@ -149,7 +167,42 @@ const u64 = (n) => { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(n)); r
 const meta = (pubkey, isSigner, isWritable) => ({ pubkey, isSigner, isWritable });
 
 function kaminoRefresh(k) {
-  return { programId: KAMINO.program, data: disc('refresh_reserve'), keys: [meta(KAMINO.reserve, false, true), meta(KAMINO.market, false, false), ...k.oracles.map((o) => meta(o, false, false))] };
+  return { programId: KAMINO.program, data: disc('refresh_reserve'), keys: [meta(k.address, false, true), meta(KAMINO.market, false, false), ...k.oracles.map((o) => meta(o, false, false))] };
+}
+
+// The account's default obligation (klend-sdk VanillaObligation: tag 0, id
+// 0, default seed accounts) and user metadata.
+function obligation(owner) {
+  const z = PublicKey.default.toBuffer();
+  const [address, bump] = PublicKey.findProgramAddressSync([Buffer.from([0]), Buffer.from([0]), owner.toBuffer(), KAMINO.market.toBuffer(), z, z], KAMINO.program);
+  return { address, hint: [{ market: KAMINO.market.toBase58(), bump }] };
+}
+const userMetadata = (owner) => PublicKey.findProgramAddressSync([Buffer.from('user_meta'), owner.toBuffer()], KAMINO.program)[0];
+
+/** The obligation's deposit and borrow reserves, in its own order. */
+async function obligationState(o) {
+  const klend = require('@kamino-finance/klend-sdk');
+  const info = await sol.getAccountInfo(o.address);
+  if (!info) return null;
+  const ob = klend.Obligation.decode(info.data);
+  const live = (x) => String(x) !== PublicKey.default.toBase58();
+  return {
+    deposits: ob.deposits.filter((d) => live(d.depositReserve)).map((d) => ({ reserve: new PublicKey(String(d.depositReserve)), amount: BigInt(String(d.depositedAmount)) })),
+    borrows: ob.borrows.filter((b) => live(b.borrowReserve)).map((b) => ({ reserve: new PublicKey(String(b.borrowReserve)), sf: BigInt(String(b.borrowedAmountSf)) })),
+  };
+}
+
+/** Refresh every reserve the obligation (and the action) touches, the
+ *  action's reserve last, then the obligation: the order klend checks. */
+async function kaminoRefreshAll(o, current, extra = []) {
+  const st = (await obligationState(o)) ?? { deposits: [], borrows: [] };
+  const used = [...st.deposits.map((d) => d.reserve), ...st.borrows.map((b) => b.reserve)];
+  const all = [...used, ...extra].filter((r, i, a) => a.findIndex((x) => x.equals(r)) === i);
+  const ixs = [];
+  for (const r of all.filter((r) => !r.equals(current.address))) ixs.push(kaminoRefresh(await kaminoReserve(r)));
+  ixs.push(kaminoRefresh(current));
+  ixs.push({ programId: KAMINO.program, data: disc('refresh_obligation'), keys: [meta(KAMINO.market, false, false), meta(o.address, false, true), ...used.map((r) => meta(r, false, false))] });
+  return ixs;
 }
 
 const core = await loadCore();
@@ -220,6 +273,158 @@ if (cmd === 'address') {
       meta(wsol.address, false, true), meta(TOKEN_PROGRAM_ID, false, false), meta(k.liqTokenProgram, false, false), meta(SYSVAR_INSTRUCTIONS, false, false)],
   };
   await run([kaminoRefresh(k), redeem], [wsol, ctok], from, core);
+} else if (cmd === 'kamino-open') {
+  const o = obligation(from);
+  const um = userMetadata(from);
+  const ixs = [];
+  if (!(await sol.getAccountInfo(um))) {
+    ixs.push({ programId: KAMINO.program, data: Buffer.concat([disc('init_user_metadata'), Buffer.alloc(32)]),
+      keys: [meta(from, true, false), meta(from, true, true), meta(um, false, true), meta(KAMINO.program, false, false), meta(SYSVAR_RENT_PUBKEY, false, false), meta(SystemProgram.programId, false, false)] });
+  }
+  if (await sol.getAccountInfo(o.address)) throw new Error(`obligation ${o.address.toBase58()} already exists`);
+  ixs.push({ programId: KAMINO.program, data: Buffer.concat([disc('init_obligation'), Buffer.from([0, 0])]),
+    keys: [meta(from, true, false), meta(from, true, true), meta(o.address, false, true), meta(KAMINO.market, false, false),
+      meta(PublicKey.default, false, false), meta(PublicKey.default, false, false), meta(um, false, false), meta(SYSVAR_RENT_PUBKEY, false, false), meta(SystemProgram.programId, false, false)] });
+  console.log(`open the Kamino obligation ${o.address.toBase58()}`);
+  await run(ixs, [], from, core, o.hint);
+} else if (cmd === 'kamino-collateral') {
+  const k = await kaminoReserve();
+  const o = obligation(from);
+  const wsol = ata(from, NATIVE_MINT, k.liqTokenProgram);
+  const amount = lamports(a1);
+  console.log(`deposit ${a1} SOL on Kamino as collateral`);
+  const deposit = {
+    programId: KAMINO.program, data: Buffer.concat([disc('deposit_reserve_liquidity_and_obligation_collateral'), u64(amount)]),
+    keys: [meta(from, true, true), meta(o.address, false, true), meta(KAMINO.market, false, false), meta(k.authority, false, false),
+      meta(k.address, false, true), meta(k.mint, false, false), meta(k.supply, false, true), meta(k.cmint, false, true),
+      meta(k.csupply, false, true), meta(wsol.address, false, true), meta(KAMINO.program, false, false),
+      meta(TOKEN_PROGRAM_ID, false, false), meta(k.liqTokenProgram, false, false), meta(SYSVAR_INSTRUCTIONS, false, false)],
+  };
+  await run([
+    createAssociatedTokenAccountIdempotentInstruction(from, wsol.address, from, NATIVE_MINT, k.liqTokenProgram),
+    SystemProgram.transfer({ fromPubkey: from, toPubkey: wsol.address, lamports: amount }),
+    createSyncNativeInstruction(wsol.address, k.liqTokenProgram),
+    ...(await kaminoRefreshAll(o, k)),
+    deposit,
+  ], [wsol], from, core, o.hint);
+} else if (cmd === 'kamino-borrow' || cmd === 'kamino-borrow-to') {
+  const k = await kaminoReserve(KAMINO.usdcReserve);
+  const o = obligation(from);
+  const to = cmd === 'kamino-borrow' ? from : new PublicKey(a2);
+  const dest = ata(to, k.mint, k.liqTokenProgram);
+  const amount = BigInt(Math.round(Number(a1) * 1e6));
+  console.log(`borrow ${a1} USDC on Kamino, to ${dest.address.toBase58()} (owner ${to.toBase58()})`);
+  const borrow = {
+    programId: KAMINO.program, data: Buffer.concat([disc('borrow_obligation_liquidity'), u64(amount)]),
+    keys: [meta(from, true, false), meta(o.address, false, true), meta(KAMINO.market, false, false), meta(k.authority, false, false),
+      meta(k.address, false, true), meta(k.mint, false, false), meta(k.supply, false, true), meta(k.feeVault, false, true),
+      meta(dest.address, false, true), meta(KAMINO.program, false, false), meta(k.liqTokenProgram, false, false), meta(SYSVAR_INSTRUCTIONS, false, false)],
+  };
+  await run([
+    createAssociatedTokenAccountIdempotentInstruction(from, dest.address, to, k.mint, k.liqTokenProgram),
+    ...(await kaminoRefreshAll(o, k, [k.address])),
+    borrow,
+  ], [dest], from, core, o.hint);
+} else if (cmd === 'kamino-repay') {
+  const k = await kaminoReserve(KAMINO.usdcReserve);
+  const o = obligation(from);
+  const src = ata(from, k.mint, k.liqTokenProgram);
+  let amt;
+  if (a1 === 'all') {
+    // The cap counts what is asked for, so ask for what is owed (rounded up), not u64 max.
+    const b = (await obligationState(o))?.borrows.find((x) => x.reserve.equals(k.address));
+    if (!b) throw new Error('no USDC debt');
+    const held = BigInt((await sol.getTokenAccountBalance(src.address)).value.amount);
+    // Interest keeps accruing until the transaction lands, so ask for 0.001
+    // more than is owed: klend repays at most the debt.
+    const owed = (b.sf >> 60n) + 1000n;
+    amt = owed < held ? owed : held;
+  } else amt = BigInt(Math.round(Number(a1) * 1e6));
+  console.log(`repay ${Number(amt) / 1e6} USDC on Kamino`);
+  const repay = {
+    programId: KAMINO.program, data: Buffer.concat([disc('repay_obligation_liquidity'), u64(amt)]),
+    keys: [meta(from, true, false), meta(o.address, false, true), meta(KAMINO.market, false, false), meta(k.address, false, true),
+      meta(k.mint, false, false), meta(k.supply, false, true), meta(src.address, false, true), meta(k.liqTokenProgram, false, false), meta(SYSVAR_INSTRUCTIONS, false, false)],
+  };
+  await run([...(await kaminoRefreshAll(o, k)), repay], [src], from, core, o.hint);
+} else if (cmd === 'kamino-withdraw') {
+  const k = await kaminoReserve();
+  const o = obligation(from);
+  const wsol = ata(from, NATIVE_MINT, k.liqTokenProgram);
+  const st = await obligationState(o);
+  const dep = st?.deposits.find((d) => d.reserve.equals(k.address));
+  if (!dep) throw new Error('no SOL collateral');
+  // Collateral tokens: all of them, or the SOL amount at the reserve's rate (rounded down).
+  let amount = dep.amount;
+  if (a1 !== 'all') {
+    const klend = require('@kamino-finance/klend-sdk');
+    const r = klend.Reserve.decode((await sol.getAccountInfo(k.address)).data);
+    const L = r.liquidity, sf = (x) => BigInt(String(x));
+    const total = sf(L.totalAvailableAmount) + ((sf(L.borrowedAmountSf) - sf(L.accumulatedProtocolFeesSf) - sf(L.accumulatedReferrerFeesSf) - sf(L.pendingReferrerFeesSf)) >> 60n);
+    const supply = BigInt(String(r.collateral.mintTotalSupply));
+    amount = (lamports(a1) * supply) / total;
+  }
+  console.log(`withdraw ${amount} collateral tokens (SOL) from Kamino`);
+  const withdraw = {
+    programId: KAMINO.program, data: Buffer.concat([disc('withdraw_obligation_collateral_and_redeem_reserve_collateral'), u64(amount)]),
+    keys: [meta(from, true, true), meta(o.address, false, true), meta(KAMINO.market, false, false), meta(k.authority, false, false),
+      meta(k.address, false, true), meta(k.mint, false, false), meta(k.csupply, false, true), meta(k.cmint, false, true),
+      meta(k.supply, false, true), meta(wsol.address, false, true), meta(KAMINO.program, false, false),
+      meta(TOKEN_PROGRAM_ID, false, false), meta(k.liqTokenProgram, false, false), meta(SYSVAR_INSTRUCTIONS, false, false)],
+  };
+  await run([
+    createAssociatedTokenAccountIdempotentInstruction(from, wsol.address, from, NATIVE_MINT, k.liqTokenProgram),
+    ...(await kaminoRefreshAll(o, k)),
+    withdraw,
+    createCloseAccountInstruction(wsol.address, from, from, [], k.liqTokenProgram), // unwrap to SOL
+  ], [wsol], from, core, o.hint);
+} else if (cmd === 'kamino-position') {
+  const o = obligation(from);
+  const st = await obligationState(o);
+  if (!st) console.log(`no obligation yet (${o.address.toBase58()}); run kamino-open`);
+  else {
+    console.log(`obligation ${o.address.toBase58()}`);
+    for (const d of st.deposits) console.log(`  collateral: ${d.amount} tokens of reserve ${d.reserve.toBase58()}`);
+    for (const b of st.borrows) console.log(`  debt: ${Number(b.sf) / 2 ** 60 / 1e6} USDC from reserve ${b.reserve.toBase58()}`);
+  }
+} else if (cmd.startsWith('tensor-')) {
+  const tensor = require('@tensor-foundation/marketplace');
+  const tmeta = require('@tensor-foundation/mpl-token-metadata');
+  const kit = createRequire(require.resolve('@tensor-foundation/marketplace'))('@solana/web3.js');
+  const rpc = kit.createSolanaRpc(process.env.SOL_RPC ?? 'https://api.devnet.solana.com');
+  const opt = (o) => (o && kit.isSome(o) ? kit.unwrapOption(o) : undefined);
+  const fromKit = (ix) => ({ programId: new PublicKey(ix.programAddress), data: Buffer.from(ix.data), keys: ix.accounts.map((a) => meta(new PublicKey(a.address), Boolean(a.role & 2), Boolean(a.role & 1))) });
+  const mint = kit.address(a1);
+  const md = await tmeta.fetchMaybeMetadata(rpc, (await tmeta.findMetadataPda({ mint }))[0]);
+  if (!md.exists) throw new Error('no Metaplex metadata: not an NFT Tensor trades');
+  const standard = opt(md.data.tokenStandard);
+  if (standard === tmeta.TokenStandard.ProgrammableNonFungible) throw new Error('programmable NFTs are not supported yet');
+  const me = kit.createNoopSigner(kit.address(from.toBase58()));
+  const own = ata(from, new PublicKey(a1));
+  const [listState] = await tensor.findListStatePda({ mint });
+  const l = await tensor.fetchMaybeListState(rpc, listState);
+  let ix;
+  if (cmd === 'tensor-buy') {
+    if (!l.exists) throw new Error('not listed on Tensor');
+    const d = l.data;
+    if (opt(d.currency)) throw new Error('priced in a token, not SOL');
+    if (d.cosigner) throw new Error("needs Tensor's cosigner");
+    const max = a2 ? lamports(a2) : BigInt(d.amount);
+    console.log(`buy ${a1} on Tensor (listed at ${Number(d.amount) / 1e9} SOL, paying at most ${Number(max) / 1e9})`);
+    ix = await tensor.getBuyLegacyInstructionAsync({
+      payer: me, owner: d.owner, mint, maxAmount: max, rentDestination: d.rentPayer ?? undefined, makerBroker: opt(d.makerBroker),
+      takerBroker: me.address, optionalRoyaltyPct: 100, tokenStandard: standard, creators: (opt(md.data.creators) ?? []).map((c) => c.address),
+    });
+  } else if (cmd === 'tensor-list') {
+    console.log(`list ${a1} on Tensor for ${a2} SOL`);
+    ix = await tensor.getListLegacyInstructionAsync({ owner: me, payer: me, mint, amount: lamports(a2), makerBroker: me.address, tokenStandard: standard });
+  } else if (cmd === 'tensor-delist') {
+    if (!l.exists || l.data.owner !== me.address) throw new Error('the account has not listed that NFT');
+    console.log(`take ${a1} off Tensor`);
+    ix = await tensor.getDelistLegacyInstructionAsync({ owner: me, payer: me, mint, rentDestination: l.data.rentPayer ?? undefined, tokenStandard: standard });
+  }
+  if (!ix) throw new Error('usage: see the top of solana.mjs');
+  await run([fromKit(ix)], [own], from, core);
 } else {
   console.log('usage: solana.mjs address | pay <sol> <address> | jito-stake <sol> | jito-stake-to <sol> <address> | jito-unstake <jitosol> | kamino-supply <sol> | kamino-redeem <ktokens|all>');
 }

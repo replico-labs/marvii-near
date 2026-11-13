@@ -66,6 +66,9 @@ struct App {
     /// Agent requests the extension refused for being over the cap, waiting
     /// for the owner's passkey. In memory: a demo, not a queue.
     pending: Mutex<Vec<Value>>,
+    /// Approved agent keys, for the SDK's waitForApproval: public key ->
+    /// { wallet, key_id }, each checked on-chain before it is stored.
+    connects: Mutex<Vec<(String, Value)>>,
     /// The name registry, if names are enabled.
     names: Option<String>,
 }
@@ -149,6 +152,7 @@ async fn main() -> Result<()> {
         code_hash,
         known_extensions,
         pending: Mutex::new(Vec::new()),
+        connects: Mutex::new(Vec::new()),
         names,
     });
     if app.names.is_some() {
@@ -177,7 +181,12 @@ async fn main() -> Result<()> {
         .route("/chain/{chain}/tx", post(chains::broadcast))
         .route("/intents/tokens", get(chains::intents_tokens))
         .route("/intents/quote", post(chains::intents_quote))
+        .route("/intents/deposit-quote", post(chains::intents_deposit_quote))
+        .route("/intents/submit", post(chains::intents_submit))
+        .route("/intents/status", get(chains::intents_status))
         .route("/names/forward", post(names_forward))
+        .route("/connect", post(connect_report))
+        .route("/connect/{public_key}", get(connect_get))
         .route("/pending", get(pending_list))
         .route("/pending/{id}", get(pending_get))
         .route("/pending/{id}/reject", post(pending_reject))
@@ -467,6 +476,8 @@ async fn agent_execute(State(a): State<Shared>, Json(b): Json<AgentBody>) -> Rep
     let mut s = summarize(&a, &out);
     let reason = refusal(&s);
     // Over the cap: keep it for the owner to approve with the passkey.
+    // A top-up wraps its deposit transaction: the EVM parts below are about that.
+    let inner = if m["action"]["type"] == "intents_deposit" { &m["action"]["action"] } else { &m["action"] };
     if !s["ok"].as_bool().unwrap_or(false) && m["action"]["type"] == "evm_tx" && reason.as_deref() == Some("over the daily cap") {
         let mut p = a.pending.lock().unwrap();
         let id = p.len() as u64 + 1;
@@ -479,8 +490,8 @@ async fn agent_execute(State(a): State<Shared>, Json(b): Json<AgentBody>) -> Rep
     s["reason"] = reason.map(Value::String).unwrap_or(Value::Null);
     // For an EVM transaction, also return the hash that was signed, so the
     // agent can attach the signature and broadcast.
-    if m["action"]["type"] == "evm_tx" {
-        let h: Result<String, _> = a.near.view(a.extension.as_str(), "evm_signing_hash").args(json!({ "tx": m["action"]["tx"] })).await;
+    if inner["type"] == "evm_tx" {
+        let h: Result<String, _> = a.near.view(a.extension.as_str(), "evm_signing_hash").args(json!({ "tx": inner["tx"] })).await;
         s["evm_signing_hash"] = h.map(Value::String).unwrap_or(Value::Null);
     }
     Ok(Json(s))
@@ -508,6 +519,40 @@ async fn pending_list(State(a): State<Shared>, Query(q): Query<WalletQuery>) -> 
 async fn pending_get(State(a): State<Shared>, Path(id): Path<u64>) -> Reply {
     let p = a.pending.lock().unwrap();
     p.iter().find(|i| i["id"] == id).cloned().map(Json).ok_or_else(|| bad("no such request"))
+}
+
+#[derive(Deserialize)]
+struct ConnectReport {
+    wallet: String,
+    key_id: String,
+}
+
+/// The page reports that its owner granted an agent's key (a permission
+/// link). Nothing is taken on trust: the session is read from the
+/// extension, and only its own public key is recorded, so anyone may call
+/// this and it can only ever say what is on-chain.
+async fn connect_report(State(a): State<Shared>, Json(b): Json<ConnectReport>) -> Reply {
+    let s: Option<Value> = a.near.view(a.extension.as_str(), "get_session").args(json!({ "wallet": b.wallet, "key_id": b.key_id })).await.map_err(bad)?;
+    let s = s.ok_or_else(|| bad("no such session"))?;
+    if s["revoked"].as_bool() == Some(true) {
+        return Err(bad("that session is revoked"));
+    }
+    let pk = s["grant"]["public_key"].as_str().ok_or_else(|| bad("session without a key"))?.to_string();
+    let entry = json!({ "wallet": b.wallet, "key_id": b.key_id, "extension": a.extension });
+    let mut c = a.connects.lock().unwrap();
+    c.retain(|(k, _)| k != &pk);
+    c.push((pk, entry.clone()));
+    // A demo store: the most recent 1,000.
+    let n = c.len();
+    if n > 1000 {
+        c.drain(..n - 1000);
+    }
+    Ok(Json(entry))
+}
+
+async fn connect_get(State(a): State<Shared>, Path(public_key): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let c = a.connects.lock().unwrap();
+    c.iter().rev().find(|(k, _)| *k == public_key.to_lowercase()).map(|(_, v)| Json(v.clone())).ok_or((StatusCode::NOT_FOUND, Json(json!({ "error": "not approved yet" }))))
 }
 
 /// Testnet demo: no auth on reject. Rejecting only drops the request; it

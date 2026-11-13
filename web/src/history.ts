@@ -115,7 +115,7 @@ export async function history(chain: string, address: string, wallet: string): P
       const inVal = BigInt(t.in_msg?.value ?? 0);
       const outs = (t.out_msgs ?? []) as any[];
       const outVal = outs.reduce((a, m) => a + BigInt(m.value ?? 0), 0n);
-      const label = outs.length ? `Sent ${fmt(outVal, 9)} TON` : inVal > 0n ? `Received ${fmt(inVal, 9)} TON` : 'Transaction';
+      const label = outs.length ? `Sent ${fmt(outVal, 9)} GRAM` : inVal > 0n ? `Received ${fmt(inVal, 9)} GRAM` : 'Transaction';
       const ok = !t.description?.aborted && (t.description?.compute_ph?.success ?? true);
       // TON Center gives the hash in base64; the explorer takes hex.
       const hex = Array.from(atob(t.hash), (c) => c.charCodeAt(0).toString(16).padStart(2, '0')).join('');

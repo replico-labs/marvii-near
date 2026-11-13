@@ -33,6 +33,14 @@ fn signer() -> String { env_or("MARVII_NEAR_SIGNER", "v1.signer-prod.testnet") }
 fn queue_delay_ms() -> u64 { env_or("MARVII_QUEUE_DELAY_MS", "600000").parse().expect("MARVII_QUEUE_DELAY_MS") }
 fn sandbox() -> bool { std::env::var("MARVII_NEAR_SANDBOX").is_ok() }
 const CHAIN_ID: u64 = 84532; // Base Sepolia: only signed here, never broadcast
+/// Hoodi (Lido's testnet) and the contracts the demo grant names there and
+/// on Base Sepolia (checked on-chain; see the grant). Lowercase, as caps are.
+const HOODI: u64 = 560048;
+const LIDO_STETH: &str = "0x3508a952176b3c15387c97be809eaffb1982176a";
+const LIDO_WSTETH: &str = "0x7e99ee3c66636de415d2d7c880938f2f40f94de4";
+const LIDO_QUEUE: &str = "0xfe56573178f1bcdf53f01a6e9977670dcbbd9186";
+const SEAPORT: &str = "0x0000000000000068f116a894984e2db1123eb395";
+const TEST_NFT: &str = "0xff67823ccb8d504d0627609f4d1dca86b2b51c43";
 
 fn keys_dir() -> Result<PathBuf> {
     Ok(PathBuf::from(std::env::var("MARVII_NEAR_KEYS").context("set MARVII_NEAR_KEYS")?))
@@ -85,6 +93,7 @@ async fn main() -> Result<()> {
         Some("publish-wallet") => publish_wallet(&args[2]).await,
         Some("rotate-key") => rotate_key(&args[2]).await,
         Some("deploy-extension") => deploy_extension(&args[2]).await,
+        Some("upgrade-extension") => upgrade_extension(&args[2]).await,
         Some("deploy-names") => deploy_names(args.get(2).context("forwarder wasm")?, args.get(3).context("registry wasm")?, args.get(4).context("parent account")?, args.get(5).context("NEAR to fund it with")?).await,
         Some("demo-name") => {
             NAME.set(args.get(2).context("name")?.clone()).ok();
@@ -393,6 +402,21 @@ async fn deploy_extension(path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Testnet iteration only: replaces the dev extension's code in place, for
+/// changes that keep its stored state's layout (rules, not structs). Costs
+/// gas instead of a new account's 4 NEAR. A live extension is never
+/// changed this way: each version is a new account.
+async fn upgrade_extension(path: &str) -> Result<()> {
+    let wasm = fs::read(path)?;
+    let ext = Key::load("extension")?;
+    let out = ext.near()?.transaction(ext.account_id.as_str()).deploy(wasm).send().wait_until::<Final>().await?;
+    if !out.is_success() {
+        bail!("upgrade failed: {:?}", out.failure_message());
+    }
+    println!("extension {} code replaced, tx {}", ext.account_id, out.transaction_hash());
+    Ok(())
+}
+
 /// A demo wallet whose passkey key is kept in the keys directory
 /// (`demo-passkey.json`), so it can be funded on other chains and used again.
 /// A software P-256 key in real WebAuthn format, like `e2e`; testnet only.
@@ -597,7 +621,37 @@ async fn demo(grant_to: Option<String>, approve: Option<u64>, upgrade: bool, can
                 "label": "Aave and Hyperliquid agent",
                 "expires_at_ms": now_ms + 7 * 86_400_000,
                 "inactivity_ms": 3 * 86_400_000u64,
-                "near_venues": [],
+                // NEAR protocols (testnet, checked on-chain): wNEAR wrap and
+                // unwrap; Ref Finance (metadata() 1.9.19) swaps through pool
+                // 1084 (USDT/wNEAR) only, with registration on its USDT;
+                // Meta Pool and LiNEAR staking (methods from their sources:
+                // Narwallets/meta-pool, linear-protocol/LiNEAR). Each pays
+                // the caller, the wallet.
+                "near_venues": [
+                    { "receiver_id": "wrap.testnet", "method": "near_deposit" },
+                    { "receiver_id": "wrap.testnet", "method": "near_withdraw" },
+                    { "receiver_id": "wrap.testnet", "method": "storage_deposit" },
+                    { "receiver_id": "ref-finance-101.testnet", "method": "pool:1084" },
+                    { "receiver_id": "usdt.itachicara.testnet", "method": "storage_deposit" },
+                    { "receiver_id": "meta-v2.pool.testnet", "method": "deposit_and_stake" },
+                    { "receiver_id": "meta-v2.pool.testnet", "method": "liquid_unstake" },
+                    { "receiver_id": "linear-protocol.testnet", "method": "deposit_and_stake" },
+                    { "receiver_id": "linear-protocol.testnet", "method": "unstake" },
+                    { "receiver_id": "linear-protocol.testnet", "method": "withdraw" },
+                    // Rhea Lending (formerly Burrow) on testnet, as
+                    // rhea-finance/burrow-sdk-python names it (Pyth oracle
+                    // enabled): registration, collateral and repay in by
+                    // ft_transfer_call, borrow and withdraw by execute_with_pyth.
+                    { "receiver_id": "contract.1689937928.burrow.testnet", "method": "storage_deposit" },
+                    { "receiver_id": "contract.1689937928.burrow.testnet", "method": "execute_with_pyth" },
+                    { "receiver_id": "usdc.fakes.testnet", "method": "storage_deposit" },
+                    // Rhea's rNEAR (lst.ref-dev.testnet, rhea-finance/rnear-sdk
+                    // TESTNET_CONFIG): staking-pool methods; pays the caller.
+                    { "receiver_id": "lst.ref-dev.testnet", "method": "storage_deposit" },
+                    { "receiver_id": "lst.ref-dev.testnet", "method": "deposit_and_stake" },
+                    { "receiver_id": "lst.ref-dev.testnet", "method": "unstake" },
+                    { "receiver_id": "lst.ref-dev.testnet", "method": "withdraw_all" }
+                ],
                 // Aave V3: supply 0x617ba037, withdraw 0x69328dec, repay
                 // 0x573ade81. Uniswap V3 SwapRouter02 on Base Sepolia
                 // (factory() and WETH9() checked on-chain):
@@ -609,14 +663,50 @@ async fn demo(grant_to: Option<String>, approve: Option<u64>, upgrade: bool, can
                     { "chain_id": CHAIN_ID, "to": pool, "selector": "0x573ade81" },
                     // Aave V3 borrow(address,uint256,uint256,uint16,address): 0xa415bcad (viem toFunctionSelector).
                     { "chain_id": CHAIN_ID, "to": pool, "selector": "0xa415bcad" },
-                    { "chain_id": CHAIN_ID, "to": "0x94cc0aac535ccdb3c01d6787d6413c739ae12bc4", "selector": "0x04e45aaf" }
+                    { "chain_id": CHAIN_ID, "to": "0x94cc0aac535ccdb3c01d6787d6413c739ae12bc4", "selector": "0x04e45aaf" },
+                    // Lido on Hoodi (docs.lido.fi/deployed-contracts/hoodi;
+                    // the Locator's lido() and withdrawalQueue() checked
+                    // on-chain): stETH submit, wstETH wrap and unwrap, the
+                    // queue's requestWithdrawals(, WstETH) and claimWithdrawal.
+                    { "chain_id": HOODI, "to": LIDO_STETH, "selector": "0xa1903eab" },
+                    { "chain_id": HOODI, "to": LIDO_WSTETH, "selector": "0xea598cb0" },
+                    { "chain_id": HOODI, "to": LIDO_WSTETH, "selector": "0xde0e9a3e" },
+                    { "chain_id": HOODI, "to": LIDO_QUEUE, "selector": "0xd6681042" },
+                    { "chain_id": HOODI, "to": LIDO_QUEUE, "selector": "0x19aa6257" },
+                    { "chain_id": HOODI, "to": LIDO_QUEUE, "selector": "0xf8444436" },
+                    // Seaport 1.6 on Base Sepolia (information() says "1.6"):
+                    // fulfillBasicOrder, its _efficient_6GL6yc twin, cancel;
+                    // and the test collection's setApprovalForAll.
+                    { "chain_id": CHAIN_ID, "to": SEAPORT, "selector": "0xfb0f3ee1" },
+                    { "chain_id": CHAIN_ID, "to": SEAPORT, "selector": "0x00000000" },
+                    { "chain_id": CHAIN_ID, "to": SEAPORT, "selector": "0xfd9f1e10" },
+                    { "chain_id": CHAIN_ID, "to": TEST_NFT, "selector": "0xa22cb465" }
                 ],
                 "evm_self": evm_self,
+                // Seaport listings: at least 0.002 ETH to the account.
+                "evm_nft_floor": "2000000000000000",
                 "near_recipients": [],
                 "evm_recipients": [],
                 // Hyperliquid testnet: ETH perps (asset 4, from the testnet
                 // `meta`), at most 5x, up to 100 USD of orders a day.
-                "caps": [{ "asset": format!("evm:{CHAIN_ID}:{usdc}"), "daily": "50000000" }, { "asset": "hyperliquid:usd", "daily": "100000000" }, { "asset": "utxo:bitcoin", "daily": "100000" }, { "asset": "utxo:zcash", "daily": "2000000" }, { "asset": "utxo:dogecoin", "daily": "50000000000" }, { "asset": format!("borrow:evm:{CHAIN_ID}:{usdc}"), "daily": "2000000" }],
+                "caps": [{ "asset": format!("evm:{CHAIN_ID}:{usdc}"), "daily": "50000000" },
+                    // Hoodi ETH staked and stETH approved (0.5 a day); Base
+                    // Sepolia ETH paid for NFTs; two NFT listings a day.
+                    { "asset": format!("evm:{HOODI}"), "daily": "500000000000000000" },
+                    { "asset": format!("evm:{HOODI}:{LIDO_STETH}"), "daily": "1000000000000000000" },
+                    { "asset": format!("evm:{CHAIN_ID}"), "daily": "10000000000000000" },
+                    { "asset": format!("nft:evm:{CHAIN_ID}"), "daily": "2" },
+                    // NEAR attached to calls (staking, wrapping, storage) and
+                    // wNEAR swapped: 3 a day each.
+                    { "asset": "near", "daily": "3000000000000000000000000" },
+                    { "asset": "nep141:wrap.testnet", "daily": "3000000000000000000000000" },
+                    // Rhea Lending: 1 test USDC borrowed a day (its 18-decimal
+                    // units), 1 repaid.
+                    { "asset": "borrow:near:usdc.fakes.testnet", "daily": "1000000000000000000" },
+                    // wNEAR, the one testnet asset Rhea can price (a default price;
+                    // its Pyth feeds there are empty): 0.1 a day.
+                    { "asset": "borrow:near:wrap.testnet", "daily": "100000000000000000000000" },
+                    { "asset": "nep141:usdc.fakes.testnet", "daily": "1000000" }, { "asset": "hyperliquid:usd", "daily": "100000000" }, { "asset": "utxo:bitcoin", "daily": "100000" }, { "asset": "utxo:zcash", "daily": "2000000" }, { "asset": "utxo:dogecoin", "daily": "50000000000" }, { "asset": format!("borrow:evm:{CHAIN_ID}:{usdc}"), "daily": "2000000" }],
                 "queue_new_targets": true,
                 "hl_markets": [{ "asset": 4, "max_leverage": 5 }],
                 "utxo": utxo
@@ -674,7 +764,7 @@ async fn demo(grant_to: Option<String>, approve: Option<u64>, upgrade: bool, can
             }
         }
         let req = NearPromise::new(ext.account_id.parse::<defuse_wallet::AccountId>()?).function_call(
-            FunctionCall::name("grant_session").args_json(grant).attach_deposit(NearToken::from_millinear(10)).gas(Gas::from_tgas(20)),
+            FunctionCall::name("grant_session").args_json(grant).attach_deposit(NearToken::from_millinear(100)).gas(Gas::from_tgas(20)),
         );
         let out = wallet.sign_and_send(req).await?.status(&near).wait_until::<Final>().await?;
         let granted = out.receipts_outcome.iter().any(|o| o.outcome.logs.iter().any(|l| l.starts_with("session_granted")));

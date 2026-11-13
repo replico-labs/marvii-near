@@ -16,7 +16,7 @@ Marvii is a passkey wallet: self-custody secured by your phone's Face ID or fing
   - New recipients and contracts wait in a delay queue, where the passkey can cancel them.
   - Revoke any agent instantly.
 - **An agent's key can live in a TEE.** The demo agent's key also lives in OutLayer, NEAR's TEE compute (Intel TDX). It is derived inside the enclave for one exact build of our code and never leaves it; each run's TDX quote names that build.
-- **Swap quotes from NEAR Intents.** Live prices between every chain's coin.
+- **Swap quotes and top-ups through NEAR Intents.** Live prices between every chain's coin, and top-ups that move your own funds to your own address on another chain. An agent can top up too: the extension checks 1Click's signed quote and that the swap pays and refunds only you.
 
 Testnet only. The contracts are unaudited.
 
@@ -79,7 +79,7 @@ All of the following ran on NEAR testnet and each chain's testnet (8–9 Novembe
   - create with a passkey
   - Home: the account, then Assets, Swap, and Apps & agents
   - Assets: a tile per chain. Each chain's page has Send and Receive (address and QR code), what it holds, and its recent history from the chain's explorer. Send works on every chain: NEAR, nine EVM chains, Bitcoin, Solana, TRON, XRP, Cardano, Litecoin, Dogecoin, Bitcoin Cash and Zcash
-  - Swap: a live NEAR Intents quote (1Click, always `dry: true`; Intents runs on mainnet only)
+  - Swap: a live NEAR Intents quote (1Click, `dry: true`), and Top up another chain: a real quote paying your own address, deposited with the passkey (mainnet funds)
   - Hyperliquid: the account's spot and perps USDC, and Move to perps with the passkey
   - agents and apps, with Hyperliquid markets in the grant
   - Confirm, which decodes exactly what the passkey signs

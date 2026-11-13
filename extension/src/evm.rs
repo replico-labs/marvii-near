@@ -24,6 +24,31 @@ pub const SEL_AAVE_BORROW: [u8; 4] = [0xa4, 0x15, 0xbc, 0xad];
 /// address,uint256,uint256,uint160))`: recipient.
 pub const SEL_UNI_EXACT_INPUT_SINGLE: [u8; 4] = [0x04, 0xe4, 0x5a, 0xaf];
 
+/// Lido (stETH, wstETH and the withdrawal queue; `cast sig`). What they
+/// produce goes to the caller, the account itself, except a withdrawal
+/// request's NFT, which goes to its `owner` argument.
+/// stETH `submit(address)`: ETH in (the value), stETH to the caller.
+pub const SEL_LIDO_SUBMIT: [u8; 4] = [0xa1, 0x90, 0x3e, 0xab];
+/// wstETH `wrap(uint256)` and `unwrap(uint256)`.
+pub const SEL_WSTETH_WRAP: [u8; 4] = [0xea, 0x59, 0x8c, 0xb0];
+pub const SEL_WSTETH_UNWRAP: [u8; 4] = [0xde, 0x0e, 0x9a, 0x3e];
+/// WithdrawalQueueERC721 `requestWithdrawals(uint256[],address)` and
+/// `requestWithdrawalsWstETH(uint256[],address)`: owner.
+pub const SEL_LIDO_REQUEST: [u8; 4] = [0xd6, 0x68, 0x10, 0x42];
+pub const SEL_LIDO_REQUEST_WSTETH: [u8; 4] = [0x19, 0xaa, 0x62, 0x57];
+/// `claimWithdrawal(uint256)`: the ETH goes to the caller.
+pub const SEL_LIDO_CLAIM: [u8; 4] = [0xf8, 0x44, 0x44, 0x36];
+
+/// ERC-721 `setApprovalForAll(address,bool)`.
+pub const SEL_SET_APPROVAL_FOR_ALL: [u8; 4] = [0xa2, 0x2c, 0xb4, 0x65];
+/// Seaport `fulfillBasicOrder(BasicOrderParameters)` and its gas-efficient
+/// twin `fulfillBasicOrder_efficient_6GL6yc` (same ABI): the NFT goes to the
+/// caller. Only the routes where the caller pays (ETH or ERC-20 for an
+/// ERC-721 or ERC-1155); the others would hand the account's NFT over for
+/// whatever the order asks.
+pub const SEL_SEAPORT_BASIC: [u8; 4] = [0xfb, 0x0f, 0x3e, 0xe1];
+pub const SEL_SEAPORT_BASIC_EFFICIENT: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
+
 /// For a call whose layout is known, the address its result goes to (who
 /// gets the deposit, the withdrawn tokens or the swap's output), which must
 /// be the account's own. `None` for any other call. The data must have
@@ -33,6 +58,43 @@ pub fn beneficiary(data: &[u8]) -> Result<Option<[u8; 20]>, &'static str> {
         return Ok(None);
     }
     let sel: [u8; 4] = data[..4].try_into().unwrap();
+    match sel {
+        SEL_LIDO_SUBMIT => {
+            if data.len() != 36 {
+                return Err("venue call data has the wrong length");
+            }
+            word_address(&data[4..36])?; // the referral: anyone, it gets nothing
+            return Ok(None);
+        }
+        SEL_SEAPORT_BASIC | SEL_SEAPORT_BASIC_EFFICIENT => {
+            // One tuple: its offset (0x20), then 18 head words; basicOrderType is the 9th.
+            if data.len() < 4 + 32 * 19 || word_u128(&data[4..36])? != 0x20 {
+                return Err("venue call data has the wrong length");
+            }
+            let order_type = word_u128(&data[4 + 32 * 9..4 + 32 * 10])?;
+            if order_type > 23 || order_type / 4 > 3 {
+                return Err("only buying an NFT through Seaport");
+            }
+            return Ok(None);
+        }
+        SEL_WSTETH_WRAP | SEL_WSTETH_UNWRAP | SEL_LIDO_CLAIM => {
+            if data.len() != 36 {
+                return Err("venue call data has the wrong length");
+            }
+            return Ok(None);
+        }
+        // (offset 0x40, owner, n, n amounts): strictly this encoding, so the
+        // owner word is the one the contract reads.
+        SEL_LIDO_REQUEST | SEL_LIDO_REQUEST_WSTETH => {
+            let w = |i: usize| data.get(4 + 32 * i..4 + 32 * (i + 1)).ok_or("venue call data has the wrong length");
+            let n = word_u128(w(2)?)? as usize;
+            if word_u128(w(0)?)? != 0x40 || n == 0 || n > 16 || data.len() != 4 + 32 * (3 + n) {
+                return Err("venue call data has the wrong length");
+            }
+            return Ok(Some(word_address(w(1)?)?));
+        }
+        _ => {}
+    }
     let (words, at) = match sel {
         SEL_AAVE_SUPPLY => (4, 2),
         SEL_AAVE_WITHDRAW => (3, 2),

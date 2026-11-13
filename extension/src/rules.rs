@@ -61,7 +61,9 @@ pub struct SolVenue {
 }
 
 /// What the agent may do on Solana. Caps use `sol` (lamports, wrapped SOL
-/// included, fees counted) and `spl:<mint>`.
+/// included, fees and rent counted), `spl:<mint>`, for Kamino borrows
+/// `borrow:solana:<mint>`, and for Tensor listings `nft:solana` (a count).
+/// A Tensor venue's scope is the marketplace program itself.
 #[near(serializers = [borsh, json])]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SolGrant {
@@ -71,6 +73,10 @@ pub struct SolGrant {
     pub venues: Vec<SolVenue>,
     /// Addresses SOL and token payments may go to.
     pub recipients: Vec<String>,
+    /// Tensor: the lowest price (lamports) the agent may list an NFT at,
+    /// so it can't sell one cheaply to an accomplice. Zero: no listing.
+    #[serde(default)]
+    pub nft_floor: U128,
 }
 
 /// What the agent may do on the XRP Ledger. Caps use `xrp` (drops, fees
@@ -209,6 +215,10 @@ pub struct Grant {
     /// withdraw, repay; Uniswap swaps) must send their result here.
     #[serde(default)]
     pub evm_self: Option<String>,
+    /// Seaport listings: the lowest price (wei, to the account) the agent
+    /// may list an NFT at. Zero: no listing.
+    #[serde(default)]
+    pub evm_nft_floor: U128,
     /// Payment-only chains the agent may pay on.
     #[serde(default)]
     pub utxo: Vec<UtxoGrant>,
@@ -306,11 +316,20 @@ pub enum Action {
     TronTx { tx: tron::TronTx },
     /// A TON wallet message from typed messages.
     TonTx { tx: ton::TonTx },
+    /// A Seaport listing for the account's EVM key to sign (EIP-712).
+    SeaportOrder { order: crate::seaport::SeaportOrder },
+    /// A NEAR Intents top-up: 1Click's signed quote (the exact JSON it
+    /// signed, and its signature) and the transfer to the quote's deposit
+    /// address (intents.rs).
+    IntentsDeposit { quote: String, signature: String, action: Box<Action> },
     SolTx {
         recent_blockhash: String,
         instructions: Vec<SolIx>,
         #[serde(default)]
         atas: Vec<SolAta>,
+        /// The account's Kamino obligations the transaction uses.
+        #[serde(default)]
+        obligations: Vec<SolObligation>,
     },
 }
 
@@ -341,6 +360,17 @@ pub struct SolAta {
     pub owner: String,
     pub mint: String,
     pub token_program: String,
+    pub bump: u8,
+}
+
+/// The account's own Kamino obligation in a market: the default one (tag
+/// 0, id 0, no seed accounts, as klend-sdk's VanillaObligation), at the
+/// address the extension derives from the account, the market and `bump`.
+/// Like an ATA's, a wrong bump gives an address no obligation lives at.
+#[near(serializers = [json])]
+#[derive(Clone, Debug)]
+pub struct SolObligation {
+    pub market: String,
     pub bump: u8,
 }
 
@@ -495,7 +525,7 @@ pub fn validate_grant(
     if let Some(sg) = &g.sol {
         sol::b58(&sg.self_address)?;
         for v in &sg.venues {
-            if !(sol::STAKE_POOL_PROGRAMS.contains(&v.program.as_str()) || v.program == sol::KAMINO) {
+            if !(sol::STAKE_POOL_PROGRAMS.contains(&v.program.as_str()) || v.program == sol::KAMINO || v.program == sol::TENSOR) {
                 return Err("no decoder for that Solana program");
             }
             sol::b58(&v.scope)?;
@@ -582,11 +612,11 @@ pub fn validate_grant(
     }
     for c in &g.caps {
         // Solana mints are base58, which is case-sensitive.
-        if !c.asset.starts_with("spl:") && !c.asset.starts_with("xrpl:") && !c.asset.starts_with("stellar:") && !c.asset.starts_with("trc20:") && !c.asset.starts_with("borrow:tron:") && !c.asset.starts_with("jetton:") && !c.asset.starts_with("soroban:") && !c.asset.starts_with("borrow:stellar:") && c.asset != c.asset.to_lowercase() {
+        if !c.asset.starts_with("spl:") && !c.asset.starts_with("xrpl:") && !c.asset.starts_with("stellar:") && !c.asset.starts_with("trc20:") && !c.asset.starts_with("borrow:tron:") && !c.asset.starts_with("jetton:") && !c.asset.starts_with("soroban:") && !c.asset.starts_with("borrow:stellar:") && !c.asset.starts_with("borrow:solana:") && c.asset != c.asset.to_lowercase() {
             return Err("cap assets must be lowercase");
         }
     }
-    if g.near_venues.len() + g.evm_venues.len() + g.near_recipients.len() + g.evm_recipients.len() + g.caps.len() + g.hl_markets.len() + g.utxo.len() + sol_items + xrpl_items + stellar_items + tron_items + ton_items > 64 {
+    if g.near_venues.len() + g.evm_venues.len() + g.near_recipients.len() + g.evm_recipients.len() + g.caps.len() + g.hl_markets.len() + g.utxo.len() + sol_items + xrpl_items + stellar_items + tron_items + ton_items > 128 {
         return Err("grant too large");
     }
     Ok(())
@@ -651,9 +681,17 @@ pub fn check(
                 if !ok && !queued {
                     return Err("token recipient not allowed");
                 }
+                if method == "ft_transfer_call" {
+                    ft_call_msg_ok(g, &a.receiver_id, &a.msg, queued)?;
+                } else if !a.msg.is_empty() {
+                    return Err("ft_transfer takes no msg");
+                }
                 spends.push((format!("nep141:{receiver_id}"), a.amount.0));
-            } else if !queued && !g.near_venues.iter().any(|v| &v.receiver_id == receiver_id && &v.method == method) {
-                return Err("not an allowed venue");
+            } else {
+                if !queued && !g.near_venues.iter().any(|v| &v.receiver_id == receiver_id && &v.method == method) {
+                    return Err("not an allowed venue");
+                }
+                spends.extend(rhea_call(receiver_id, method, args)?);
             }
             Plan {
                 kind: Kind::Near {
@@ -704,6 +742,17 @@ pub fn check(
                     let sel = format!("0x{}", hex::encode(selector));
                     if !queued && !g.evm_venues.iter().any(|v| v.chain_id == chain && v.to.to_lowercase() == to && v.selector.to_lowercase() == sel) {
                         return Err("not an allowed venue");
+                    }
+                    // setApprovalForAll hands every NFT of the collection to
+                    // the operator: only to a venue (Seaport), queued or not.
+                    if selector == evm::SEL_SET_APPROVAL_FOR_ALL {
+                        if t.value > 0 || t.data.len() != 4 + 64 || word_u128_ok(&t.data[36..68]) > 1 {
+                            return Err("bad setApprovalForAll");
+                        }
+                        let op = evm::fmt_address(&evm::word_address(&t.data[4..36])?);
+                        if !g.evm_venues.iter().any(|v| v.chain_id == chain && v.to.to_lowercase() == op) {
+                            return Err("operator is not a venue");
+                        }
                     }
                     // Where a venue call's result goes, for layouts we know:
                     // always the account itself, queued or not.
@@ -787,6 +836,10 @@ pub fn check(
             let (_, id, spends) = tron::check(t, tx, queued)?;
             Plan { kind: Kind::Evm { path: "tron".into(), hash: id }, spends }
         }
+        Action::SeaportOrder { order } => {
+            let (hash, spends) = crate::seaport::check(g, order, queued)?;
+            Plan { kind: Kind::Evm { path: EVM_PATH.to_string(), hash }, spends }
+        }
         Action::TonTx { tx } => {
             let t = g.ton.as_ref().ok_or("TON not allowed")?;
             let (_, hash, spends) = ton::check(t, tx, queued)?;
@@ -797,10 +850,44 @@ pub fn check(
             let (_, hash, spends) = stellar::check(x, tx, queued, stellar::TESTNET)?;
             Plan { kind: Kind::Eddsa { path: "stellar".into(), message: hash.to_vec() }, spends }
         }
-        Action::SolTx { recent_blockhash, instructions, atas } => {
+        Action::SolTx { recent_blockhash, instructions, atas, obligations } => {
             let sg = g.sol.as_ref().ok_or("Solana not allowed")?;
-            let (message, spends) = sol_message(sg, recent_blockhash, instructions, atas, queued)?;
+            let (message, spends) = sol_message(sg, recent_blockhash, instructions, atas, obligations, queued)?;
             Plan { kind: Kind::Eddsa { path: "solana".into(), message }, spends }
+        }
+        Action::IntentsDeposit { quote, signature, action: inner } => {
+            if queued {
+                return Err("a top-up can't be queued");
+            }
+            if matches!(**inner, Action::IntentsDeposit { .. }) {
+                return Err("one top-up at a time");
+            }
+            let d = crate::intents::check(g, quote, signature, now, wallet)?;
+            // The deposit address may be paid in this transfer only.
+            let mut s2 = s.clone();
+            match d.origin {
+                crate::intents::Family::Evm(c) => s2.grant.evm_recipients.push(format!("{c}:{}", d.address)),
+                crate::intents::Family::Sol => s2.grant.sol.as_mut().ok_or("Solana not allowed")?.recipients.push(d.address.clone()),
+                _ => return Err("the extension can't pay a deposit address on that chain yet"),
+            }
+            let p = check(&s2, inner, Mode::Direct, now, wallet, extension, signer)?;
+            if !p.spends.iter().any(|(a, _)| *a == d.spend) {
+                return Err("the transfer doesn't move the quoted asset");
+            }
+            for (a, v) in &p.spends {
+                let max = if *a == d.spend {
+                    // A SOL deposit also pays the transaction's fee.
+                    if a == "sol" { d.amount_in + crate::intents::SOL_FEE_ALLOWANCE } else { d.amount_in }
+                } else if a == "sol" && d.origin == crate::intents::Family::Sol {
+                    crate::intents::SOL_FEE_ALLOWANCE
+                } else {
+                    return Err("a top-up moves only the quoted asset");
+                };
+                if *v > max {
+                    return Err("more than the quoted amount");
+                }
+            }
+            p
         }
         Action::HlOrder { .. } | Action::HlCancel { .. } | Action::HlLeverage { .. } => {
             if queued {
@@ -858,15 +945,153 @@ pub fn hl_check(g: &Grant, action: &Action, now: u64) -> Result<(Vec<u8>, Vec<(S
 struct FtArgs {
     receiver_id: AccountId,
     amount: U128,
+    #[serde(default)]
+    msg: String,
+}
+
+/// Ref Finance's exchange contracts (mainnet, testnet): `ref-finance-101.testnet`'s
+/// metadata() reports version 1.9.19.
+pub const REF_EXCHANGES: [&str; 2] = ["v2.ref-finance.near", "ref-finance-101.testnet"];
+
+/// Rhea Lending (formerly Burrow): mainnet, and the testnet contract
+/// rhea-finance/burrow-sdk-python names (its get_config enables the Pyth
+/// oracle). Actions as that SDK builds them.
+pub const RHEA_LENDING: [&str; 2] = ["contract.main.burrow.near", "contract.1689937928.burrow.testnet"];
+/// The price oracles whose `oracle_call` forwards to it.
+pub const RHEA_ORACLES: [&str; 2] = ["priceoracle.near", "mock-priceoracle.testnet"];
+
+/// Checks a list of Rhea Lending actions: each one of `allowed`, carrying
+/// only a token and amounts (no account field, so nothing goes anywhere
+/// but the caller). Returns what is borrowed, as `borrow:near:<token>`.
+fn rhea_actions(v: &near_sdk::serde_json::Value, allowed: &[&str]) -> Result<Vec<(String, u128)>, &'static str> {
+    let actions = v.as_array().ok_or("bad lending message")?;
+    if actions.is_empty() || actions.len() > 4 {
+        return Err("1 to 4 lending actions");
+    }
+    let mut borrows = vec![];
+    for a in actions {
+        let a = a.as_object().filter(|a| a.len() == 1).ok_or("bad lending message")?;
+        let (kind, body) = a.iter().next().unwrap();
+        if !allowed.contains(&kind.as_str()) {
+            return Err("a lending action that isn't allowed here");
+        }
+        let body = body.as_object().ok_or("bad lending message")?;
+        if body.keys().any(|k| k != "token_id" && k != "amount" && k != "max_amount") {
+            return Err("lending action fields other than token and amounts");
+        }
+        let token = body.get("token_id").and_then(|t| t.as_str()).ok_or("bad lending message")?;
+        let amount = |k: &str| -> Result<Option<u128>, &'static str> {
+            body.get(k).map(|x| x.as_str().and_then(|s| s.parse().ok()).ok_or("bad lending amount")).transpose()
+        };
+        let amt = amount("amount")?;
+        amount("max_amount")?;
+        if kind == "Borrow" {
+            borrows.push((format!("borrow:near:{token}"), amt.ok_or("a borrow needs an amount")?));
+        }
+    }
+    Ok(borrows)
+}
+
+/// Checks a call to Rhea Lending (`execute`, `execute_with_pyth`) or to its
+/// oracle (`oracle_call`); returns the borrows. Other calls: no spends.
+fn rhea_call(receiver_id: &AccountId, method: &str, args: &str) -> Result<Vec<(String, u128)>, &'static str> {
+    const OUT: [&str; 4] = ["Withdraw", "Borrow", "IncreaseCollateral", "DecreaseCollateral"];
+    let v: near_sdk::serde_json::Value = near_sdk::serde_json::from_str(args).map_err(|_| "bad lending message")?;
+    let o = v.as_object().ok_or("bad lending message")?;
+    if RHEA_LENDING.contains(&receiver_id.as_str()) && (method == "execute" || method == "execute_with_pyth") {
+        if o.len() != 1 {
+            return Err("bad lending message");
+        }
+        return rhea_actions(o.get("actions").ok_or("bad lending message")?, &OUT);
+    }
+    if RHEA_ORACLES.contains(&receiver_id.as_str()) && method == "oracle_call" {
+        if o.keys().any(|k| k != "receiver_id" && k != "msg") {
+            return Err("bad lending message");
+        }
+        let to = o.get("receiver_id").and_then(|r| r.as_str()).ok_or("bad lending message")?;
+        if !RHEA_LENDING.contains(&to) {
+            return Err("the oracle may only call Rhea Lending");
+        }
+        let m: near_sdk::serde_json::Value = near_sdk::serde_json::from_str(o.get("msg").and_then(|m| m.as_str()).ok_or("bad lending message")?).map_err(|_| "bad lending message")?;
+        let m = m.as_object().filter(|m| m.len() == 1).ok_or("bad lending message")?;
+        return rhea_actions(m.get("actions").ok_or("bad lending message")?, &OUT);
+    }
+    Ok(vec![])
+}
+
+/// What an `ft_transfer_call` may carry to a contract. An empty message
+/// (a plain deposit, credited to the account) to any venue. To Ref, a swap
+/// whose every field is one seen in Ref's own swaps, through pools the grant
+/// lists (venue method `pool:<id>`): Ref pools are permissionless, so an
+/// unlisted one could be the agent's own at a ruinous price, and an
+/// unknown field could send the output elsewhere. The output comes back to
+/// the account, the sender. Any other message is refused.
+fn ft_call_msg_ok(g: &Grant, to: &AccountId, msg: &str, queued: bool) -> Result<(), &'static str> {
+    if msg.is_empty() {
+        return Ok(());
+    }
+    if RHEA_LENDING.contains(&to.as_str()) {
+        // Tokens in: as collateral, or to repay (burrow-sdk-python
+        // deposit_collateral, repay_from_wallet).
+        let v: near_sdk::serde_json::Value = near_sdk::serde_json::from_str(msg).map_err(|_| "bad lending message")?;
+        let o = v.as_object().filter(|o| o.len() == 1).and_then(|o| o.get("Execute")).and_then(|e| e.as_object()).ok_or("bad lending message")?;
+        if o.len() != 1 {
+            return Err("bad lending message");
+        }
+        let spends = rhea_actions(o.get("actions").ok_or("bad lending message")?, &["IncreaseCollateral", "Repay"])?;
+        debug_assert!(spends.is_empty());
+        return Ok(());
+    }
+    if !REF_EXCHANGES.contains(&to.as_str()) {
+        return Err("only a plain deposit (empty msg) to this contract");
+    }
+    let v: near_sdk::serde_json::Value = near_sdk::serde_json::from_str(msg).map_err(|_| "bad Ref message")?;
+    let o = v.as_object().ok_or("bad Ref message")?;
+    // `force: 0` as Rhea's own SDK (rhea-finance/rhea-sdk, instantSwap) sends
+    // it; `skip_unwrap_near` as rnear-sdk's instant unstake does (whether
+    // wNEAR output comes back as NEAR; to the sender either way).
+    if o.keys().any(|k| k != "actions" && k != "force" && k != "skip_unwrap_near")
+        || o.get("force").is_some_and(|f| f.as_u64() != Some(0))
+        || o.get("skip_unwrap_near").is_some_and(|f| !f.is_boolean())
+    {
+        return Err("Ref message fields other than actions");
+    }
+    let actions = o.get("actions").and_then(|a| a.as_array()).ok_or("bad Ref message")?;
+    if actions.is_empty() || actions.len() > 4 {
+        return Err("1 to 4 Ref swaps");
+    }
+    for (i, a) in actions.iter().enumerate() {
+        let a = a.as_object().ok_or("bad Ref message")?;
+        const FIELDS: [&str; 5] = ["pool_id", "token_in", "token_out", "amount_in", "min_amount_out"];
+        if a.keys().any(|k| !FIELDS.contains(&k.as_str())) {
+            return Err("Ref swap fields other than pool, tokens and amounts");
+        }
+        let pool = a.get("pool_id").and_then(|p| p.as_u64()).ok_or("bad Ref message")?;
+        // A route's middle hops carry 0; its last hop holds the minimum.
+        let min = a.get("min_amount_out").and_then(|m| m.as_str()).ok_or("bad Ref message")?;
+        if min.is_empty() || !min.bytes().all(|b| b.is_ascii_digit()) {
+            return Err("bad Ref message");
+        }
+        if i == actions.len() - 1 && min.bytes().all(|b| b == b'0') {
+            return Err("a Ref swap needs a minimum output");
+        }
+        if !queued && !g.near_venues.iter().any(|v| &v.receiver_id == to && v.method == format!("pool:{pool}")) {
+            return Err("not an allowed Ref pool");
+        }
+    }
+    Ok(())
 }
 
 /// Checks a Solana transaction against the grant and compiles its message.
-pub fn sol_message(sg: &SolGrant, blockhash: &str, ixs: &[SolIx], atas: &[SolAta], queued: bool) -> Result<(Vec<u8>, Vec<(String, u128)>), &'static str> {
+pub fn sol_message(sg: &SolGrant, blockhash: &str, ixs: &[SolIx], atas: &[SolAta], obligations: &[SolObligation], queued: bool) -> Result<(Vec<u8>, Vec<(String, u128)>), &'static str> {
     let me = sol::b58(&sg.self_address)?;
-    if atas.len() > 12 {
+    if atas.len() > 12 || obligations.len() > 4 {
         return Err("too many token accounts");
     }
-    let mut own = sol::Own { me, atas: vec![] };
+    let mut own = sol::Own { me, atas: vec![], obligations: vec![] };
+    for o in obligations {
+        own.obligations.push(sol::kamino_obligation(&me, &sol::b58(&o.market)?, o.bump));
+    }
     for a in atas {
         let (o, m, tp) = (sol::b58(&a.owner)?, sol::b58(&a.mint)?, sol::b58(&a.token_program)?);
         if a.token_program != sol::TOKEN && a.token_program != sol::TOKEN_2022 {
@@ -876,4 +1101,9 @@ pub fn sol_message(sg: &SolGrant, blockhash: &str, ixs: &[SolIx], atas: &[SolAta
     }
     let ixs = sol::parse(ixs)?;
     sol::check(sg, &own, &ixs, &sol::b58(blockhash)?, queued)
+}
+
+/// A word's value, or u128::MAX if it doesn't fit.
+fn word_u128_ok(w: &[u8]) -> u128 {
+    evm::word_u128(w).unwrap_or(u128::MAX)
 }

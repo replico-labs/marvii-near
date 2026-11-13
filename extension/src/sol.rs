@@ -16,8 +16,12 @@
 //!   account itself;
 //! - SOL and token payments go only to listed recipients;
 //! - what the account pays or puts into a protocol counts against the caps:
-//!   `sol` (in lamports, wrapped SOL included, fees too) and `spl:<mint>`.
-//!   Withdrawals back to the account itself don't count.
+//!   `sol` (in lamports, wrapped SOL included, fees and rent too) and
+//!   `spl:<mint>`. Withdrawals back to the account itself don't count.
+//! - Kamino borrows count against `borrow:solana:<mint>`, and every
+//!   obligation instruction must name the account's own obligation (derived
+//!   here from the account and the market), so a repay can't pay someone
+//!   else's loan.
 
 use near_sdk::env;
 
@@ -40,6 +44,32 @@ pub const KAMINO: &str = "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD";
 const K_REFRESH_RESERVE: [u8; 8] = [2, 218, 138, 235, 79, 201, 25, 102];
 const K_DEPOSIT: [u8; 8] = [169, 201, 30, 126, 6, 205, 102, 68];
 const K_REDEEM: [u8; 8] = [234, 117, 181, 125, 185, 142, 220, 29];
+const K_INIT_USER_METADATA: [u8; 8] = [117, 169, 176, 69, 197, 23, 15, 162];
+const K_INIT_OBLIGATION: [u8; 8] = [251, 10, 231, 76, 27, 11, 159, 96];
+const K_REFRESH_OBLIGATION: [u8; 8] = [33, 132, 147, 228, 151, 192, 72, 89];
+const K_DEPOSIT_COLLATERAL: [u8; 8] = [129, 199, 4, 2, 222, 39, 26, 46];
+const K_BORROW: [u8; 8] = [121, 127, 18, 204, 73, 245, 225, 65];
+const K_REPAY: [u8; 8] = [145, 178, 13, 225, 76, 240, 147, 72];
+const K_WITHDRAW_COLLATERAL: [u8; 8] = [75, 93, 93, 220, 34, 150, 218, 196];
+/// Rent for Kamino's accounts, counted when the agent creates them:
+/// (size + 128) × 6,960 lamports, sizes from klend-sdk 13.0.3's layouts
+/// (UserMetadata 1,032 bytes, Obligation 3,344, discriminators included).
+pub const KAMINO_USER_METADATA_RENT: u128 = (1032 + 128) * 6960;
+pub const KAMINO_OBLIGATION_RENT: u128 = (3344 + 128) * 6960;
+/// Tensor's marketplace (TCMP), the same ID on mainnet and devnet
+/// (@tensor-foundation/marketplace 1.0.0, as protean-bot pins it).
+pub const TENSOR: &str = "TCMPhJdwDryooaGtiocG1u3xcYbRpiJzb283XfCZsDp";
+/// That client's discriminators.
+const T_LIST_LEGACY: [u8; 8] = [6, 110, 255, 18, 16, 36, 8, 30];
+const T_BUY_LEGACY: [u8; 8] = [68, 127, 43, 8, 212, 31, 249, 114];
+const T_DELIST_LEGACY: [u8; 8] = [88, 35, 231, 184, 110, 218, 149, 23];
+/// Rent for a Tensor listing account, counted when the agent lists: as
+/// protean-bot budgets it, rent-exempt for 400 bytes.
+pub const TENSOR_LIST_RENT: u128 = (400 + 128) * 6960;
+/// Tensor's taker fee and a maker broker's share, counted on a buy (3%).
+pub const TENSOR_FEE_PCT: u128 = 3;
+pub const RENT_SYSVAR: &str = "SysvarRent111111111111111111111111111111111";
+pub const INSTRUCTIONS_SYSVAR: &str = "Sysvar1nstructions1111111111111111111111111";
 
 /// Rent for a token account (165 bytes), counted when the agent creates one.
 pub const TOKEN_ACCOUNT_RENT: u128 = 2_039_280;
@@ -86,11 +116,32 @@ pub struct Ix {
     pub data: Vec<u8>,
 }
 
-/// The account's token accounts the agent says it uses: address → mint.
+/// A program-derived address from its seeds and bump (no curve check: a
+/// wrong bump gives an address the program never creates an account at).
+pub fn pda(seeds: &[&[u8]], bump: u8, program: &[u8; 32]) -> [u8; 32] {
+    let mut b = Vec::new();
+    for s in seeds {
+        b.extend_from_slice(s);
+    }
+    b.push(bump);
+    b.extend_from_slice(program);
+    b.extend_from_slice(b"ProgramDerivedAddress");
+    env::sha256_array(&b)
+}
+
+/// The account's default Kamino obligation in `market` (tag 0, id 0, seed
+/// accounts the default key; klend-sdk getObligationPdaWithArgs).
+pub fn kamino_obligation(me: &[u8; 32], market: &[u8; 32], bump: u8) -> [u8; 32] {
+    pda(&[&[0], &[0], me, market, &[0; 32], &[0; 32]], bump, &b58(KAMINO).unwrap())
+}
+
+/// The account's token accounts and obligations the agent says it uses.
 pub struct Own {
     pub me: [u8; 32],
     /// (address, owner, mint)
     pub atas: Vec<([u8; 32], [u8; 32], [u8; 32])>,
+    /// The account's own Kamino obligations.
+    pub obligations: Vec<[u8; 32]>,
 }
 
 impl Own {
@@ -276,6 +327,21 @@ fn check_ix(g: &SolGrant, own: &Own, ix: &Ix, queued: bool, cu: &mut (Option<u64
             _ => Err("only SOL deposits and withdrawals on a stake pool"),
         }
     } else if p == KAMINO {
+        let obligation = |i: usize| -> Result<(), &'static str> {
+            if own.obligations.contains(&key(i)?) { Ok(()) } else { Err("not the account's own obligation") }
+        };
+        let token_programs = |at: &[usize]| -> Result<(), &'static str> {
+            for &i in at {
+                let t = fmt(&key(i)?);
+                if t != TOKEN && t != TOKEN_2022 {
+                    return Err("unknown token program");
+                }
+            }
+            if fmt(&key(at[at.len() - 1] + 1)?) != INSTRUCTIONS_SYSVAR {
+                return Err("unexpected account");
+            }
+            Ok(())
+        };
         let disc: [u8; 8] = d.get(..8).and_then(|b| b.try_into().ok()).ok_or("instruction data too short")?;
         match disc {
             // refresh_reserve: reserve, market, 4 oracle slots.
@@ -320,7 +386,230 @@ fn check_ix(g: &SolGrant, own: &Own, ix: &Ix, queued: bool, cu: &mut (Option<u64
                 // Back to the account itself: not a spend.
                 Ok(vec![])
             }
-            _ => Err("only refresh, deposit and redeem on Kamino"),
+            // init_user_metadata(user_lookup_table): owner, fee payer,
+            // user metadata, referrer (none: the program), rent, system.
+            // The address is the program's to check (seeds "user_meta" and
+            // the owner); nothing is paid but its rent.
+            K_INIT_USER_METADATA if d.len() == 40 => {
+                n(6)?;
+                signer_me(0)?;
+                signer_me(1)?;
+                if !queued && !g.venues.iter().any(|v| v.program == KAMINO) {
+                    return Err("not an allowed venue");
+                }
+                if d[8..] != [0u8; 32] {
+                    return Err("no lookup table");
+                }
+                if key(3)? != ix.program || fmt(&key(4)?) != RENT_SYSVAR || fmt(&key(5)?) != SYSTEM {
+                    return Err("unexpected account");
+                }
+                Ok(vec![("sol".into(), KAMINO_USER_METADATA_RENT)])
+            }
+            // init_obligation(tag 0, id 0): owner, fee payer, obligation,
+            // market, seed 1, seed 2 (default key), user metadata, rent, system.
+            K_INIT_OBLIGATION if d.len() == 10 => {
+                n(9)?;
+                signer_me(0)?;
+                signer_me(1)?;
+                venue_ok(g, p, &key(3)?, queued)?;
+                if d[8..] != [0, 0] || key(4)? != [0; 32] || key(5)? != [0; 32] {
+                    return Err("only the default obligation");
+                }
+                obligation(2)?;
+                if fmt(&key(7)?) != RENT_SYSVAR || fmt(&key(8)?) != SYSTEM {
+                    return Err("unexpected account");
+                }
+                Ok(vec![("sol".into(), KAMINO_OBLIGATION_RENT)])
+            }
+            // refresh_obligation: market, obligation, then its reserves.
+            K_REFRESH_OBLIGATION if d.len() == 8 => {
+                if a.len() < 2 || a.len() > 2 + 16 {
+                    return Err("wrong number of accounts");
+                }
+                venue_ok(g, p, &key(0)?, queued)?;
+                obligation(1)?;
+                Ok(vec![])
+            }
+            // deposit_reserve_liquidity_and_obligation_collateral: owner,
+            // obligation, market, market authority, reserve, liquidity mint,
+            // supply, collateral mint, collateral vault, source, placeholder
+            // (the program), collateral and liquidity token programs, sysvar.
+            K_DEPOSIT_COLLATERAL if d.len() == 16 => {
+                n(14)?;
+                signer_me(0)?;
+                obligation(1)?;
+                venue_ok(g, p, &key(2)?, queued)?;
+                let mint = key(5)?;
+                if own.mine(&key(9)?) != Some(mint) {
+                    return Err("tokens must come from the account's own token account");
+                }
+                if key(10)? != ix.program {
+                    return Err("unexpected account");
+                }
+                token_programs(&[11, 12])?;
+                Ok(vec![(asset(&mint), u64_at(d, 8)? as u128)])
+            }
+            // borrow_obligation_liquidity: owner, obligation, market, market
+            // authority, reserve, liquidity mint, supply, fee receiver,
+            // destination, referrer token state (none: the program), token
+            // program, sysvar. What is borrowed counts against
+            // `borrow:solana:<mint>`; it goes only to the account.
+            K_BORROW if d.len() == 16 => {
+                n(12)?;
+                signer_me(0)?;
+                obligation(1)?;
+                venue_ok(g, p, &key(2)?, queued)?;
+                let mint = key(5)?;
+                if own.mine(&key(8)?) != Some(mint) {
+                    return Err("venue call sends the result to someone else");
+                }
+                if key(9)? != ix.program {
+                    return Err("no referrer");
+                }
+                token_programs(&[10])?;
+                Ok(vec![(format!("borrow:solana:{}", fmt(&mint)), u64_at(d, 8)? as u128)])
+            }
+            // repay_obligation_liquidity: owner, obligation (the account's
+            // own: klend lets anyone repay any obligation), market, reserve,
+            // liquidity mint, supply, source, token program, sysvar.
+            K_REPAY if d.len() == 16 => {
+                n(9)?;
+                signer_me(0)?;
+                obligation(1)?;
+                venue_ok(g, p, &key(2)?, queued)?;
+                let mint = key(4)?;
+                if own.mine(&key(6)?) != Some(mint) {
+                    return Err("tokens must come from the account's own token account");
+                }
+                token_programs(&[7])?;
+                Ok(vec![(asset(&mint), u64_at(d, 8)? as u128)])
+            }
+            // withdraw_obligation_collateral_and_redeem_reserve_collateral:
+            // owner, obligation, market, market authority, reserve,
+            // liquidity mint, collateral vault, collateral mint, supply,
+            // destination, placeholder (the program), collateral and
+            // liquidity token programs, sysvar. Back to the account: not a
+            // spend (klend refuses one that leaves the loan unhealthy).
+            K_WITHDRAW_COLLATERAL if d.len() == 16 => {
+                n(14)?;
+                signer_me(0)?;
+                obligation(1)?;
+                venue_ok(g, p, &key(2)?, queued)?;
+                if own.mine(&key(9)?) != Some(key(5)?) {
+                    return Err("venue call sends the result to someone else");
+                }
+                if key(10)? != ix.program {
+                    return Err("unexpected account");
+                }
+                token_programs(&[11, 12])?;
+                u64_at(d, 8)?;
+                Ok(vec![])
+            }
+            _ => Err("not a Kamino instruction the extension knows"),
+        }
+    } else if p == TENSOR {
+        let disc: [u8; 8] = d.get(..8).and_then(|b| b.try_into().ok()).ok_or("instruction data too short")?;
+        let me_or_none = |i: usize| -> Result<(), &'static str> {
+            let k = key(i)?;
+            if k == own.me || k == ix.program { Ok(()) } else { Err("a broker that isn't the account") }
+        };
+        if !queued && !g.venues.iter().any(|v| v.program == TENSOR && v.scope == TENSOR) {
+            return Err("not an allowed venue");
+        }
+        // Metaplex legacy NFTs, so no authorization data (programmable NFTs' rule sets).
+        match disc {
+            // buy_legacy(max_amount, optional_royalty_pct: Option<u16>, None):
+            // fee vault, buyer, buyer's token account, listing's token
+            // account, listing, mint, seller (paid), payer, taker broker,
+            // maker broker, rent destination, token, ATA, marketplace and
+            // system programs, metadata, edition, two token records, rules,
+            // rules program, metadata program, sysvar, cosigner; then the
+            // creators (royalties).
+            T_BUY_LEGACY => {
+                if a.len() < 24 {
+                    return Err("wrong number of accounts");
+                }
+                let max = u64_at(d, 8)? as u128;
+                let pct: u128 = match &d[16..] {
+                    [0, 0] => 0,
+                    [1, lo, hi, 0] => u16::from_le_bytes([*lo, *hi]) as u128,
+                    _ => return Err("unexpected Tensor buy data"),
+                };
+                if pct > 100 {
+                    return Err("royalty share over 100%");
+                }
+                if key(1)? != own.me {
+                    return Err("venue call sends the result to someone else");
+                }
+                signer_me(7)?;
+                let mint = key(5)?;
+                if own.mine(&key(2)?) != Some(mint) {
+                    return Err("venue call sends the result to someone else");
+                }
+                me_or_none(8)?;
+                if key(23)? != ix.program {
+                    return Err("a listing that needs Tensor's cosigner");
+                }
+                // The price, Tensor's fees and, at worst, royalties of the
+                // share the agent opts into on top; and the new token account.
+                let spend = max + max * TENSOR_FEE_PCT / 100 + max * pct / 100 + TOKEN_ACCOUNT_RENT;
+                Ok(vec![("sol".into(), spend)])
+            }
+            // list_legacy(amount, expire_in_sec, currency, private_taker,
+            // maker_broker, authorization_data): owner, owner's token
+            // account, listing, listing's token account, mint, payer, …
+            T_LIST_LEGACY => {
+                n(19)?;
+                signer_me(0)?;
+                signer_me(5)?;
+                let mint = key(4)?;
+                if own.mine(&key(1)?) != Some(mint) {
+                    return Err("tokens must come from the account's own token account");
+                }
+                let price = u64_at(d, 8)? as u128;
+                let mut i = 16;
+                let mut opt = |len: usize| -> Result<Option<Vec<u8>>, &'static str> {
+                    match d.get(i) {
+                        Some(0) => { i += 1; Ok(None) }
+                        Some(1) => { let v = d.get(i + 1..i + 1 + len).ok_or("unexpected Tensor list data")?.to_vec(); i += 1 + len; Ok(Some(v)) }
+                        _ => Err("unexpected Tensor list data"),
+                    }
+                };
+                opt(8)?; // expiry: any
+                if opt(32)?.is_some() {
+                    return Err("only SOL listings");
+                }
+                if opt(32)?.is_some() {
+                    return Err("no private buyer");
+                }
+                if let Some(b) = opt(32)? {
+                    if b[..] != own.me {
+                        return Err("a broker that isn't the account");
+                    }
+                }
+                if opt(0)?.is_some() || i != d.len() {
+                    return Err("unexpected Tensor list data");
+                }
+                if g.nft_floor.0 == 0 || price < g.nft_floor.0 {
+                    return Err("listing price below the floor");
+                }
+                Ok(vec![("nft:solana".into(), 1), ("sol".into(), TENSOR_LIST_RENT)])
+            }
+            // delist_legacy(None): owner, owner's token account (the NFT
+            // comes back here), listing, listing's token account, mint, …
+            T_DELIST_LEGACY => {
+                n(19)?;
+                if d.len() != 9 || d[8] != 0 {
+                    return Err("unexpected Tensor delist data");
+                }
+                signer_me(0)?;
+                signer_me(6)?;
+                if own.mine(&key(1)?) != Some(key(4)?) {
+                    return Err("venue call sends the result to someone else");
+                }
+                Ok(vec![])
+            }
+            _ => Err("only buy, list and delist on Tensor"),
         }
     } else {
         Err("no decoder for this Solana program")

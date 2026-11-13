@@ -94,6 +94,35 @@ The Swap card asks NEAR Intents' 1Click API for a quote through the relayer, whi
 
 On 9 November 2026, 10 wNEAR quoted 36.14 USDC, at least 35.78 after 1% slippage, in about 10 seconds. No solver quoted wNEAR to BTC inside Intents at that moment; the page says so.
 
+## NEAR Intents top-ups between chains (13 November 2026)
+
+A top-up moves the account's own funds from one chain to its own address on another, through 1Click (mainnet). 1Click signs each real quote with its ed25519 key: base58(sha256(the quote's canonical JSON)), checked against `ed25519:reYaWhvwu8Jzo3WUM3zhn6VrhuMEF4eADL17qtRVifc` from 1Click's own SDK (`quote-signature.ts`). Live quotes verified against it, dry and real.
+
+**Extension** (`extension/src/intents.rs`, action `intents_deposit`): the agent hands over the signed quote and the deposit transfer. The extension:
+- checks 1Click's signature on-chain;
+- requires an exact-input swap from and to the chains themselves, at most 3% slippage, and an output worth at least 95% of the input by 1Click's USD prices (a fee hidden in the request would show there);
+- requires the recipient to be the account's own address on the destination chain and refunds to go to its own address on the origin chain;
+- allows the quote's deposit address as a recipient for this transfer only, for at most the quoted amount of the quoted asset, under the usual caps;
+- refuses a quote older than 30 minutes or one whose deposit address is about to expire.
+
+Deposits can come from Ethereum, Base, Arbitrum, BNB Chain, Polygon and Avalanche (the coin, USDC, USDT) and Solana (SOL, USDC, USDT); destinations also include NEAR, TRON and XRP. Unit tests use real signed quotes (`extension/src/testdata/`), including a tampered one.
+
+**Runs** (`agent/intents.mjs`, dev extension `6dd64e49…`, real 1Click quotes):
+- 5 USDC on Base → SOL to the account's Solana address: checked and signed by the account's EVM key ([`WwQA2hx1…`](https://testnet.nearblocks.io/txns/WwQA2hx1u5FNepFp9BhLDPEGGDXEPWKwc1U3bNadzBL)).
+- The same paying someone else's Solana address: refused, "a top-up pays only the account itself" ([`H3DvdUj6…`](https://testnet.nearblocks.io/txns/H3DvdUj6zKaxk84qc1iYNbCwkRQv4oYU64HHsjpDFxNd)).
+- Depositing one unit more than quoted: refused ([`EnqQXQsy…`](https://testnet.nearblocks.io/txns/EnqQXQsy3AMuyiUmmR4DXJMYQxJvgVEQhZbqbng3Y6EH)).
+- 0.002 ETH on Base → USDC on NEAR to the account: signed ([`3xf1XTwu…`](https://testnet.nearblocks.io/txns/3xf1XTwubkwDjFyARg6yEvEhkZ3cT4unFaLCLZ41SAG1)).
+
+Not broadcast: the deposits are real mainnet transactions (the testnet MPC network signs for any EVM chain ID), and the demo account holds no mainnet funds. With funds, `node intents.mjs topup … --broadcast` sends the deposit, reports it to 1Click and follows the swap.
+
+**Page:** Swap → "Top up another chain": a real quote paying the account's own address, then "Deposit with passkey" approves the exact transfer to the deposit address, broadcasts it from the browser and shows the swap's progress.
+
+**Signed in OutLayer's TEE:** the module now accepts `intents_deposit` (its deposit action must itself be a known type, never another top-up). Rebuilt and published as sha256 `d6de908f…8543` (FastFS tx [`BfrRMTsk…`](https://testnet.nearblocks.io/txns/BfrRMTskSpnxytiMiYSqJ6W9GHhVfGVSLzBjHwPacA5g)); the key is bound to the build, so this module has a new TEE key, `14e5e1dc…60f4`. Granted through a permission link (key `tee-topup`, Base USDC cap only) and approved with the demo passkey:
+- 5 USDC on Base → SOL to the account's Solana address, signed in the TEE and checked by the extension ([`76SZSPBB…`](https://testnet.nearblocks.io/txns/76SZSPBBFcZMMhcJZXRryQpfXyz5hiryTn4s9rr9jcoq)).
+- The same paying a stranger: refused, "a top-up pays only the account itself" ([`1iKN3AvU…`](https://testnet.nearblocks.io/txns/1iKN3AvUG9JmwKA7biqVHzvgqFcCReAuyS4yWZHRSSj)).
+
+**Relayer:** `/intents/deposit-quote` (rebuilds the exact JSON 1Click signed; a test checks it byte for byte), `/intents/submit`, `/intents/status`. None of it is trusted: the extension checks the signature itself.
+
 ## Extension v5: venue rules, Uniswap, payments (9 November 2026)
 
 **Deployed** at `d591504aa95d1d7164f11dfac2016363dd18788458040c7fc3ee32cd4344e0ec` (tx [`95i8K91i…`](https://testnet.nearblocks.io/txns/95i8K91iCS7dHv85hn8wBnNrfc3n1fr1xyiWG9snuc6k)).

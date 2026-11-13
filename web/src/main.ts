@@ -87,7 +87,7 @@ const OTHER_CHAINS: OtherChain[] = [
       const native = (await r.json()).balances.find((b: any) => b.asset_type === 'native');
       return BigInt(Math.round(Number(native?.balance ?? 0) * 1e7));
     } },
-  { id: 'ton', name: 'TON', sym: 'TON', decimals: 9, explorer: 'https://testnet.tonviewer.com/',
+  { id: 'ton', name: 'TON', sym: 'GRAM', decimals: 9, explorer: 'https://testnet.tonviewer.com/',
     balance: async (a) => BigInt((await get(`${TONCENTER}/getAddressBalance?address=${encodeURIComponent(a)}`)).result) },
   { id: 'cardano', name: 'Cardano', sym: 'ADA', decimals: 6, explorer: 'https://preprod.cardanoscan.io/address/',
     // Through the relayer: Koios's POST responses carry no CORS header.
@@ -111,6 +111,7 @@ const TOKEN_BALANCES = [
 const TOKENS: Record<string, { symbol: string; decimals: number }> = {
   '84532:0xba50cd2a20f6da35d788639e581bca8d0b5d4d5f': { symbol: 'USDC', decimals: 6 },
   '84532:0x4200000000000000000000000000000000000006': { symbol: 'WETH', decimals: 18 },
+  '560048:0x3508a952176b3c15387c97be809eaffb1982176a': { symbol: 'stETH', decimals: 18 },
 };
 /** Hyperliquid testnet perps by asset index (`meta` universe, checked
  *  9 November 2026). */
@@ -124,15 +125,31 @@ const PAY_NAMES: Record<string, string> = { bitcoin: 'Bitcoin', litecoin: 'Litec
 function capWords(asset: string, daily: string): string {
   if (asset === 'hyperliquid:usd') return `$${esc(fmtUnits(BigInt(daily), 6, 2))} of Hyperliquid orders`;
   if (asset.startsWith('utxo:') && PAY_CHAINS[asset.slice(5)]) return `${esc(fmtUnits(BigInt(daily), 8, 8))} ${PAY_CHAINS[asset.slice(5)]} (fees included)`;
+  const coins: Record<string, [number, string]> = { near: [24, 'NEAR'], sol: [9, 'SOL'], ton: [9, 'GRAM'], xlm: [7, 'XLM'], xrp: [6, 'XRP'], trx: [6, 'TRX'], 'nep141:wrap.testnet': [24, 'wNEAR'], 'nep141:wrap.near': [24, 'wNEAR'] };
+  if (coins[asset]) return `${esc(fmtUnits(BigInt(daily), coins[asset][0]))} ${coins[asset][1]}`;
+  const evmCoin = asset.match(/^evm:(\d+)$/);
+  if (evmCoin) return `${esc(fmtUnits(BigInt(daily), 18))} ${esc(EVM_CHAINS.find((c) => c.id === Number(evmCoin[1]))?.sym ?? 'ETH')} on ${esc(chainName(Number(evmCoin[1])))}`;
+  if (asset.startsWith('nft:')) return `${esc(daily)} NFT listing${daily === '1' ? '' : 's'} on ${esc(asset.slice(4).replace(/^evm:/, 'chain ').replace('solana', 'Solana'))}`;
+  if (asset.startsWith('borrow:')) return `borrowing ${esc(daily)} units of ${esc(asset.split(':').slice(2).join(':'))} (${esc(asset.split(':')[1])})`;
   return `${esc(daily)} of ${esc(asset)}`;
 }
 const POOLS: Record<string, string> = {
   '84532:0x8bab6d1b75f19e9ed9fce8b9bd338844ff79ae27': 'Aave V3 pool',
   '84532:0x94cc0aac535ccdb3c01d6787d6413c739ae12bc4': 'Uniswap V3 router',
+  // Lido on Hoodi (docs.lido.fi/deployed-contracts/hoodi, checked on-chain).
+  '560048:0x3508a952176b3c15387c97be809eaffb1982176a': 'Lido stETH',
+  '560048:0x7e99ee3c66636de415d2d7c880938f2f40f94de4': 'Lido wstETH',
+  '560048:0xfe56573178f1bcdf53f01a6e9977670dcbbd9186': 'Lido withdrawal queue',
+  // Seaport 1.6 (information() reports "1.6" on Base Sepolia).
+  '84532:0x0000000000000068f116a894984e2db1123eb395': 'Seaport (OpenSea)',
 };
 /** Venue functions by selector (keccak256 of the signature). The extension
  *  checks where each one's result goes (v5). */
-const FN_NAMES: Record<string, string> = { '0x617ba037': 'supply', '0x69328dec': 'withdraw', '0x573ade81': 'repay', '0x04e45aaf': 'swap' };
+const FN_NAMES: Record<string, string> = {
+  '0x617ba037': 'supply', '0x69328dec': 'withdraw', '0x573ade81': 'repay', '0xa415bcad': 'borrow', '0x04e45aaf': 'swap',
+  '0xa1903eab': 'stake', '0xea598cb0': 'wrap', '0xde0e9a3e': 'unwrap', '0xd6681042': 'request withdrawal', '0x19aa6257': 'request withdrawal (wstETH)', '0xf8444436': 'claim withdrawal',
+  '0xfb0f3ee1': 'buy', '0x00000000': 'buy', '0xfd9f1e10': 'cancel listings', '0xa22cb465': 'approve NFTs for',
+};
 /** Venues the grant form offers by name. Aave V3 from bgd-labs/aave-address-book
  *  (checked on-chain); Uniswap V3 SwapRouter02 on Base Sepolia, whose
  *  factory() and WETH9() were checked on-chain. */
@@ -141,7 +158,12 @@ const VENUES = [
   { id: 'uniswap', name: 'Uniswap V3', what: 'swap', chain: 84532, to: '0x94cc0aac535ccdb3c01d6787d6413c739ae12bc4', selectors: ['0x04e45aaf'] },
 ];
 const fnName = (sel: string) => FN_NAMES[sel.toLowerCase()] ?? `function ${sel}`;
-const chainName = (id: number) => EVM_CHAINS.find((c) => c.id === id)?.name ?? `chain ${id}`;
+const chainName = (id: number) => EVM_CHAINS.find((c) => c.id === id)?.name ?? ({ 560048: 'Hoodi' } as Record<number, string>)[id] ?? `chain ${id}`;
+/** A long list folded after the first few. */
+function fold(items: string[], first = 6): string {
+  if (items.length <= first) return items.join('; ');
+  return `${items.slice(0, first).join('; ')} <details class="inline"><summary>and ${items.length - first} more</summary>${items.slice(first).join('; ')}</details>`;
+}
 function amount(chain: number, token: string, raw: string) {
   const t = TOKENS[`${chain}:${token}`];
   if (!t) return `${esc(raw)} units of token ${esc(token)}`;
@@ -760,7 +782,7 @@ function stellarSendForm() {
   };
 }
 
-/** Sends TON. The wallet message is built on this page (core); the node only
+/** Sends GRAM (TON's coin, Toncoin until June 2026). The wallet message is built on this page (core); the node only
  *  supplies the wallet's seqno and whether it is deployed yet. The first
  *  send deploys the wallet (the address is its code and key's hash). */
 function tonSendForm() {
@@ -768,9 +790,9 @@ function tonSendForm() {
   m.innerHTML = `
     <div class="backdrop"><form class="card sheet" id="send">
       <h2>Send on TON</h2>
-      <p class="small muted">Balance ${esc(ton.balance)} TON</p>
+      <p class="small muted">Balance ${esc(ton.balance)} GRAM</p>
       <label>To <input name="to" required class="mono" placeholder="UQ… or EQ…"></label>
-      <label>Amount (TON) <input name="amount" required inputmode="decimal" placeholder="0.0"></label>
+      <label>Amount (GRAM) <input name="amount" required inputmode="decimal" placeholder="0.0"></label>
       <label>Comment (optional) <input name="comment" maxlength="120" placeholder="Exchanges often need one"></label>
       <div class="row end"><button type="button" class="secondary" id="cancel">Cancel</button><button class="primary">Review</button></div>
       <div id="status" class="status"></div>
@@ -1211,6 +1233,109 @@ function swapCard() {
   };
 }
 
+/** Mainnet assets a top-up moves (1Click's /v0/tokens; the extension's
+ *  intents.rs has the same table). `rpc` marks a chain the page can deposit
+ *  from: the passkey approves the exact transfer to 1Click's deposit address. */
+const TOPUP: { key: string; id: string; label: string; decimals: number; family: 'evm' | 'sol' | 'near'; chain?: number; token?: string; rpc?: string; explorer?: string }[] = [
+  { key: 'base-usdc', id: 'nep141:base-0x833589fcd6edb6e08f4c7c32d4f71b54bda02913.omft.near', label: 'USDC · Base', decimals: 6, family: 'evm', chain: 8453, token: '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913', rpc: 'https://mainnet.base.org', explorer: 'https://basescan.org/tx/' },
+  { key: 'base-eth', id: 'nep141:base.omft.near', label: 'ETH · Base', decimals: 18, family: 'evm', chain: 8453, rpc: 'https://mainnet.base.org', explorer: 'https://basescan.org/tx/' },
+  { key: 'arb-usdc', id: 'nep141:arb-0xaf88d065e77c8cc2239327c5edb3a432268e5831.omft.near', label: 'USDC · Arbitrum', decimals: 6, family: 'evm', chain: 42161, token: '0xaf88d065e77c8cc2239327c5edb3a432268e5831', rpc: 'https://arb1.arbitrum.io/rpc', explorer: 'https://arbiscan.io/tx/' },
+  { key: 'arb-eth', id: 'nep141:arb.omft.near', label: 'ETH · Arbitrum', decimals: 18, family: 'evm', chain: 42161, rpc: 'https://arb1.arbitrum.io/rpc', explorer: 'https://arbiscan.io/tx/' },
+  { key: 'eth', id: 'nep141:eth.omft.near', label: 'ETH · Ethereum', decimals: 18, family: 'evm', chain: 1, rpc: 'https://ethereum-rpc.publicnode.com', explorer: 'https://etherscan.io/tx/' },
+  { key: 'sol', id: 'nep141:sol.omft.near', label: 'SOL · Solana', decimals: 9, family: 'sol' },
+  { key: 'sol-usdc', id: 'nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near', label: 'USDC · Solana', decimals: 6, family: 'sol' },
+  { key: 'near-usdc', id: 'nep141:17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1', label: 'USDC · NEAR', decimals: 6, family: 'near' },
+  { key: 'wnear', id: 'nep141:wrap.near', label: 'wNEAR · NEAR', decimals: 24, family: 'near' },
+];
+
+function topupCard() {
+  const form = document.getElementById('topup') as HTMLFormElement | null;
+  if (!form) return;
+  const out = document.getElementById('topup-out')!;
+  // A testnet account has no NEAR account on mainnet to be paid.
+  const dests = TOPUP.filter((a) => a.family !== 'near' || cfg.chain_id === 'mainnet');
+  (form.elements.namedItem('from') as HTMLSelectElement).innerHTML = TOPUP.filter((a) => a.rpc).map((a) => `<option value="${a.key}">${esc(a.label)}</option>`).join('');
+  (form.elements.namedItem('to') as HTMLSelectElement).innerHTML = dests.map((a) => `<option value="${a.key}">${esc(a.label)}</option>`).join('');
+  (form.elements.namedItem('to') as HTMLSelectElement).value = 'sol';
+  const own = (a: (typeof TOPUP)[number]) => (a.family === 'evm' ? evmAddr : a.family === 'sol' ? solana.address : wallet);
+  form.onsubmit = async (ev) => {
+    ev.preventDefault();
+    const f = new FormData(form);
+    const from = TOPUP.find((a) => a.key === f.get('from'))!;
+    const to = TOPUP.find((a) => a.key === f.get('to'))!;
+    try {
+      if (from.id === to.id) throw new Error('Pick two different assets');
+      if (!own(from) || !own(to)) throw new Error('Your addresses are still loading. Try again in a moment.');
+      out.innerHTML = '<span class="muted">Asking NEAR Intents…</span>';
+      const r = await fetch(`${RELAYER}/intents/deposit-quote`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ from: from.id, to: to.id, amount: toUnits(String(f.get('amount')), from.decimals), refund_to: own(from), recipient: own(to) }),
+        signal: AbortSignal.timeout(30000),
+      });
+      const q = await r.json();
+      if (!r.ok) throw new Error(/liquidity/i.test(q.error ?? '') ? 'No solver is quoting this pair right now. Try another.' : q.error ?? 'No quote');
+      const usd = (v: string) => (v ? ` ($${Number(v).toFixed(2)})` : '');
+      out.innerHTML = `<div class="row between"><span>You'd get</span><b>${esc(q.amount_out)} ${esc(to.label)}${esc(usd(q.amount_out_usd))}</b></div>
+        <div class="row between muted"><span>For</span><span>${esc(fmtUnits(BigInt(q.amount_in), from.decimals, Math.min(8, from.decimals)))} ${esc(from.label)}${esc(usd(q.amount_in_usd))}</span></div>
+        <div class="row between muted"><span>Paid to</span><span class="mono">${esc(short(own(to)))} (you)</span></div>
+        <div class="row between muted"><span>Time</span><span>about ${esc(q.time_estimate_s)} s</span></div>
+        <div class="row end"><button type="button" class="primary" id="topup-go">Deposit with passkey</button></div>
+        <div id="topup-status"></div>`;
+      document.getElementById('topup-go')!.onclick = () => topupDeposit(from, q).catch((e) => (document.getElementById('topup-status')!.innerHTML = `<span class="error">${esc((e as Error).message ?? e)}</span>`));
+    } catch (e) {
+      out.innerHTML = `<span class="error">${esc((e as Error).message ?? e)}</span>`;
+    }
+  };
+}
+
+/** The owner's deposit: the passkey approves the exact transfer of the quoted
+ *  amount to 1Click's deposit address; the page broadcasts it, tells 1Click,
+ *  and follows the swap. */
+async function topupDeposit(from: (typeof TOPUP)[number], q: { deposit_address: string; amount_in: string }) {
+  const st = document.getElementById('topup-status')!;
+  const rpc = from.rpc!;
+  const amount = q.amount_in;
+  const native = !from.token;
+  const data = native ? '0x' : '0xa9059cbb' + q.deposit_address.slice(2).toLowerCase().padStart(64, '0') + BigInt(amount).toString(16).padStart(64, '0');
+  st.innerHTML = '<span class="muted">Preparing…</span>';
+  const [nonce, block, prio, gas] = await Promise.all([
+    evmRpc(rpc, 'eth_getTransactionCount', [evmAddr, 'pending']),
+    fetch(rpc, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_getBlockByNumber', params: ['latest', false] }) }).then((r) => r.json()),
+    evmRpc(rpc, 'eth_maxPriorityFeePerGas', []).catch(() => 1_000_000n),
+    evmRpc(rpc, 'eth_estimateGas', [{ from: evmAddr, to: native ? q.deposit_address : from.token, value: native ? '0x' + BigInt(amount).toString(16) : '0x0', data }]),
+  ]);
+  const maxFee = BigInt(block.result.baseFeePerGas) * 2n + prio;
+  const tx = core.evm_send_tx(BigInt(from.chain!), nonce, prio.toString(), maxFee.toString(), (gas * 12n) / 10n, from.token ?? "", q.deposit_address, amount);
+  const msg = core.owner_evm_sign_message(cfg.chain_id, wallet, nonce32(), createdAt(), cfg.signer, tx);
+  st.innerHTML = '';
+  confirm(msg, {
+    tx,
+    after: async (out) => {
+      if (!out.mpc_signature) throw new Error('No signature came back');
+      const signed = JSON.parse(core.evm_signed_tx(tx, JSON.stringify(out.mpc_signature)));
+      if (signed.from.toLowerCase() !== evmAddr.toLowerCase()) throw new Error('The signature is not from this account');
+      const r = await fetch(rpc, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_sendRawTransaction', params: [signed.raw] }) }).then((r) => r.json());
+      if (r.error) throw new Error(r.error.message);
+      await post(`${RELAYER}/intents/submit`, { tx_hash: r.result, deposit_address: q.deposit_address }).catch(() => {});
+      followTopup(q.deposit_address);
+      return `Deposited. <a target="_blank" rel="noopener" href="${esc(from.explorer + r.result)}">View transaction</a>. NEAR Intents is swapping it; progress shows under the quote.`;
+    },
+  });
+}
+
+async function followTopup(depositAddress: string) {
+  const st = document.getElementById('topup-status');
+  for (let i = 0; i < 60 && st; i++) {
+    await new Promise((r) => setTimeout(r, 10_000));
+    const s = await get(`${RELAYER}/intents/status?deposit_address=${encodeURIComponent(depositAddress)}`).catch(() => null);
+    if (!s) continue;
+    const words: Record<string, string> = { PENDING_DEPOSIT: 'Waiting for the deposit', KNOWN_DEPOSIT_TX: 'Deposit seen', PROCESSING: 'Swapping', SUCCESS: 'Done', REFUNDED: 'Refunded to you', FAILED: 'Failed', INCOMPLETE_DEPOSIT: 'Deposit incomplete' };
+    st.innerHTML = `<span class="${s.status === 'FAILED' ? 'error' : 'muted'}">${esc(words[s.status] ?? s.status)}${s.amount_out ? ` · ${esc(s.amount_out)}` : ''}</span>`;
+    if (['SUCCESS', 'REFUNDED', 'FAILED'].includes(s.status)) break;
+  }
+}
+
 async function dashboard() {
   const all: [string, string][] = [['chain-near', 'NEAR'], ...EVM_CHAINS.map((c) => [`chain-${c.id}`, c.name] as [string, string]), ...OTHER_CHAINS.map((c) => [`chain-${c.id}`, c.name] as [string, string])];
   render(`
@@ -1249,7 +1374,17 @@ async function dashboard() {
           <div class="row end"><button class="primary">Get quote</button></div>
           <div id="swap-out" class="small"></div>
         </form>
-        <p class="muted small">Live prices from NEAR Intents' solvers, between balances held in NEAR Intents by this account. Quote only: Intents runs on mainnet, and this testnet wallet never deposits.</p>
+        <p class="muted small">Live prices from NEAR Intents' solvers, between balances held in NEAR Intents by this account. Quote only: this swaps balances already inside NEAR Intents. To move funds between chains, use Top up below.</p>
+      </section>
+      <section class="card" id="topup-card">
+        <div class="row between"><h2>Top up another chain</h2><span class="pill">NEAR Intents · mainnet</span></div>
+        <form id="topup" class="stack">
+          <div class="row"><label class="grow">From <select name="from"></select></label><label class="grow">To <select name="to"></select></label></div>
+          <label>Amount <input name="amount" required inputmode="decimal" placeholder="0.0"></label>
+          <div class="row end"><button class="primary">Get quote</button></div>
+          <div id="topup-out" class="small"></div>
+        </form>
+        <p class="muted small">Moves your own funds between chains: 1Click's solvers pay your own address on the other chain, and refund your own address if the swap can't happen. Agents can do this too, and the extension checks 1Click's signed quote before it signs. These are real mainnet funds: your EVM and Solana addresses are the same on mainnet.</p>
       </section>
     </section>
     <section class="view" data-view="agents">
@@ -1269,11 +1404,35 @@ async function dashboard() {
         <p class="muted small">Each gets a key that NEAR checks on every request: which venues, how much a day, until when. Revoke any of them instantly.</p>
         <ul id="sessions" class="list"><li class="muted">Loading…</li></ul>
       </section>
+      <section class="card">
+        <h2>Connect an app</h2>
+        <p class="muted small">Apps and agents ask for access with a permission link. Open it here and you'll see exactly what they ask for before your passkey approves anything.</p>
+        <form class="row" id="connect-paste"><input name="link" class="mono" placeholder="https://near.marvii.xyz/#/connect?r=…" required><button class="secondary">Open</button></form>
+        <details class="small"><summary>Building an agent?</summary>
+          <p>Use <span class="mono">@marvii/agent-sdk</span> (in <span class="mono">near/sdk</span>): make a session key (or keep it in OutLayer's TEE), send the owner a permission link, wait for their approval, then act. Every action is checked by Marvii's extension on NEAR before Chain Signatures sign it.</p>
+          <pre class="mono small">const link = permissionLink({ publicKey, keyId: 'my-agent',
+  app: { name: 'My agent' },
+  grant: { near_venues: [{ receiver_id: 'wrap.testnet', method: 'near_deposit' }],
+           caps: [{ asset: 'near', daily: '50000000000000000000000' }] } });
+const { wallet } = await waitForApproval({ publicKey });
+await new MarviiAgent({ wallet, keyId: 'my-agent', signer }).execute(nearCall(…));</pre>
+        </details>
+      </section>
     </section>
     <div id="modal"></div>`);
   route();
   document.getElementById('add')!.onclick = grantForm;
+  (document.getElementById('connect-paste') as HTMLFormElement).onsubmit = (ev) => {
+    ev.preventDefault();
+    const raw = String(new FormData(ev.target as HTMLFormElement).get('link') ?? '').trim();
+    const m = raw.match(/#\/connect\?r=[A-Za-z0-9_-]+$/);
+    if (!m) return status('That isn\'t a Marvii permission link.', 'error');
+    location.hash = m[0];
+    connectFromLink().catch((e) => status(`That permission link can't be used: ${esc((e as Error).message ?? e)}`, 'error'));
+  };
+  connectFromLink().catch((e) => status(`That permission link can't be used: ${esc((e as Error).message ?? e)}`, 'error'));
   swapCard();
+  topupCard();
   hlCard().catch(() => {});
   if (!document.body.classList.contains('readonly')) moveCard().catch(() => {});
   app.onclick = (e) => {
@@ -1339,7 +1498,14 @@ async function dashboard() {
       }
     })
     .catch(() => {});
-  await Promise.all([loadSessions(), loadPending(), loadQueued()]);
+  await Promise.all([
+    loadSessions().catch((e) => {
+      const ul = document.getElementById('sessions');
+      if (ul) ul.innerHTML = `<li class="error small">Couldn't show your agents: ${esc(String((e as Error)?.message ?? e))}</li>`;
+    }),
+    loadPending(),
+    loadQueued(),
+  ]);
 }
 
 type QueuedItem = { wallet: string; key_id: string; action: string; created_ms: number; ready_at_ms: number };
@@ -1460,22 +1626,36 @@ async function loadSessions() {
         const [kind, chain, token] = c.asset.split(':');
         if (kind === 'evm' && token) return `${amount(Number(chain), token, c.daily)} a day on ${esc(chainName(Number(chain)))}`;
         return `${capWords(c.asset, c.daily)} a day`;
-      }).join(', ') || 'no spending';
+      });
       const venues = [
         ...s.grant.evm_venues.map((v) => `${esc(fnName(v.selector))} on ${named(v.chain_id, v.to)}, ${esc(chainName(v.chain_id))}`),
         ...s.grant.near_venues.map((v) => `${esc(v.receiver_id)}.${esc(v.method)}`),
         ...(s.grant.hl_markets ?? []).map((m) => `Hyperliquid ${esc(hlName(m.asset))} up to ${esc(m.max_leverage)}x`),
-        ...((s.grant as any).utxo ?? []).map((u: any) => `payments on ${esc(PAY_NAMES[u.chain] ?? u.chain)} to ${u.recipients.map((r: string) => esc(short(core.utxo_address(u.chain, r)))).join(', ') || 'no one'}`),
-      ].join('; ') || 'none';
+        ...((s.grant as any).utxo ?? []).map((u: any) => `payments on ${esc(PAY_NAMES[u.chain] ?? u.chain)} to ${u.recipients.map((r: string) => esc(short(utxoAddr(u.chain, r)))).join(', ') || 'no one'}`),
+        ...grantChains(s.grant as any),
+      ];
       return `<li class="session">
         <div class="row between"><b>${esc(s.grant.label)}</b> ${state}</div>
         <div class="small muted">key ${esc(k)} · ${s.nonce} requests · until ${esc(new Date(s.grant.expires_at_ms).toLocaleString())}</div>
-        <div class="small">Venues: ${venues}</div>
-        <div class="small">Caps: ${caps}</div>
+        <div class="small">Venues: ${venues.length ? fold(venues) : 'none'}</div>
+        <div class="small">Caps: ${caps.length ? fold(caps, 4) : 'no spending'}</div>
+        ${s.revoked || expired ? '' : `<div class="small muted" data-spent="${esc(k)}"></div>`}
         ${s.revoked ? '' : `<button class="danger small-btn" data-revoke="${esc(k)}">Revoke</button>`}
       </li>`;
     })
     .join('');
+  // What each live session has used of its caps today (the extension's own count).
+  for (const [k, s] of rows) {
+    const el = ul.querySelector<HTMLElement>(`[data-spent="${CSS.escape(k)}"]`);
+    if (!el) continue;
+    Promise.all(s.grant.caps.map((c) => view<string>(cfg.extension, 'spent_today', { wallet, key_id: k, asset: c.asset }).then((u) => [c, u] as const)))
+      .then((used) => {
+        const parts = used.filter(([, u]) => u !== '0').map(([c, u]) => `${capWords(c.asset, u)} of ${capWords(c.asset, c.daily)}`);
+        el.textContent = '';
+        el.innerHTML = parts.length ? `Used today: ${parts.join(', ')}` : 'Nothing used today';
+      })
+      .catch(() => {});
+  }
   ul.querySelectorAll<HTMLButtonElement>('[data-revoke]').forEach((b) => {
     b.onclick = () => {
       const key_id = b.dataset.revoke!;
@@ -1582,6 +1762,132 @@ function grantForm() {
   };
 }
 
+/** An output script as its address, or the script itself where this page
+ *  can't encode the chain's addresses (Dogecoin, which the grant form
+ *  doesn't offer). */
+function utxoAddr(chain: string, script: string): string {
+  try {
+    return core.utxo_address(chain, script);
+  } catch {
+    return `script ${script}`;
+  }
+}
+
+/** The non-EVM parts of a grant, briefly, for the agents list. */
+function grantChains(g: any): string[] {
+  const out: string[] = [];
+  if (g.sol) out.push(`Solana: ${(g.sol.venues ?? []).map((v: any) => esc(SOL_PROGRAMS[v.program] ?? short(v.program))).join(', ') || 'payments'}${g.sol.nft_floor && g.sol.nft_floor !== '0' ? `, Tensor listings from ${esc(fmtUnits(BigInt(g.sol.nft_floor), 9))} SOL` : ''}`);
+  if (g.ton) out.push(`TON: ${[g.ton.recipients?.length && 'payments', g.ton.jettons?.length && 'jettons', g.ton.evaa?.length && 'EVAA lending'].filter(Boolean).join(', ') || 'nothing'}`);
+  if (g.tron) out.push(`TRON: ${(g.tron.venues ?? []).length} contract calls${g.tron.nfts?.length ? ', NFTs' : ''}`);
+  if (g.xrpl) out.push(`XRP Ledger: ${[g.xrpl.dex && 'order book', g.xrpl.amm && 'AMM', g.xrpl.nft && 'NFTs'].filter(Boolean).join(', ') || 'payments'}`);
+  if (g.stellar) out.push(`Stellar: ${[g.stellar.dex && 'order book', g.stellar.amm && 'AMM', g.stellar.blend?.length && 'Blend lending'].filter(Boolean).join(', ') || 'payments'}`);
+  if (g.evm_nft_floor && g.evm_nft_floor !== '0') out.push(`Seaport listings from ${esc(fmtUnits(BigInt(g.evm_nft_floor), 18))}`);
+  return out;
+}
+
+/** Solana programs the extension knows (sol.rs), by name. */
+const SOL_PROGRAMS: Record<string, string> = {
+  SPoo1Ku8WFXoNDMHPsrGSTSG1Y47rzgn41SLUNakuHy: 'Jito staking',
+  DPoo15wWDqpPJJtS2MUZ49aRxqz5ZaaJCJP4z8bLuib: 'Jito staking (devnet)',
+  KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD: 'Kamino lending',
+  TCMPhJdwDryooaGtiocG1u3xcYbRpiJzb283XfCZsDp: 'Tensor NFT marketplace',
+};
+
+// ---- Permission links (near/sdk permissionLink): #/connect?r=<request> ----
+
+function base58Bytes(s: string): Uint8Array {
+  const A = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+  let n = 0n;
+  for (const c of s) {
+    const i = A.indexOf(c);
+    if (i < 0) throw new Error('not base58');
+    n = n * 58n + BigInt(i);
+  }
+  const hex = n.toString(16).padStart(2, '0');
+  const body = (hex.length % 2 ? '0' : '') + hex;
+  const lead = (s.match(/^1*/) ?? [''])[0].length;
+  return Uint8Array.from(('00'.repeat(lead) + body).match(/../g)!.map((h) => parseInt(h, 16)));
+}
+
+/**
+ * An app's request for a session key, from a permission link. The page
+ * fills in the account's own addresses, then shows the grant on the usual
+ * Confirm screen, which explains every part of it (or refuses to approve a
+ * part it can't explain). The app's name is its own claim, shown as such.
+ */
+async function connectFromLink() {
+  const m = location.hash.match(/^#\/connect\?r=([A-Za-z0-9_-]+)$/);
+  if (!m) return;
+  const b64 = m[1].replace(/-/g, '+').replace(/_/g, '/');
+  const req = JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(b64 + '='.repeat((4 - (b64.length % 4)) % 4)), (c) => c.charCodeAt(0))));
+  window.history.replaceState(null, '', location.pathname + location.search + '#/agents');
+  route();
+  if (req.v !== 1) throw new Error('unknown request version');
+  if (!/^[0-9a-f]{64}$/.test(req.public_key ?? '')) throw new Error('bad agent key');
+  if (!/^[a-z0-9_.-]{1,64}$/.test(req.key_id ?? '')) throw new Error('bad key name');
+  const name = String(req.app?.name ?? '').slice(0, 64);
+  if (!name) throw new Error('the app has no name');
+  const days = Number(req.days ?? 7), idle = Number(req.idle_days ?? 3);
+  if (!(days >= 1 && days <= 90 && idle >= 1 && idle <= 90)) throw new Error('lasting 1 to 90 days');
+  if (typeof req.grant !== 'object' || req.grant === null) throw new Error('no permissions asked for');
+  for (const k of ['public_key', 'label', 'expires_at_ms', 'inactivity_ms']) if (k in req.grant) throw new Error(`the link may not set ${k}`);
+  let returnUrl: URL | null = null;
+  if (req.return_url) {
+    returnUrl = new URL(req.return_url);
+    if (returnUrl.protocol !== 'https:' && returnUrl.hostname !== 'localhost') throw new Error('the return address must be https');
+  }
+  // The account's own addresses, as the request's placeholders name them.
+  let text = JSON.stringify(req.grant);
+  status('Loading your addresses…');
+  const fill: Record<string, () => string> = {
+    '{evm_self}': () => evmAddr.toLowerCase(),
+    '{sol_self}': () => solana.address,
+    '{ton_self}': () => ton.address,
+    '{tron_self}': () => tron.address,
+    '{stellar_self}': () => stellar.address,
+    '{xrp_self}': () => xrp.address,
+    '{xrp_pk}': () => {
+      if (!xrp.key) return '';
+      const xy = base58Bytes(xrp.key.replace(/^secp256k1:/, ''));
+      return [xy[63] & 1 ? 3 : 2, ...xy.slice(0, 32)].map((b) => b.toString(16).padStart(2, '0')).join('');
+    },
+  };
+  for (const [ph, val] of Object.entries(fill)) {
+    if (!text.includes(ph)) continue;
+    const v = await until(async () => val() || null, 30000);
+    if (!v) throw new Error(`your ${ph.slice(1, -1).replace('_self', '').replace('_pk', '')} address didn't load; try again`);
+    text = text.split(ph).join(v);
+  }
+  if (/\{[a-z_]+\}/.test(text)) throw new Error(`unknown placeholder ${text.match(/\{[a-z_]+\}/)![0]}`);
+  const now = Date.now();
+  const grant = {
+    near_venues: [], evm_venues: [], near_recipients: [], evm_recipients: [], caps: [], queue_new_targets: false, hl_markets: [],
+    ...JSON.parse(text),
+    public_key: req.public_key, label: name, expires_at_ms: now + days * 86_400_000, inactivity_ms: idle * 86_400_000,
+  };
+  const args = JSON.stringify({ key_id: req.key_id, grant });
+  // 0.01 NEAR up to 2 KB of grant; past that, its bytes (JSON is longer than
+  // the stored form, so this covers it).
+  const deposit = args.length <= 2048 ? 10n ** 22n : BigInt(args.length + 256) * 10n ** 19n;
+  status('');
+  const msg = core.call_message(cfg.chain_id, wallet, nonce(), createdAt(), cfg.extension, 'grant_session', args, deposit.toString(), 20n);
+  confirm(msg, {
+    app: { name, url: req.app?.url ? String(req.app.url) : '' },
+    after: async () => {
+      // Tells the relayer, which reads the session from the extension
+      // before telling the app anything.
+      await post(`${RELAYER}/connect`, { wallet, key_id: req.key_id }).catch(() => {});
+      if (returnUrl) {
+        returnUrl.searchParams.set('wallet', wallet);
+        returnUrl.searchParams.set('key_id', req.key_id);
+        setTimeout(() => (location.href = returnUrl!.toString()), 1500);
+        return `Approved. Taking you back to ${esc(returnUrl.host)}…`;
+      }
+      return `Approved. <b>${esc(name)}</b> can now act within these limits. You can revoke it here any time.`;
+    },
+  });
+}
+
 /** A decode failure blocks approval instead of showing something partial. */
 let blocked = false;
 function explainSafe(receiver: string, a: Described['external'][0]['actions'][0], ctx: SignCtx = {}) {
@@ -1609,6 +1915,22 @@ function explain(receiver: string, a: Described['external'][0]['actions'][0], ct
   const ours = receiver === cfg.extension;
   if (ours && a.method === 'grant_session') {
     const g = a.args.grant;
+    // Every part of a grant must be shown; a part this page can't explain
+    // blocks approval (explainSafe turns the throw into a warning).
+    const KNOWN = ['public_key', 'label', 'expires_at_ms', 'inactivity_ms', 'near_venues', 'evm_venues', 'near_recipients', 'evm_recipients', 'caps', 'queue_new_targets', 'hl_markets', 'evm_self', 'evm_nft_floor', 'utxo', 'sol', 'xrpl', 'stellar', 'tron', 'ton'];
+    const unknown = Object.keys(g).filter((k) => !KNOWN.includes(k));
+    if (unknown.length) throw new Error(`This grant has parts this page can't show you (${unknown.join(', ')})`);
+    const list = (xs: string[], none: string) => (xs?.length ? xs.map((x) => copyable(String(x))).join(', ') : none);
+    const sections: string[] = [];
+    if (g.evm_nft_floor && g.evm_nft_floor !== '0') sections.push(`<li>May list your NFTs on Seaport (OpenSea's contract) for no less than <b>${esc(fmtUnits(BigInt(g.evm_nft_floor), 18))}</b> in the chain's coin, to you</li>`);
+    if (g.sol) {
+      const venues = (g.sol.venues ?? []).map((v: any) => `${esc(SOL_PROGRAMS[v.program] ?? short(v.program))}${v.scope === v.program ? '' : ` (${esc(short(v.scope))})`}`);
+      sections.push(`<li>On <b>Solana</b> (${copyable(g.sol.self_address)}): may use ${venues.length ? venues.join(', ') : 'no protocols'}; may pay ${list(g.sol.recipients, 'no one directly')}${g.sol.nft_floor && g.sol.nft_floor !== '0' ? `; may list NFTs on Tensor for no less than <b>${esc(fmtUnits(BigInt(g.sol.nft_floor), 9))} SOL</b>` : ''}. What protocols return comes back to that address.</li>`);
+    }
+    if (g.ton) sections.push(`<li>On <b>TON</b> (${copyable(g.ton.self_address)}): may pay ${list(g.ton.recipients, 'no one directly')}${g.ton.jettons?.length ? `; tokens ${g.ton.jettons.map((j: any) => copyable(j.master)).join(', ')}` : ''}${g.ton.evaa?.length ? `; may lend and borrow on EVAA (${g.ton.evaa.map((x: string) => copyable(x)).join(', ')})` : ''}</li>`);
+    if (g.tron) sections.push(`<li>On <b>TRON</b> (${copyable(g.tron.self_address)}): may call ${(g.tron.venues ?? []).map((v: any) => `${esc(fnName(v.selector))} on ${copyable(v.contract)}`).join('; ') || 'nothing'}; may pay ${list(g.tron.recipients, 'no one directly')}${g.tron.nfts?.length ? `; may trade NFTs of ${list(g.tron.nfts, '')}` : ''}</li>`);
+    if (g.xrpl) sections.push(`<li>On the <b>XRP Ledger</b> (${copyable(g.xrpl.self_address)}): ${[g.xrpl.dex && 'trade on its order book', g.xrpl.amm && 'use its AMM pools', g.xrpl.nft && 'trade NFTs'].filter(Boolean).join(', ') || 'payments only'}; assets ${list(g.xrpl.assets, 'XRP only')}; may pay ${list(g.xrpl.recipients, 'no one directly')}</li>`);
+    if (g.stellar) sections.push(`<li>On <b>Stellar</b> (${copyable(g.stellar.self_address)}): ${[g.stellar.dex && 'trade on its order book', g.stellar.amm && 'use its AMM pools', g.stellar.blend?.length && `lend and borrow on Blend (${g.stellar.blend.map((x: string) => copyable(x)).join(', ')})`].filter(Boolean).join(', ') || 'payments only'}; assets ${list(g.stellar.assets, 'XLM only')}; may pay ${list(g.stellar.recipients, 'no one directly')}</li>`);
     const venues = [
       ...g.evm_venues.map((v: any) => `${esc(fnName(v.selector))} on ${POOLS[`${v.chain_id}:${String(v.to).toLowerCase()}`] ? `<b>${esc(POOLS[`${v.chain_id}:${String(v.to).toLowerCase()}`])}</b>` : esc(v.to)} (${esc(chainName(v.chain_id))})`),
       ...g.near_venues.map((v: any) => `call ${esc(v.method)} on ${esc(v.receiver_id)}`),
@@ -1620,9 +1942,10 @@ function explain(receiver: string, a: Described['external'][0]['actions'][0], ct
         <li>May ${venues.length ? venues.join('; ') : 'call nothing'}</li>
         <li>May pay ${pays.length ? pays.join(', ') : 'no one directly'}</li>
         ${g.evm_self ? `<li>Results of those calls go only to your account ${copyable(g.evm_self)}</li>` : ''}
-        ${(g.utxo ?? []).map((u: any) => `<li>May pay on <b>${esc(PAY_NAMES[u.chain] ?? u.chain)}</b>: ${u.recipients.length ? u.recipients.map((r: string) => copyable(core.utxo_address(u.chain, r))).join(', ') : 'no one directly'}; change only to ${copyable(core.utxo_address(u.chain, u.self_script))}</li>`).join('')}
+        ${(g.utxo ?? []).map((u: any) => `<li>May pay on <b>${esc(PAY_NAMES[u.chain] ?? u.chain)}</b>: ${u.recipients.length ? u.recipients.map((r: string) => copyable(utxoAddr(u.chain, r))).join(', ') : 'no one directly'}; change only to ${copyable(utxoAddr(u.chain, u.self_script))}</li>`).join('')}
         ${(g.hl_markets ?? []).map((m: any) => `<li>May trade <b>${esc(hlName(m.asset))}</b> on Hyperliquid testnet, at most <b>${esc(m.max_leverage)}x</b> leverage, signed by your account's EVM address</li>`).join('')}
-        <li>At most ${g.caps.map((c: any) => capWords(c.asset, c.daily)).join(', ')} a day</li>
+        ${sections.join('')}
+        <li>At most ${g.caps.length ? g.caps.map((c: any) => capWords(c.asset, c.daily)).join(', ') : 'nothing'} a day</li>
         <li>Until ${esc(new Date(g.expires_at_ms).toLocaleString())}, or after ${esc(Math.round(g.inactivity_ms / 86_400_000))} days unused</li>
         <li>${g.queue_new_targets ? '<span class="warn">May propose new recipients and contracts: each waits the delay, and you can cancel it</span>' : 'May not propose anything new'}</li>
       </ul>`;
@@ -1661,7 +1984,7 @@ function explain(receiver: string, a: Described['external'][0]['actions'][0], ct
       const d = JSON.parse(core.describe_ton(tonBoc));
       if (req.payload_v2?.Eddsa !== d.signing_hash) throw new Error('The signature request does not match the payment shown');
       const note = d.comment ? ` · comment "${esc(d.comment)}"` : '';
-      return `<b>Approve:</b> Send <b>${esc(fmtUnits(BigInt(d.nanotons), 9))} TON</b> to ${copyable(d.to)} on TON<div class="small muted">Network fee paid from the balance${note}</div>`;
+      return `<b>Approve:</b> Send <b>${esc(fmtUnits(BigInt(d.nanotons), 9))} GRAM</b> to ${copyable(d.to)} on TON<div class="small muted">Network fee paid from the balance${note}</div>`;
     }
     if (req?.path === 'bitcoin' || req?.path === 'litecoin') {
       // Bitcoin and Litecoin: each input needs its own signature. Confirm
@@ -1730,7 +2053,7 @@ function explain(receiver: string, a: Described['external'][0]['actions'][0], ct
  *  signature request must match. */
 type SignCtx = { tx?: string; solMessage?: string; btcPlan?: string; tronRaw?: string; xrpTx?: string; tonBoc?: string; stellarTx?: string; legacyPlan?: string; adaPlan?: string; hlTransfer?: { amount: string; to_perp: boolean; nonce: number } };
 
-function confirm(msgJson: string, ctx: SignCtx & { pendingId?: number; after?: (out: Outcome & { mpc_signature?: unknown }) => Promise<string> } = {}) {
+function confirm(msgJson: string, ctx: SignCtx & { pendingId?: number; app?: { name: string; url: string }; after?: (out: Outcome & { mpc_signature?: unknown }) => Promise<string> } = {}) {
   const msg = core.normalize_request(msgJson);
   const d: Described = JSON.parse(core.describe_message(msg));
   blocked = false;
@@ -1762,6 +2085,7 @@ function confirm(msgJson: string, ctx: SignCtx & { pendingId?: number; after?: (
   m.innerHTML = `
     <div class="backdrop"><div class="card sheet">
       <h2>Confirm</h2>
+      ${ctx.app ? `<p class="notice small">A request from <b>${esc(ctx.app.name)}</b>${ctx.app.url ? ` (${esc(ctx.app.url)})` : ''}. That name is the app's own claim: approve only if you started this.</p>` : ''}
       <p class="small muted">Your account will:</p>
       <ul class="list">${[...ops, ...calls].join('') || '<li>Nothing</li>'}</ul>
       <p class="small muted">Valid until ${esc(new Date(d.deadline).toLocaleString())}. Decoded on this page from the exact message your passkey signs.</p>

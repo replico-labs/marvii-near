@@ -11,11 +11,15 @@ export function setRpc(url: string) {
 }
 
 async function rpc(method: string, params: unknown) {
-  const res = await fetch(rpcUrl, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
-  });
+  // A stalled connection mustn't leave the page waiting forever: 15 s, then one retry.
+  const once = () =>
+    fetch(rpcUrl, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+      signal: AbortSignal.timeout(15000),
+    });
+  const res = await once().catch(() => once());
   const j = await res.json();
   if (j.error) throw new Error(j.error.cause?.name ?? j.error.message);
   return j.result;

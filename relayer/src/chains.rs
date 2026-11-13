@@ -476,6 +476,164 @@ pub async fn intents_quote(Json(b): Json<QuoteBody>) -> Reply {
     Ok(Json(json!({ "quote": v["quote"], "timestamp": v["timestamp"] })))
 }
 
+// ---- NEAR Intents top-ups (real quotes) ----
+//
+// A top-up moves the account's own funds from one chain to its own address
+// on another. The relayer only fetches 1Click's signed quote and rebuilds the
+// exact JSON 1Click signed (one-click-sdk-typescript, quote-signature.ts);
+// the extension checks the signature and every rule itself (intents.rs), so
+// nothing here is trusted.
+
+#[derive(serde::Deserialize)]
+pub struct DepositQuoteBody {
+    from: String,
+    to: String,
+    amount: String,
+    /// The account's own address on the origin chain.
+    refund_to: String,
+    /// The account's own address on the destination chain.
+    recipient: String,
+    #[serde(default)]
+    slippage_bps: Option<u64>,
+}
+
+fn plain(s: &str, max: usize) -> bool {
+    !s.is_empty() && s.len() <= max && s.chars().all(|c| c.is_ascii_alphanumeric() || ":-_.".contains(c))
+}
+
+/// json-stable-stringify: keys sorted, no spaces, undefined (absent) dropped.
+pub fn stable(v: &Value) -> String {
+    match v {
+        Value::Object(m) => {
+            let mut keys: Vec<&String> = m.keys().filter(|k| !m[*k].is_null()).collect();
+            keys.sort();
+            let parts: Vec<String> = keys.iter().map(|k| format!("{}:{}", Value::String((*k).clone()), stable(&m[*k]))).collect();
+            format!("{{{}}}", parts.join(","))
+        }
+        Value::Array(a) => format!("[{}]", a.iter().map(stable).collect::<Vec<_>>().join(",")),
+        _ => v.to_string(),
+    }
+}
+
+/// The object 1Click signs: chosen request fields, then the quote's fields
+/// (which overwrite, as `deadline` does), then the timestamp.
+pub fn signed_quote_json(r: &Value) -> String {
+    let (q, o) = (&r["quoteRequest"], &r["quote"]);
+    let truthy = |v: &Value| match v {
+        Value::Null | Value::Bool(false) => Value::Null,
+        Value::String(s) if s.is_empty() => Value::Null,
+        Value::Number(n) if n.as_f64() == Some(0.0) => Value::Null,
+        _ => v.clone(),
+    };
+    let mut m = serde_json::Map::new();
+    for k in ["dry", "swapType", "slippageTolerance", "originAsset", "depositType", "destinationAsset", "amount", "refundTo", "refundType", "recipient", "recipientType", "deadline"] {
+        m.insert(k.into(), q[k].clone());
+    }
+    for k in ["quoteWaitingTimeMs", "referral", "virtualChainRecipient", "virtualChainRefundRecipient", "customRecipientMsg"] {
+        m.insert(k.into(), truthy(&q[k]));
+    }
+    for k in ["amountIn", "amountInFormatted", "amountInUsd", "minAmountIn", "amountOut", "amountOutFormatted", "amountOutUsd", "minAmountOut"] {
+        m.insert(k.into(), o[k].clone());
+    }
+    if q["dry"] != Value::Bool(true) {
+        for k in ["depositAddress", "depositMemo", "deadline", "timeWhenInactive", "timeEstimate", "refundFee", "withdrawFee"] {
+            m.insert(k.into(), truthy(&o[k]));
+        }
+    }
+    m.insert("timestamp".into(), r["timestamp"].clone());
+    stable(&Value::Object(m))
+}
+
+pub async fn intents_deposit_quote(Json(b): Json<DepositQuoteBody>) -> Reply {
+    if !plain(&b.from, 120) || !plain(&b.to, 120) || b.from == b.to {
+        return Err(bad("pick two different assets"));
+    }
+    if b.amount.is_empty() || b.amount.len() > 40 || !b.amount.chars().all(|c| c.is_ascii_digit()) {
+        return Err(bad("amount must be a whole number of base units"));
+    }
+    if !plain(&b.refund_to, 100) || !plain(&b.recipient, 100) {
+        return Err(bad("bad address"));
+    }
+    let deadline = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(bad)?.as_secs() + 600;
+    let req = json!({
+        "dry": false,
+        "swapType": "EXACT_INPUT",
+        "slippageTolerance": b.slippage_bps.unwrap_or(100).min(300),
+        "originAsset": b.from,
+        "depositType": "ORIGIN_CHAIN",
+        "destinationAsset": b.to,
+        "amount": b.amount,
+        "refundTo": b.refund_to,
+        "refundType": "ORIGIN_CHAIN",
+        "recipient": b.recipient,
+        "recipientType": "DESTINATION_CHAIN",
+        "deadline": format_rfc3339(deadline),
+    });
+    let r = reqwest::Client::new().post(format!("{ONECLICK}/quote")).json(&req).timeout(Duration::from_secs(25)).send().await.map_err(bad)?;
+    let ok = r.status().is_success();
+    let v: Value = r.json().await.map_err(bad)?;
+    if !ok {
+        return Err(bad(v["message"].as_str().unwrap_or("no quote")));
+    }
+    Ok(Json(json!({
+        "quote": signed_quote_json(&v),
+        "signature": v["signature"],
+        "deposit_address": v["quote"]["depositAddress"],
+        "amount_in": v["quote"]["amountIn"],
+        "amount_out": v["quote"]["amountOutFormatted"],
+        "min_amount_out": v["quote"]["minAmountOut"],
+        "amount_in_usd": v["quote"]["amountInUsd"],
+        "amount_out_usd": v["quote"]["amountOutUsd"],
+        "deadline": v["quote"]["deadline"],
+        "time_estimate_s": v["quote"]["timeEstimate"],
+    })))
+}
+
+#[derive(serde::Deserialize)]
+pub struct SubmitBody {
+    tx_hash: String,
+    deposit_address: String,
+}
+
+/// Tells 1Click about the deposit transaction, so it needn't wait to spot it.
+pub async fn intents_submit(Json(b): Json<SubmitBody>) -> Reply {
+    if !plain(&b.tx_hash, 128) || !plain(&b.deposit_address, 100) {
+        return Err(bad("bad tx hash or address"));
+    }
+    let r = reqwest::Client::new()
+        .post(format!("{ONECLICK}/deposit/submit"))
+        .json(&json!({ "txHash": b.tx_hash, "depositAddress": b.deposit_address }))
+        .timeout(Duration::from_secs(20))
+        .send()
+        .await
+        .map_err(bad)?;
+    let v: Value = r.json().await.map_err(bad)?;
+    Ok(Json(json!({ "status": v["status"] })))
+}
+
+#[derive(serde::Deserialize)]
+pub struct StatusQuery {
+    deposit_address: String,
+}
+
+pub async fn intents_status(axum::extract::Query(q): axum::extract::Query<StatusQuery>) -> Reply {
+    if !plain(&q.deposit_address, 100) {
+        return Err(bad("bad address"));
+    }
+    let r = reqwest::Client::new()
+        .get(format!("{ONECLICK}/status?depositAddress={}", q.deposit_address))
+        .timeout(Duration::from_secs(20))
+        .send()
+        .await
+        .map_err(bad)?;
+    let v: Value = r.json().await.map_err(bad)?;
+    let d = &v["swapDetails"];
+    Ok(Json(json!({
+        "status": v["status"], "updated_at": v["updatedAt"],
+        "amount_out": d["amountOutFormatted"], "destination_tx": d["destinationChainTxHashes"], "refunded": d["refundedAmountFormatted"],
+    })))
+}
+
 /// UTC seconds since 1970 as RFC 3339 (civil-from-days, H. Hinnant).
 fn format_rfc3339(secs: u64) -> String {
     let (days, rem) = ((secs / 86_400) as i64, secs % 86_400);
@@ -493,6 +651,15 @@ fn format_rfc3339(secs: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn signed_quote_json_is_what_1click_signed() {
+        // A mainnet quote (13 November 2026) and the JSON that verifies
+        // against 1Click's key (the extension's intents-self.json).
+        let raw: serde_json::Value = serde_json::from_str(include_str!("testdata/intents-raw.json")).unwrap();
+        let fixture: serde_json::Value = serde_json::from_str(include_str!("../../extension/src/testdata/intents-self.json")).unwrap();
+        assert_eq!(super::signed_quote_json(&raw), fixture["quote"].as_str().unwrap());
+    }
+
     #[test]
     fn tls_config_names_its_provider() {
         // With two providers linked, the default builder can't choose.
