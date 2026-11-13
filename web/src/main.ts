@@ -634,10 +634,10 @@ function fillChain(id: string, address: string, native: string, assets: string[]
 // ---- Views: Home, Assets (a page per chain), Swap, Apps & agents ----
 
 const VIEW_TITLES: Record<string, string> = { home: 'Marvii', assets: 'Assets', swap: 'Swap', topup: 'Top up', agents: 'Apps & agents' };
-/** The Swap tile's menu: Swap, or Top up another chain, each its own page. */
-function swapMenu() {
-  const btn = document.getElementById('swap-tile') as HTMLButtonElement;
-  const menu = document.getElementById('swap-menu')!;
+/** A button that opens a menu of links (the Swap tile, the protocol picker). */
+function menuButton(btnId: string, menuId: string) {
+  const btn = document.getElementById(btnId) as HTMLButtonElement;
+  const menu = document.getElementById(menuId)!;
   const set = (open: boolean) => {
     menu.hidden = !open;
     btn.setAttribute('aria-expanded', String(open));
@@ -651,9 +651,15 @@ function swapMenu() {
     if (!menu.hidden && !menu.contains(ev.target as Node)) set(false);
   });
   document.addEventListener('keydown', (ev) => {
-    if (ev.key === 'Escape' && !menu.hidden) {
+    if (menu.hidden) return;
+    if (ev.key === 'Escape') {
       set(false);
       btn.focus();
+    } else if (ev.key === 'ArrowDown' || ev.key === 'ArrowUp') {
+      ev.preventDefault();
+      const items = Array.from(menu.querySelectorAll<HTMLElement>('a'));
+      const i = items.indexOf(document.activeElement as HTMLElement);
+      items[(i + (ev.key === 'ArrowDown' ? 1 : items.length - 1)) % items.length]?.focus();
     }
   });
   window.addEventListener('hashchange', () => set(false));
@@ -1464,7 +1470,10 @@ async function dashboard() {
       </section>
       <section class="card">
         <div class="row between wrap-row"><h1>Apps &amp; agents</h1>
-          <select id="protocol-pick" aria-label="Show a protocol" class="compact"><option value="">By protocol…</option></select></div>
+          <div class="pick-wrap">
+            <button type="button" class="pick" id="protocol-pick" aria-haspopup="menu" aria-expanded="false" aria-controls="protocol-menu"><span>By protocol…</span><span class="caret" aria-hidden="true">▾</span></button>
+            <div class="pick-menu" id="protocol-menu" role="menu" hidden>${PROTOCOLS.map((p) => `<a role="menuitem" href="#/p-${p.id}"><span>${esc(p.name)}</span><span class="mono">${esc(p.chain)}</span></a>`).join('')}</div>
+          </div></div>
         <p class="muted small">NEAR checks every request against the limits you set. Revoke any agent instantly.</p>
         <ul id="sessions" class="list agents"><li class="muted">Loading…</li></ul>
       </section>
@@ -1489,12 +1498,8 @@ await new MarviiAgent({ wallet, keyId: 'my-agent', signer }).execute(nearCall(�
     ${protocolViews()}
     <div id="modal"></div>`);
   route();
-  swapMenu();
-  (document.getElementById('protocol-pick') as HTMLSelectElement).onchange = (ev) => {
-    const v = (ev.target as HTMLSelectElement).value;
-    if (v) location.hash = `#/p-${v}`;
-    (ev.target as HTMLSelectElement).value = '';
-  };
+  menuButton('swap-tile', 'swap-menu');
+  menuButton('protocol-pick', 'protocol-menu');
   document.getElementById('add')!.onclick = grantForm;
   (document.getElementById('connect-paste') as HTMLFormElement).onsubmit = (ev) => {
     ev.preventDefault();
@@ -1962,7 +1967,6 @@ const PROTOCOLS: Protocol[] = [
   { id: 'nfts', name: 'NFT transfers', chain: 'Other chains', about: 'Sending your NFTs to addresses you list (TON, TRON, XRP Ledger).', access: (g) => [g.ton?.nft && 'TON NFTs', g.tron?.nfts?.length && `TRON NFTs (${g.tron.nfts.length} collections)`, g.xrpl?.nft && 'XRP Ledger NFTs'].filter(Boolean) as string[], caps: capsByPrefix('nft:') },
   { id: 'payments', name: 'Payments', chain: 'Other chains', about: 'Paying the recipients you list, on Bitcoin, Litecoin, Dogecoin, Bitcoin Cash, Zcash and Cardano. Change always comes back to you.', access: (g) => (g.utxo ?? []).map((u: any) => `${esc(PAY_NAMES[u.chain] ?? u.chain)} to ${u.recipients.map((r: string) => esc(short(utxoAddr(u.chain, r)))).join(', ') || 'no one'}`), caps: capsByPrefix('utxo:') },
 ];
-const PROTOCOL_CHAINS = [...new Set(PROTOCOLS.map((p) => p.chain))];
 
 /** The protocols a grant opens, as chips, plus contracts no named protocol covers. */
 function protocolChips(g: any, max = Infinity): string {
@@ -2071,13 +2075,6 @@ function renderProtocols(rows: [string, Session][]) {
   const now = Date.now();
   const live = rows.filter(([, s]) => !s.revoked && now < s.grant.expires_at_ms && now < s.last_used_ms + s.grant.inactivity_ms);
   const users = (p: Protocol) => live.filter(([, s]) => p.access(s.grant).length);
-  const sel = document.getElementById('protocol-pick') as HTMLSelectElement | null;
-  if (sel) {
-    sel.innerHTML = '<option value="">By protocol…</option>' + PROTOCOL_CHAINS.map((c) => `<optgroup label="${esc(c)}">${PROTOCOLS.filter((p) => p.chain === c).map((p) => {
-      const n = users(p).length;
-      return `<option value="${p.id}">${esc(p.name)}${n ? ` · ${n} agent${n === 1 ? '' : 's'}` : ''}</option>`;
-    }).join('')}</optgroup>`).join('');
-  }
   for (const p of PROTOCOLS) {
     const ul = document.querySelector<HTMLElement>(`[data-protocol="${p.id}"]`);
     if (!ul) continue;
