@@ -256,7 +256,7 @@ function nameForm() {
       const p = nameProblem(n);
       if (p) throw new Error(p);
       if (!(await nameAvailable(n))) throw new Error('That name is taken');
-      confirm(registerMessage(n), { after: async () => `Your name is ${copyableName(`${n}.${cfg.names}`)}` });
+      confirm(registerMessage(n), { after: async () => ({ title: 'Name saved', note: `Your name is ${copyableName(`${n}.${cfg.names}`)}` }) });
     } catch (e) {
       status(String((e as Error).message ?? e), 'error');
     }
@@ -286,7 +286,7 @@ function nearSendForm() {
       if (BigInt(yocto) > BigInt(nearBalance)) throw new Error('More than your balance');
       if (!(await account(to))) throw new Error('No NEAR account by that name');
       const msg = core.transfer_message(cfg.chain_id, wallet, nonce(), createdAt(), to, yocto);
-      confirm(msg, { after: async (out) => `Sent. <a target="_blank" rel="noopener" href="https://testnet.nearblocks.io/txns/${esc(out.tx_hash)}">View transaction</a>` });
+      confirm(msg, { after: async () => ({ title: 'Sent' }) });
     } catch (e) {
       status(String((e as Error).message ?? e), 'error');
     }
@@ -426,12 +426,87 @@ async function main() {
     // The address comes from the extension the wallet was created with; it
     // keeps that address when the passkey moves it to a newer extension.
     wallet = (pk as Passkey & { wallet?: string }).wallet ?? core.wallet_account_id(cfg.wallet_code_hash, pk.publicKey, cfg.extension);
+    if (Date.now() - lastActive() > LOCK_MS) lock();
     busy('Opening your wallet…');
     await backToWallet();
     busy(null);
+    watchIdle();
   } else {
     start();
   }
+}
+
+// ---- Locking after a while away ----
+// A screen lock, not a key: what's on screen stays hidden until the
+// passkey answers. Money never depended on it: every send and approval asks
+// the passkey anyway, and balances are public on-chain.
+
+const LOCK_MS = 15 * 60 * 1000;
+const ACTIVE_KEY = 'marvii-near:active';
+function lastActive(): number {
+  try {
+    return Number(localStorage.getItem(ACTIVE_KEY) ?? Date.now());
+  } catch {
+    return Date.now();
+  }
+}
+function touch() {
+  try {
+    localStorage.setItem(ACTIVE_KEY, String(Date.now()));
+  } catch {}
+}
+/** Locks after LOCK_MS without a tap, key or scroll, here or in another tab. */
+function watchIdle() {
+  touch();
+  let last = 0;
+  const seen = () => {
+    if (document.getElementById('lock') || Date.now() - last < 5000) return;
+    last = Date.now();
+    touch();
+  };
+  for (const ev of ['pointerdown', 'keydown', 'scroll', 'wheel', 'touchstart']) addEventListener(ev, seen, { passive: true, capture: true });
+  const check = () => {
+    // Never mid-action: a passkey sheet or a send may be open.
+    if (document.getElementById('busy') || document.getElementById('lock')) return;
+    if (Date.now() - lastActive() > LOCK_MS) lock();
+  };
+  setInterval(check, 30000);
+  document.addEventListener('visibilitychange', () => document.visibilityState === 'visible' && check());
+}
+function lock() {
+  if (document.getElementById('lock') || !pk) return;
+  app.inert = true;
+  document.getElementById('done')?.remove();
+  const el = document.createElement('div');
+  el.id = 'lock';
+  el.className = 'lock';
+  el.innerHTML = `<div class="lock-card" role="dialog" aria-modal="true" aria-labelledby="lock-h">
+    <div class="lock-ic">${MARK}</div>
+    <h2 id="lock-h">Wallet locked</h2>
+    <p class="small muted">You were away for a while. Unlock with your passkey to continue.</p>
+    <button class="primary big" type="button">Unlock with passkey</button>
+    <div class="status"></div>
+  </div>`;
+  document.body.appendChild(el);
+  const btn = el.querySelector('button')!;
+  const st = el.querySelector<HTMLElement>('.status')!;
+  btn.onclick = async () => {
+    btn.disabled = true;
+    st.textContent = '';
+    try {
+      const challenge = Array.from(crypto.getRandomValues(new Uint8Array(32)), (b) => b.toString(16).padStart(2, '0')).join('');
+      await signChallenge(pk!, challenge);
+      el.remove();
+      app.inert = false;
+      touch();
+    } catch (e) {
+      st.className = 'status error';
+      st.textContent = /cancel|not allowed|abort/i.test(String((e as Error).message ?? e)) ? 'Not unlocked. Try again.' : String((e as Error).message ?? e);
+    } finally {
+      btn.disabled = false;
+    }
+  };
+  btn.focus();
 }
 
 function start() {
@@ -475,9 +550,11 @@ function start() {
       busy('Opening your wallet…');
       await backToWallet();
       busy(null);
+      watchIdle();
       if (fundError && fundError !== 'already funded') status(`Your account is ready. The free testnet NEAR wasn't sent (${fundError}). To give apps and agents permission, deposit about 0.1 NEAR from the NEAR row first.`, 'error');
       const named = chosen && cfg.names ? await view<string | null>(cfg.names, 'name_of', { wallet }).catch(() => null) : null;
       if (chosen && !named) status(`Your account is ready, but the name ${chosen} couldn't be registered. Choose a name from the NEAR row.`, 'error');
+      else if (!fundError || fundError === 'already funded') success({ title: 'Wallet created', note: named ? `Your name is ${copyableName(named)}` : 'Your passkey owns it. No seed phrase to keep.', tx: out ? [{ chain: 'NEAR', hash: out.tx_hash, href: `https://testnet.nearblocks.io/txns/${out.tx_hash}` }] : [] });
     } catch (e) {
       busy(null);
       status(String((e as Error).message ?? e), 'error');
@@ -779,7 +856,7 @@ function xrpSendForm() {
           const signed = JSON.parse(core.xrp_signed_tx(p.tx_hex, JSON.stringify(out.mpc_signature), xrp.address));
           const r = (await post(XRPL, { method: 'submit', params: [{ tx_blob: signed.tx_blob }] })).result;
           if (!['tesSUCCESS', 'terQUEUED'].includes(r.engine_result)) throw new Error(r.engine_result_message ?? r.error_message ?? r.engine_result ?? 'XRP refused the transaction');
-          return `Sent. <a target="_blank" rel="noopener" href="https://testnet.xrpl.org/transactions/${esc(signed.hash)}">View transaction</a>`;
+          return sent('XRP Ledger', signed.hash, `https://testnet.xrpl.org/transactions/${signed.hash}`);
         },
       });
     } catch (e) {
@@ -833,7 +910,7 @@ function stellarSendForm() {
           const r = await fetch(`${HORIZON}/transactions`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: `tx=${encodeURIComponent(env)}` });
           const j = await r.json();
           if (!r.ok) throw new Error(j.extras?.result_codes ? JSON.stringify(j.extras.result_codes) : (j.title ?? 'Stellar refused the transaction'));
-          return `Sent. <a target="_blank" rel="noopener" href="https://stellar.expert/explorer/testnet/tx/${esc(j.hash)}">View transaction</a>`;
+          return sent('Stellar', j.hash, `https://stellar.expert/explorer/testnet/tx/${j.hash}`);
         },
       });
     } catch (e) {
@@ -879,7 +956,7 @@ function tonSendForm() {
           const boc = core.ton_signed_tx(p.signing_boc, JSON.stringify(out.mpc_signature), ton.key, !deployed);
           const r = await post(`${TONCENTER}/sendBoc`, { boc });
           if (!r.ok) throw new Error(r.error ?? 'TON refused the message');
-          return `Sent. It shows on the explorer in a few seconds. <a target="_blank" rel="noopener" href="https://testnet.tonviewer.com/${esc(ton.address)}">View account</a>`;
+          return { title: 'Sent', note: 'It shows on the explorer in a few seconds.', tx: [{ chain: 'TON account', hash: ton.address, href: `https://testnet.tonviewer.com/${ton.address}` }] };
         },
       });
     } catch (e) {
@@ -923,7 +1000,7 @@ function tronSendForm() {
           const signed = JSON.parse(core.tron_signed_tx(r.raw_hex, JSON.stringify(out.mpc_signature), tron.address));
           const res = await post(`${TRON_API}/wallet/broadcasthex`, { transaction: signed.tx_hex });
           if (!res.result) throw new Error(res.message ?? res.code ?? 'TRON refused the transaction');
-          return `Sent. <a target="_blank" rel="noopener" href="https://nile.tronscan.org/#/transaction/${esc(signed.txid)}">View transaction</a>`;
+          return sent('TRON', signed.txid, `https://nile.tronscan.org/#/transaction/${signed.txid}`);
         },
       });
     } catch (e) {
@@ -974,7 +1051,7 @@ function btcSendForm(chain = 'bitcoin') {
           const sigs = (out as any).mpc_signatures ?? [];
           const signed = JSON.parse(core.bitcoin_signed_tx(btcPlan, JSON.stringify(sigs)));
           const txid = await utxoBroadcast(chain, signed.raw);
-          return `Sent. <a target="_blank" rel="noopener" href="${c.tx}${esc(txid)}">View transaction</a>`;
+          return sent(c.name, txid, `${c.tx}${txid}`);
         },
       });
     } catch (e) {
@@ -1042,7 +1119,7 @@ function legacySendForm(chain: string) {
       after: async (out) => {
         const signed = JSON.parse(core.legacy_signed_tx(legacyPlan, JSON.stringify((out as any).mpc_signatures ?? [])));
         await relayerBroadcast(chain, signed.raw);
-        return `Sent. <a target="_blank" rel="noopener" href="${esc(c.tx.replace('{}', signed.txid))}">View transaction</a>`;
+        return sent(c.name, signed.txid, c.tx.replace('{}', signed.txid));
       },
     });
   });
@@ -1065,7 +1142,7 @@ function adaSendForm() {
         if (!out.mpc_signature) throw new Error('No signature came back');
         const signed = JSON.parse(core.cardano_signed_tx(adaPlan, JSON.stringify(out.mpc_signature), ada.key));
         await relayerBroadcast('cardano', signed.cbor);
-        return `Sent. <a target="_blank" rel="noopener" href="https://preprod.cardanoscan.io/transaction/${esc(signed.txid)}">View transaction</a>`;
+        return sent('Cardano', signed.txid, `https://preprod.cardanoscan.io/transaction/${signed.txid}`);
       },
     });
   });
@@ -1103,7 +1180,7 @@ function solSendForm() {
           const signed = core.solana_signed_tx(solMessage, JSON.stringify(out.mpc_signature), solana.address);
           const r = await post(SOLANA_RPC, { jsonrpc: '2.0', id: 1, method: 'sendTransaction', params: [signed, { encoding: 'base64' }] });
           if (r.error) throw new Error(r.error.message);
-          return `Sent. <a target="_blank" rel="noopener" href="https://explorer.solana.com/tx/${esc(r.result)}?cluster=devnet">View transaction</a>`;
+          return sent('Solana', r.result, `https://explorer.solana.com/tx/${r.result}?cluster=devnet`);
         },
       });
     } catch (e) {
@@ -1166,7 +1243,7 @@ function sendForm(chainId: number) {
           if (signed.from.toLowerCase() !== evmAddr.toLowerCase()) throw new Error('The signature is not from this account');
           const r = await fetch(c.rpc, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_sendRawTransaction', params: [signed.raw] }) }).then((r) => r.json());
           if (r.error) throw new Error(r.error.message);
-          return c.explorer ? `Sent. <a target="_blank" rel="noopener" href="${esc(c.explorer.replace('/address/', '/tx/') + r.result)}">View transaction</a>` : `Sent: ${esc(r.result)}`;
+          return sent(c.name, r.result, c.explorer ? c.explorer.replace('/address/', '/tx/') + r.result : '');
         },
       });
     } catch (e) {
@@ -1236,7 +1313,7 @@ async function hlCard() {
             const action = JSON.parse(core.hl_transfer_action(amount, true, BigInt(nonce)));
             const r = await post(`${HL_API}/exchange`, { action, nonce, signature });
             if (r.status !== 'ok') throw new Error(`Hyperliquid: ${typeof r.response === 'string' ? r.response : JSON.stringify(r)}`);
-            return `Moved ${esc(amount)} USDC to perps on Hyperliquid testnet.`;
+            return { title: 'Moved', note: `${esc(amount)} USDC to perps on Hyperliquid testnet.` };
           },
         });
       } catch (e) {
@@ -1379,7 +1456,7 @@ async function topupDeposit(from: (typeof TOPUP)[number], q: { deposit_address: 
       if (r.error) throw new Error(r.error.message);
       await post(`${RELAYER}/intents/submit`, { tx_hash: r.result, deposit_address: q.deposit_address }).catch(() => {});
       followTopup(q.deposit_address);
-      return `Deposited. <a target="_blank" rel="noopener" href="${esc(from.explorer + r.result)}">View transaction</a>. NEAR Intents is swapping it; progress shows under the quote.`;
+      return { ...sent(from.label.split(' · ')[1] ?? 'Deposit', r.result, from.explorer + r.result), title: 'Deposited', note: 'NEAR Intents is swapping it; progress shows under the quote.' };
     },
   });
 }
@@ -2270,9 +2347,9 @@ async function connectFromLink() {
         returnUrl.searchParams.set('wallet', wallet);
         returnUrl.searchParams.set('key_id', req.key_id);
         setTimeout(() => (location.href = returnUrl!.toString()), 1500);
-        return `Approved. Taking you back to ${esc(returnUrl.host)}…`;
+        return { title: 'Approved', note: `Taking you back to ${esc(returnUrl.host)}…` };
       }
-      return `Approved. <b>${esc(name)}</b> can now act within these limits. You can revoke it here any time.`;
+      return { title: 'Approved', note: `<b>${esc(name)}</b> can now act within these limits. Revoke it any time.` };
     },
   });
 }
@@ -2444,7 +2521,54 @@ function explain(receiver: string, a: Described['external'][0]['actions'][0], ct
  *  signature request must match. */
 type SignCtx = { tx?: string; solMessage?: string; btcPlan?: string; tronRaw?: string; xrpTx?: string; tonBoc?: string; stellarTx?: string; legacyPlan?: string; adaPlan?: string; hlTransfer?: { amount: string; to_perp: boolean; nonce: number } };
 
-function confirm(msgJson: string, ctx: SignCtx & { pendingId?: number; app?: { name: string; url: string }; after?: (out: Outcome & { mpc_signature?: unknown }) => Promise<string> } = {}) {
+/** What a passkey action did, for the success card: a word, a line, and
+ *  each transaction it made with a link to that chain's explorer. */
+type Done = { title: string; note?: string; tx?: { chain: string; hash: string; href: string }[] };
+const sent = (chain: string, hash: string, href: string): Done => ({ title: 'Sent', tx: [{ chain, hash, href }] });
+/** The card's word when an action has no `after`: what the message does. */
+function defaultTitle(d: { internal: { op: string }[]; external: { actions: { method?: string }[] }[] }): string {
+  if (d.internal.some((o) => o.op === 'add_extension')) return 'Moved';
+  const m = d.external.flatMap((p) => p.actions.map((a) => a.method));
+  if (m.includes('revoke_session')) return 'Revoked';
+  if (m.some((x) => x === 'cancel_queued' || x === 'cancel')) return 'Cancelled';
+  return 'Approved';
+}
+const CHECK = `<svg viewBox="0 0 64 64" aria-hidden="true"><circle cx="32" cy="32" r="32" fill="currentColor"/><path d="M19 33.5l9 9 17-19" fill="none" stroke="#fff" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+/** The success card: a green check, one word, and the transactions as
+ *  explorer links. Closes on a tap outside, Done, Esc, or after 8 s. */
+function success(r: Done) {
+  document.getElementById('done')?.remove();
+  const el = document.createElement('div');
+  el.id = 'done';
+  el.className = 'done-backdrop';
+  el.innerHTML = `<div class="done-card" role="status" aria-live="polite">
+    <div class="done-check">${CHECK}</div>
+    <h2>${esc(r.title)}</h2>
+    ${r.note ? `<p class="small muted">${r.note}</p>` : ''}
+    ${r.tx?.length ? `<ul class="done-tx">${r.tx.map((t) => `<li><span class="muted">${esc(t.chain)}</span>${t.href ? `<a class="mono" target="_blank" rel="noopener" href="${esc(t.href)}">${esc(short(t.hash))} ↗</a>` : `<span class="mono">${esc(short(t.hash))}</span>`}</li>`).join('')}</ul>` : ''}
+    <button class="primary big" type="button">Done</button>
+  </div>`;
+  document.body.appendChild(el);
+  let timer = setTimeout(close, 8000);
+  function close() {
+    clearTimeout(timer);
+    el.remove();
+    document.removeEventListener('keydown', key);
+  }
+  function key(ev: KeyboardEvent) {
+    if (ev.key === 'Escape') close();
+  }
+  document.addEventListener('keydown', key);
+  el.onclick = (ev) => {
+    if (ev.target === el) close();
+  };
+  el.querySelector('button')!.onclick = close;
+  // Reading or about to tap a link: don't vanish underneath.
+  el.onpointerenter = () => clearTimeout(timer);
+  el.onpointerleave = () => (timer = setTimeout(close, 5000));
+}
+
+function confirm(msgJson: string, ctx: SignCtx & { pendingId?: number; app?: { name: string; url: string }; after?: (out: Outcome & { mpc_signature?: unknown }) => Promise<Done> } = {}) {
   const msg = core.normalize_request(msgJson);
   const d: Described = JSON.parse(core.describe_message(msg));
   blocked = false;
@@ -2516,16 +2640,12 @@ function confirm(msgJson: string, ctx: SignCtx & { pendingId?: number; app?: { n
       sent = true;
       if (!out.ok) throw new Error('Refused on-chain: ' + JSON.stringify(out.failures));
       busy(ctx.after ? 'Sending…' : 'Confirming…');
-      const done = ctx.after ? await within(ctx.after(out), 90000) : `Done. Transaction ${esc(out.tx_hash)}`;
+      const done: Done = ctx.after ? await within(ctx.after(out), 90000) : { title: defaultTitle(d) };
       m.innerHTML = '';
       busy('Updating your wallet…');
       await backToWallet();
       busy(null);
-      const el = document.getElementById('status');
-      if (el) {
-        el.className = 'status ok';
-        el.innerHTML = done;
-      }
+      success({ ...done, tx: [{ chain: 'NEAR', hash: out.tx_hash, href: `https://testnet.nearblocks.io/txns/${out.tx_hash}` }, ...(done.tx ?? [])] });
     } catch (e) {
       busy(null);
       const msg = String((e as Error).message ?? e);
@@ -2541,4 +2661,5 @@ function confirm(msgJson: string, ctx: SignCtx & { pendingId?: number; app?: { n
   };
 }
 
+if (import.meta.env.DEV) (window as any).__success = success;
 main().catch((e) => render(`<section class="card"><h1>Marvii</h1><p class="error">${esc(e.message ?? e)}</p><p class="muted small">Is the relayer running at the configured address?</p></section>`));
