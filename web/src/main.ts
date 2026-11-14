@@ -2273,6 +2273,23 @@ async function checkTeeKey(publicKey: string, proof: { tx_hash?: string; sender?
   if (out?.public_key !== publicKey) throw no('that run made a different key');
 }
 
+/** Phoenix subaccounts stay one per agent: refuses a grant naming a
+ *  subaccount another live agent already trades (the same number means the
+ *  same trading key and collateral). The extension doesn't check this yet. */
+async function perpsClash(grant: any, keyId: string): Promise<string | null> {
+  const want: number[] = (grant?.sol?.perps ?? []).map((d: any) => Number(d.sub));
+  if (!want.length) return null;
+  const rows = await view<[string, Session][]>(cfg.extension, 'list_sessions', { wallet });
+  const now = Date.now();
+  for (const [id, s] of rows) {
+    if (id === keyId || s.revoked || now >= s.grant.expires_at_ms || now >= s.last_used_ms + s.grant.inactivity_ms) continue;
+    const taken = new Set(((s.grant as any).sol?.perps ?? []).map((d: any) => Number(d.sub)));
+    const n = want.find((x) => taken.has(x));
+    if (n !== undefined) return `Phoenix subaccount ${n} is already used by ${s.grant.label}. Agents can't share one: revoke ${s.grant.label} first, or ask this agent for another subaccount.`;
+  }
+  return null;
+}
+
 async function connectFromLink() {
   const m = location.hash.match(/^#\/connect\?r=([A-Za-z0-9_-]+)$/);
   if (!m) return;
@@ -2331,6 +2348,8 @@ async function connectFromLink() {
     ...JSON.parse(text),
     public_key: req.public_key, label: name, expires_at_ms: now + days * 86_400_000, inactivity_ms: idle * 86_400_000,
   };
+  const clash = await perpsClash(grant, req.key_id);
+  if (clash) throw new Error(clash);
   const args = JSON.stringify({ key_id: req.key_id, grant });
   // 0.01 NEAR up to 2 KB of grant; past that, its bytes (JSON is longer than
   // the stored form, so this covers it).

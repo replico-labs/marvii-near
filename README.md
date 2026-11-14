@@ -83,7 +83,7 @@ These ran on NEAR testnet and each chain's testnet (8 to 13 November 2026), or, 
 | | |
 |---|---|
 | Wallet code (`defuse-wallet-webauthn-p256`, near/intents `32cd1f9`), immutable global contract | `909f39dd861604db7f75eafad948b6cf288ffc81db1fb59177030f227721c98e` |
-| Marvii extension v6 (13 November 2026) | `0e59c2a2862583fd03eb8a6ad722a67d54189ce241f4f3b46c4884e26ee4f5a0` (v3 to v5 still accepted; the page offers the move) |
+| Marvii extension v6 (13 November 2026) | `0e59c2a2862583fd03eb8a6ad722a67d54189ce241f4f3b46c4884e26ee4f5a0` (a wallet still on v5 is offered the move; v1 to v4 were deleted on 14 November 2026, and wallets created under them keep their addresses) |
 | OutLayer TEE module (agent keys) | `551085926472e0a1236afa1c7461e63c87413496c63cf77645890e886433775b` on `outlayer.testnet` |
 | Chain Signatures | `v1.signer-prod.testnet` |
 | Names registry; forwarder code hash | `marvii.testnet`; `9428c9b6ea5401af2ecd8487170c5ceb409daa81133b8b62d70f59105d7f795e` |
@@ -198,6 +198,7 @@ The SDK has a builder for each (`evmTx`, `solTx`, `phoenixOrder`, …).
   - someone else cancelling a queued request
   - the cap checked again when a queued request runs
 - Agents' keys come only from Marvii's OutLayer module: the page checks, on NEAR, the OutLayer run that made each key before it lets the passkey approve it.
+- The extension's account has no keys: v6 and v5 had their only key deleted on 14 November 2026 ([`8ZKTYYef…`](https://testnet.nearblocks.io/txns/8ZKTYYefiG2V61gfrXZ6gLx12U6x8NK86prsg6AniW8T), [`BrgL2LPD…`](https://testnet.nearblocks.io/txns/BrgL2LPDsRjtcdzhsfEwBo37YfDUhxA23zeUyuSNFSL5)), so no one can change their code or delete them. A fix ships as a new version that wallets move to with one tap.
 - The extension's owner can pause sessions. Pausing only restricts; it can't move funds or grant anything.
 - Known limits:
   - testnet only, unaudited

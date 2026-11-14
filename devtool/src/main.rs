@@ -102,6 +102,7 @@ async fn main() -> Result<()> {
         Some("e2e") => e2e().await,
         Some("outlayer-upload") => outlayer_upload(args.get(2).context("module wasm")?).await,
         Some("outlayer-run") => outlayer_run(args.get(2).context("module wasm")?, args.get(3).context("input JSON")?).await.map(|v| println!("{v}")),
+        Some("lock") => lock(args.get(2).context("key file name, e.g. extension-v6")?).await,
         Some("reclaim") => reclaim(args.get(2).context("key file name, e.g. extension-a0d73493")?).await,
         Some("fund") => fund(args.get(2).context("account")?, args.get(3).context("NEAR amount")?).await,
         Some("demo-wallet") => demo_wallet(None, None, false).await,
@@ -353,6 +354,28 @@ async fn publish_wallet(path: &str) -> Result<()> {
 
 /// Deletes an account we no longer use (an abandoned extension), sending
 /// its balance back to the deployer. Never the current `extension`.
+/// Deletes an extension account's only key, so its code can never change
+/// and the account can never be deleted. Irreversible.
+async fn lock(name: &str) -> Result<()> {
+    if !name.starts_with("extension") {
+        bail!("only extension accounts are locked");
+    }
+    let k = Key::load(name)?;
+    let pk = SigningKey::from_bytes(&k.seed).verifying_key().to_bytes();
+    let out = k
+        .near()?
+        .transaction(k.account_id.as_str())
+        .delete_key(near_kit::signer::PublicKey::ed25519_from_bytes(pk)?)
+        .wait_until::<Final>()
+        .await?;
+    println!("locked {}: {}, tx {}", k.account_id, out.is_success(), out.transaction_hash());
+    if !out.is_success() {
+        bail!("lock failed: {:?}", out.failure_message());
+    }
+    fs::rename(keys_dir()?.join(format!("{name}.json")), keys_dir()?.join(format!("locked-{name}.json")))?;
+    Ok(())
+}
+
 async fn reclaim(name: &str) -> Result<()> {
     if name == "extension" || name == "deployer" {
         bail!("refusing to delete {name}");
